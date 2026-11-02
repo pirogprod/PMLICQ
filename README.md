@@ -37,4 +37,4 @@
 
 ## Основа
 
-Основа на плагине от Symnok : https://github.com/Symnok/miranda-kicq
+Основан на плагине от Symnok : https://github.com/Symnok/miranda-kicq
