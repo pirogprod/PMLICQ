@@ -1,0 +1,224 @@
+// Microsoft Visual C++ generated resource script.
+//
+#include "..\src\resource.h"
+
+#define APSTUDIO_READONLY_SYMBOLS
+/////////////////////////////////////////////////////////////////////////////
+//
+// Generated from the TEXTINCLUDE 2 resource.
+//
+#include "winres.h"
+/////////////////////////////////////////////////////////////////////////////
+#undef APSTUDIO_READONLY_SYMBOLS
+
+/////////////////////////////////////////////////////////////////////////////
+// English (United States) resources
+
+#if !defined(AFX_RESOURCE_DLL) || defined(AFX_TARG_ENU)
+LANGUAGE LANG_ENGLISH, SUBLANG_ENGLISH_US
+#pragma code_page(1252)
+
+/////////////////////////////////////////////////////////////////////////////
+//
+// Dialog
+//
+
+IDD_ACCMGRUI DIALOGEX 0, 0, 186, 110
+STYLE DS_SETFONT | DS_FIXEDSYS | WS_CHILD
+EXSTYLE WS_EX_CONTROLPARENT
+FONT 8, "MS Shell Dlg", 0, 0, 0x1
+BEGIN
+    LTEXT           "UIN:",IDC_STATIC,0,7,60,8
+    EDITTEXT        IDC_UIN,62,5,123,12,ES_AUTOHSCROLL | ES_NUMBER
+    LTEXT           "Password:",IDC_STATIC,0,23,60,8
+    EDITTEXT        IDC_PASSWORD,62,21,123,12,ES_PASSWORD | ES_AUTOHSCROLL
+    LTEXT           "Server:",IDC_STATIC,0,39,60,8
+    EDITTEXT        IDC_SERVER,62,37,123,12,ES_AUTOHSCROLL
+    LTEXT           "Port:",IDC_STATIC,0,55,60,8
+    EDITTEXT        IDC_PORT,62,53,40,12,ES_AUTOHSCROLL | ES_NUMBER
+    LTEXT           "Default group:",IDC_STATIC,0,71,60,8
+    EDITTEXT        IDC_GROUP,62,69,123,12,ES_AUTOHSCROLL
+    LTEXT           "Only the first 8 characters of the password are used by the ICQ login of this server.",IDC_STATIC,0,87,185,18
+END
+
+IDD_OPTIONS DIALOGEX 0, 0, 305, 140
+STYLE DS_SETFONT | DS_FIXEDSYS | WS_CHILD
+EXSTYLE WS_EX_CONTROLPARENT
+FONT 8, "MS Shell Dlg", 0, 0, 0x1
+BEGIN
+    GROUPBOX        "Account",IDC_STATIC,7,7,291,62
+    LTEXT           "UIN:",IDC_STATIC,15,22,80,8
+    EDITTEXT        IDC_UIN,100,20,120,12,ES_AUTOHSCROLL | ES_NUMBER
+    LTEXT           "Password:",IDC_STATIC,15,40,80,8
+    EDITTEXT        IDC_PASSWORD,100,38,120,12,ES_PASSWORD | ES_AUTOHSCROLL
+    GROUPBOX        "Connection",IDC_STATIC,7,73,291,62
+    LTEXT           "Server:",IDC_STATIC,15,88,80,8
+    EDITTEXT        IDC_SERVER,100,86,120,12,ES_AUTOHSCROLL
+    LTEXT           "Port:",IDC_STATIC,15,104,80,8
+    EDITTEXT        IDC_PORT,100,102,40,12,ES_AUTOHSCROLL | ES_NUMBER
+    LTEXT           "Default group:",IDC_STATIC,15,120,80,8
+    EDITTEXT        IDC_GROUP,100,118,120,12,ES_AUTOHSCROLL
+END
+
+
+#ifdef APSTUDIO_INVOKED
+/////////////////////////////////////////////////////////////////////////////
+//
+// TEXTINCLUDE
+//
+
+1 TEXTINCLUDE
+BEGIN
+    "..\src\resource.h\0"
+END
+
+2 TEXTINCLUDE
+BEGIN
+    "#include ""winres.h""\0"
+END
+
+3 TEXTINCLUDE
+BEGIN
+    "\r\n"
+    "\0"
+END
+
+#endif    // APSTUDIO_INVOKED
+
+/////////////////////////////////////////////////////////////////////////////
+//
+// Icon
+//
+
+IDI_KICQ                ICON                    "kicq.ico"
+
+#endif    // English (United States) resources
+/////////////////////////////////////////////////////////////////////////////
+
+
+// PML embedded original X-status assets
+// Original QIP Infium x-status sprite and ID catalog, embedded in the DLL.
+// RCDATA IDs 29000-29001. Runtime protocol integration is NOT implemented.
+29000 RCDATA "xstatus_assets\qip_infium_xstatuses.png"
+29001 RCDATA "xstatus_assets\qip_infium_xstatuses.ini"
+
+IDD_KICQ_XSTATUS DIALOGEX 0, 0, 260, 211
+STYLE DS_SETFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "PMLICQ - X-status"
+FONT 9, "Segoe UI"
+BEGIN
+ LTEXT "X-status:", -1, 8, 9, 125, 12
+ COMBOBOX IDC_KICQ_XSTATUS_LANG, 174, 6, 78, 60, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+ COMBOBOX IDC_KICQ_XSTATUS_LIST, 8, 23, 244, 120, CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP
+ LTEXT "Title:", -1, 8, 51, 240, 12
+ EDITTEXT IDC_KICQ_XSTATUS_TITLE, 8, 65, 244, 16, ES_AUTOHSCROLL | WS_TABSTOP
+ LTEXT "Description:", -1, 8, 91, 240, 12
+ EDITTEXT IDC_KICQ_XSTATUS_DESC, 8, 105, 244, 49, ES_MULTILINE | ES_AUTOVSCROLL | WS_VSCROLL | WS_TABSTOP
+ DEFPUSHBUTTON "Save", IDOK, 138, 186, 54, 16
+ PUSHBUTTON "Cancel", IDCANCEL, 198, 186, 54, 16
+END
+
+// Original QIP Infium status sprite converted to Win32 bitmap resource.
+IDB_KICQ_XSTATUS_SPRITE BITMAP "xstatus_assets/qip_infium_xstatuses.bmp"
+
+// Alpha-preserving QIP X-status icons (generated from original transparent PNG)
+29100 ICON "xstatus_assets/xstatus_01.ico"
+29101 ICON "xstatus_assets/xstatus_02.ico"
+29102 ICON "xstatus_assets/xstatus_03.ico"
+29103 ICON "xstatus_assets/xstatus_04.ico"
+29104 ICON "xstatus_assets/xstatus_05.ico"
+29105 ICON "xstatus_assets/xstatus_06.ico"
+29106 ICON "xstatus_assets/xstatus_07.ico"
+29107 ICON "xstatus_assets/xstatus_08.ico"
+29108 ICON "xstatus_assets/xstatus_09.ico"
+29109 ICON "xstatus_assets/xstatus_10.ico"
+29110 ICON "xstatus_assets/xstatus_11.ico"
+29111 ICON "xstatus_assets/xstatus_12.ico"
+29112 ICON "xstatus_assets/xstatus_13.ico"
+29113 ICON "xstatus_assets/xstatus_14.ico"
+29114 ICON "xstatus_assets/xstatus_15.ico"
+29115 ICON "xstatus_assets/xstatus_16.ico"
+29116 ICON "xstatus_assets/xstatus_17.ico"
+29117 ICON "xstatus_assets/xstatus_18.ico"
+29118 ICON "xstatus_assets/xstatus_19.ico"
+29119 ICON "xstatus_assets/xstatus_20.ico"
+29120 ICON "xstatus_assets/xstatus_21.ico"
+29121 ICON "xstatus_assets/xstatus_22.ico"
+29122 ICON "xstatus_assets/xstatus_23.ico"
+29123 ICON "xstatus_assets/xstatus_24.ico"
+29124 ICON "xstatus_assets/xstatus_25.ico"
+29125 ICON "xstatus_assets/xstatus_26.ico"
+29126 ICON "xstatus_assets/xstatus_27.ico"
+29127 ICON "xstatus_assets/xstatus_28.ico"
+29128 ICON "xstatus_assets/xstatus_29.ico"
+29129 ICON "xstatus_assets/xstatus_30.ico"
+29130 ICON "xstatus_assets/xstatus_31.ico"
+29131 ICON "xstatus_assets/xstatus_32.ico"
+29132 ICON "xstatus_assets/xstatus_33.ico"
+29133 ICON "xstatus_assets/xstatus_34.ico"
+29134 ICON "xstatus_assets/xstatus_35.ico"
+
+IDD_KICQ_PROFILE DIALOGEX 0, 0, 305, 244
+STYLE DS_SETFONT | DS_FIXEDSYS | WS_CHILD
+EXSTYLE WS_EX_CONTROLPARENT
+FONT 9, "Segoe UI"
+BEGIN
+ LTEXT "Nickname:", -1, 7, 10, 83, 11
+ EDITTEXT IDC_KICQ_PROFILE_NICK, 96, 8, 201, 14, ES_AUTOHSCROLL | WS_TABSTOP
+ LTEXT "First name:", -1, 7, 29, 83, 11
+ EDITTEXT IDC_KICQ_PROFILE_FIRST, 96, 27, 201, 14, ES_AUTOHSCROLL | WS_TABSTOP
+ LTEXT "Last name:", -1, 7, 48, 83, 11
+ EDITTEXT IDC_KICQ_PROFILE_LAST, 96, 46, 201, 14, ES_AUTOHSCROLL | WS_TABSTOP
+ LTEXT "Email:", -1, 7, 67, 83, 11
+ EDITTEXT IDC_KICQ_PROFILE_EMAIL, 96, 65, 201, 14, ES_AUTOHSCROLL | WS_TABSTOP
+ LTEXT "City:", -1, 7, 86, 83, 11
+ EDITTEXT IDC_KICQ_PROFILE_CITY, 96, 84, 201, 14, ES_AUTOHSCROLL | WS_TABSTOP
+ LTEXT "State/region:", -1, 7, 105, 83, 11
+ EDITTEXT IDC_KICQ_PROFILE_STATE, 96, 103, 201, 14, ES_AUTOHSCROLL | WS_TABSTOP
+ LTEXT "Phone:", -1, 7, 124, 83, 11
+ EDITTEXT IDC_KICQ_PROFILE_PHONE, 96, 122, 201, 14, ES_AUTOHSCROLL | WS_TABSTOP
+ LTEXT "Fax:", -1, 7, 143, 83, 11
+ EDITTEXT IDC_KICQ_PROFILE_FAX, 96, 141, 201, 14, ES_AUTOHSCROLL | WS_TABSTOP
+ LTEXT "Home address:", -1, 7, 162, 83, 11
+ EDITTEXT IDC_KICQ_PROFILE_STREET, 96, 160, 201, 14, ES_AUTOHSCROLL | WS_TABSTOP
+ LTEXT "Mobile:", -1, 7, 181, 83, 11
+ EDITTEXT IDC_KICQ_PROFILE_CELL, 96, 179, 201, 14, ES_AUTOHSCROLL | WS_TABSTOP
+ LTEXT "ZIP/postcode:", -1, 7, 200, 83, 11
+ EDITTEXT IDC_KICQ_PROFILE_ZIP, 96, 198, 201, 14, ES_AUTOHSCROLL | WS_TABSTOP
+ LTEXT "Apply saves locally and sends ICQ Meta 0x03EA when connected.", -1, 7, 225, 290, 16
+END
+
+IDD_KICQ_PROFILE_EXT DIALOGEX 0, 0, 305, 244
+STYLE DS_SETFONT | DS_FIXEDSYS | WS_CHILD
+EXSTYLE WS_EX_CONTROLPARENT
+FONT 9, "Segoe UI"
+BEGIN
+ LTEXT "About me:", -1, 7, 10, 84, 11
+ EDITTEXT IDC_KICQ_EXT_ABOUT, 96, 8, 201, 34, ES_MULTILINE | ES_AUTOVSCROLL | WS_VSCROLL | WS_TABSTOP
+ LTEXT "Company:", -1, 7, 53, 84, 11
+ EDITTEXT IDC_KICQ_EXT_COMPANY, 96, 51, 201, 14, ES_AUTOHSCROLL | WS_TABSTOP
+ LTEXT "Department:", -1, 7, 72, 84, 11
+ EDITTEXT IDC_KICQ_EXT_DEPT, 96, 70, 201, 14, ES_AUTOHSCROLL | WS_TABSTOP
+ LTEXT "Position:", -1, 7, 91, 84, 11
+ EDITTEXT IDC_KICQ_EXT_POSITION, 96, 89, 201, 14, ES_AUTOHSCROLL | WS_TABSTOP
+ LTEXT "Homepage:", -1, 7, 110, 84, 11
+ EDITTEXT IDC_KICQ_EXT_HOMEPAGE, 96, 108, 201, 14, ES_AUTOHSCROLL | WS_TABSTOP
+ LTEXT "Birth year:", -1, 7, 134, 84, 11
+ EDITTEXT IDC_KICQ_EXT_BIRTHYEAR, 96, 132, 60, 14, ES_NUMBER | WS_TABSTOP
+ LTEXT "Month:", -1, 160, 134, 44, 11
+ EDITTEXT IDC_KICQ_EXT_BIRTHMONTH, 209, 132, 35, 14, ES_NUMBER | WS_TABSTOP
+ LTEXT "Day:", -1, 247, 134, 21, 11
+ EDITTEXT IDC_KICQ_EXT_BIRTHDAY, 270, 132, 27, 14, ES_NUMBER | WS_TABSTOP
+ LTEXT "Extended fields are sent via ICQ Meta when online.", -1, 7, 177, 290, 16
+END
+
+// Entry point inside StdUserInfo's own-details window.
+IDD_KICQ_USERINFO_LINK DIALOGEX 0, 0, 305, 100
+STYLE DS_SETFONT | DS_FIXEDSYS | WS_CHILD
+EXSTYLE WS_EX_CONTROLPARENT
+FONT 9, "Segoe UI"
+BEGIN
+ LTEXT "Edit your PMLICQ profile in the protocol settings:", -1, 8, 8, 284, 16
+ PUSHBUTTON "Nickname, name and address...", IDC_KICQ_USERINFO_BASIC, 8, 29, 225, 18
+ PUSHBUTTON "About me, work and birthday...", IDC_KICQ_USERINFO_EXT, 8, 55, 225, 18
+END
