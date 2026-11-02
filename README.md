@@ -6,7 +6,7 @@
 
 Доработана поддержка с серверами использующие Open OSCAR Server : https://github.com/mk6i/open-oscar-server/
 
-И оставлена изначальная поддержка IserverD : https://github.com/namikiri/iserverd
+И оставлена изначальная поддержка с серверами использующие IserverD : https://github.com/namikiri/iserverd
 
 ## Структура и назначение
 
