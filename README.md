@@ -4,6 +4,9 @@
 
 Проект основан на плагине KICQ.dll (от Symnok), с доработками pirogprod и других участников; Для работы требуется совместимый сервер OSCAR.
 
+Доработана поддержка с серверами использующие Open OSCAR Server : https://github.com/mk6i/open-oscar-server/
+и оставлена изначальная поддержка IserverD : https://github.com/namikiri/iserverd
+
 ## Структура и назначение
 
 - `sources/0.96.7/KICQ/` — исходники под **Miranda NG 0.96.7**.
