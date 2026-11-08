@@ -1,0 +1,7 @@
+OK: XP x86 / 0.96.7; ARS wire, OFT2 data phase, account UI, x86 cancellation
+OK: XP x86 / 0.96.8; ARS wire, OFT2 data phase, account UI, x86 cancellation
+OK: x64 / 0.96.7; ARS wire, OFT2 data phase, account UI, x86 cancellation
+OK: x64 / 0.96.8; ARS wire, OFT2 data phase, account UI, x86 cancellation
+OK: ARS 2 length-prefixed frame, cookie, capability
+OK: ARS 4 length-prefixed frame, cookie, capability
+Not checked: Windows compilation, real proxy connection, two-client interoperability.
