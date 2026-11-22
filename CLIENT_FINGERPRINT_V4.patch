@@ -1,0 +1,174 @@
+--- a/PMLICQ/normal/0.96.7/KICQ/src/server.cpp
++++ b/PMLICQ/normal/0.96.7/KICQ/src/server.cpp
+@@ -1,4 +1,4 @@
+-/*
++﻿/*
+ Copyright (C) 2026 Miranda NG team
+ 
+ This program is free software; you can redistribute it and/or
+@@ -1036,6 +1036,10 @@
+ 						pUser->bServerRelay = true;
+ 				}
+ 			}
++			// PMLV is a self-identifying PMLICQ version capability. A server may
++			// omit or reorder the older human-readable marker, so do not require it.
++			if (hasPmlichqVersion)
++				detectedPmlichq = true;
+ 			if (detectedPmlichq && hasPmlichqVersion) {
+ 				// Do not label it as genuine QIP/Jimm: this is still PMLICQ.
+ 				szMirVer.Format("Miranda NG PMLICQ %u.%u.%u.%u",
+@@ -1054,15 +1058,31 @@
+ 					}
+ 				}
+ 			}
+-			if (!szMirVer.IsEmpty())
++			// The client identification is an observation, not the X-status.
++			// Do not erase a valid identification merely because a full presence
++			// refresh contains capabilities that our detector does not yet know.
++			// No arbitrary version may be inferred from generic OSCAR feature GUIDs.
++			if (!szMirVer.IsEmpty()) {
+ 				setString(hContact, "MirVer", szMirVer);
+-			else if (caps)
+-				db_unset(hContact, m_szModuleName, "MirVer"); // No guessing from generic feature GUIDs.
++				setByte(hContact, "ClientDetectKnown", 1);
++			}
++			else if (caps) {
++				// Preserve the last known client across incomplete/unknown updates.
++				// First sighting of an unknown client must still be visible in Miranda.
++				if (!getByte(hContact, "ClientDetectKnown", 0))
++					setString(hContact, "MirVer", "OSCAR client (unidentified)");
++			}
+ 			if (caps) {
+-				// Diagnostic capability fingerprint for unknown clients; bounded to 256 bytes.
+-				// Does not influence X-status handling or the buddy's advertised features.
+-				const bytes_t bounded = caps->data.substr(0, min(caps->data.size(), size_t(256)));
++				// Save the complete (bounded) raw capability fingerprint for comparing
++				// QIP, Jimm, Miranda and other actual clients in field tests.
++				// Neither this fingerprint nor the unknown label alters X-status logic.
++				const bytes_t bounded = caps->data.substr(0, min(caps->data.size(), size_t(1024)));
+ 				setString(hContact, "ClientCapsFingerprint", OscarText::hex(bounded));
++				setDword(hContact, "ClientCapsSize", (uint32_t)caps->data.size());
++			}
++			if (shortCaps) {
++				const bytes_t boundedShort = shortCaps->data.substr(0, min(shortCaps->data.size(), size_t(512)));
++				setString(hContact, "ClientShortCapsFingerprint", OscarText::hex(boundedShort));
+ 			}
+ 		}
+ 	}
+@@ -1155,6 +1175,10 @@
+ 			return;
+ 		pUser->bOnline = false;
+ 		hContact = pUser->hContact;
++		// The next online announcement belongs to a new client session.
++		// Keep the historical MirVer for offline display, but do not trust it
++		// if the following session advertises an unknown capabilities set.
++		setByte(hContact, "ClientDetectKnown", 0);
+ 		{ db_unset(hContact, m_szModuleName, "XStatusId"); db_unset(hContact, m_szModuleName, "XStatusName"); db_unset(hContact, m_szModuleName, "XStatusLive"); db_unset(hContact, m_szModuleName, "XStatusMsg"); db_unset(hContact, m_szModuleName, "XStatusTextReceived"); db_unset(hContact, m_szModuleName, "XStatusQueryTS"); }
+ 	}
+ 
+--- a/PMLICQ/normal/0.96.7/KICQ/src/oscar.cpp
++++ b/PMLICQ/normal/0.96.7/KICQ/src/oscar.cpp
+@@ -1,4 +1,4 @@
+-/*
++﻿/*
+ Copyright (C) 2026 Miranda NG team
+ 
+ This program is free software; you can redistribute it and/or
+@@ -395,7 +395,9 @@
+ 	caps.bytes(unhex(CAP_UTF8));
+ 	if (xstatusGuid && *xstatusGuid)
+ 		caps.bytes(unhex(xstatusGuid));
+-	caps.bytes(unhex("563FC8090B6F41BD9F79422609DFA2F3"));
++	// Do not falsely advertise ICQ Lite/ICQ2Go's private fingerprint.
++	// It is documented as specific to those clients and can confuse third-party
++	// fingerprint databases. Our own PMLICQ marker above remains available.
+ 	caps.bytes(unhex("0946134D4C7F11D18222444553540000"));   // typing notifications
+ 	OscarWriter w;
+ 	w.tlv(5, caps);
+--- a/PMLICQ/windows-xp-x86/0.96.7/KICQ/src/server.cpp
++++ b/PMLICQ/windows-xp-x86/0.96.7/KICQ/src/server.cpp
+@@ -1,4 +1,4 @@
+-/*
++﻿/*
+ #include <string>
+ Copyright (C) 2026 Miranda NG team
+ 
+@@ -1145,6 +1145,10 @@
+ 						pUser->bServerRelay = true;
+ 				}
+ 			}
++			// PMLV is a self-identifying PMLICQ version capability. A server may
++			// omit or reorder the older human-readable marker, so do not require it.
++			if (hasPmlichqVersion)
++				detectedPmlichq = true;
+ 			if (detectedPmlichq && hasPmlichqVersion) {
+ 				// Do not label it as genuine QIP/Jimm: this is still PMLICQ.
+ 				szMirVer.Format("Miranda NG PMLICQ %u.%u.%u.%u",
+@@ -1163,15 +1167,31 @@
+ 					}
+ 				}
+ 			}
+-			if (!szMirVer.IsEmpty())
++			// The client identification is an observation, not the X-status.
++			// Do not erase a valid identification merely because a full presence
++			// refresh contains capabilities that our detector does not yet know.
++			// No arbitrary version may be inferred from generic OSCAR feature GUIDs.
++			if (!szMirVer.IsEmpty()) {
+ 				setString(hContact, "MirVer", szMirVer);
+-			else if (caps)
+-				db_unset(hContact, m_szModuleName, "MirVer"); // No guessing from generic feature GUIDs.
++				setByte(hContact, "ClientDetectKnown", 1);
++			}
++			else if (caps) {
++				// Preserve the last known client across incomplete/unknown updates.
++				// First sighting of an unknown client must still be visible in Miranda.
++				if (!getByte(hContact, "ClientDetectKnown", 0))
++					setString(hContact, "MirVer", "OSCAR client (unidentified)");
++			}
+ 			if (caps) {
+-				// Diagnostic capability fingerprint for unknown clients; bounded to 256 bytes.
+-				// Does not influence X-status handling or the buddy's advertised features.
+-				const bytes_t bounded = caps->data.substr(0, min(caps->data.size(), size_t(256)));
++				// Save the complete (bounded) raw capability fingerprint for comparing
++				// QIP, Jimm, Miranda and other actual clients in field tests.
++				// Neither this fingerprint nor the unknown label alters X-status logic.
++				const bytes_t bounded = caps->data.substr(0, min(caps->data.size(), size_t(1024)));
+ 				setString(hContact, "ClientCapsFingerprint", OscarText::hex(bounded));
++				setDword(hContact, "ClientCapsSize", (uint32_t)caps->data.size());
++			}
++			if (shortCaps) {
++				const bytes_t boundedShort = shortCaps->data.substr(0, min(shortCaps->data.size(), size_t(512)));
++				setString(hContact, "ClientShortCapsFingerprint", OscarText::hex(boundedShort));
+ 			}
+ 		}
+ 	}
+@@ -1277,6 +1297,10 @@
+ 			return;
+ 		pUser->bOnline = false;
+ 		hContact = pUser->hContact;
++		// The next online announcement belongs to a new client session.
++		// Keep the historical MirVer for offline display, but do not trust it
++		// if the following session advertises an unknown capabilities set.
++		setByte(hContact, "ClientDetectKnown", 0);
+ 		{ db_unset(hContact, m_szModuleName, "XStatusId"); db_unset(hContact, m_szModuleName, "XStatusName"); db_unset(hContact, m_szModuleName, "XStatusLive"); db_unset(hContact, m_szModuleName, "XStatusMsg"); db_unset(hContact, m_szModuleName, "XStatusTextReceived"); db_unset(hContact, m_szModuleName, "XStatusQueryTS"); }
+ 	}
+ 
+--- a/PMLICQ/windows-xp-x86/0.96.7/KICQ/src/oscar.cpp
++++ b/PMLICQ/windows-xp-x86/0.96.7/KICQ/src/oscar.cpp
+@@ -1,4 +1,4 @@
+-/*
++﻿/*
+ Copyright (C) 2026 Miranda NG team
+ 
+ This program is free software; you can redistribute it and/or
+@@ -395,7 +395,9 @@
+ 	caps.bytes(unhex(CAP_UTF8));
+ 	if (xstatusGuid && *xstatusGuid)
+ 		caps.bytes(unhex(xstatusGuid));
+-	caps.bytes(unhex("563FC8090B6F41BD9F79422609DFA2F3"));
++	// Do not falsely advertise ICQ Lite/ICQ2Go's private fingerprint.
++	// It is documented as specific to those clients and can confuse third-party
++	// fingerprint databases. Our own PMLICQ marker above remains available.
+ 	caps.bytes(unhex("0946134D4C7F11D18222444553540000"));   // typing notifications
+ 	OscarWriter w;
+ 	w.tlv(5, caps);

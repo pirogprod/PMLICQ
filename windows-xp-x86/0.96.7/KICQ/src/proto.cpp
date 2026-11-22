@@ -1,4 +1,4 @@
-/*
+﻿/*
 Copyright (C) 2026 Miranda NG team
 
 This program is free software; you can redistribute it and/or
@@ -34,6 +34,7 @@ along with this program. If not, see <http://www.gnu.org/licenses/>.
 static HICON g_kicqXIcons[35] = {};
 static HANDLE g_kicqExtraIcon = nullptr;
 static HANDLE g_kicqExtraImages[35] = {};
+
 // One shared extra-icon registration serves every PMLICQ account.
 // Never store one account name globally: a second account would hide the first.
 static std::vector<CMStringA> g_kicqIconModules;
@@ -44,6 +45,7 @@ static bool KicqIsOurAccount(const char *module)
   if (!mir_strcmp(name.c_str(), module)) return true;
  return false;
 }
+
 
 
 static HICON KicqXIcon(int id)
@@ -83,7 +85,7 @@ static int KicqExtraApply(WPARAM wParam, LPARAM)
  const int confirmed = db_get_b(contact, module, "XStatusLive", 0);
  int id = confirmed ? db_get_b(contact, module, "XStatusId", 0) : 0;
  if (id >= 1 && id <= 35) {
-  if (g_kicqExtraImages[id - 1] != INVALID_HANDLE_VALUE) ExtraIcon_SetIcon(g_kicqExtraIcon, contact, g_kicqExtraImages[id - 1]);
+  if (g_kicqExtraImages[id - 1] && g_kicqExtraImages[id - 1] != INVALID_HANDLE_VALUE) ExtraIcon_SetIcon(g_kicqExtraIcon, contact, g_kicqExtraImages[id - 1]);
   else ExtraIcon_SetIcon(g_kicqExtraIcon, contact, INVALID_HANDLE_VALUE);
  }
  else ExtraIcon_SetIcon(g_kicqExtraIcon, contact, INVALID_HANDLE_VALUE);
@@ -957,7 +959,7 @@ void CKicqProto::SendXStatus()
  const int id = getByte("XStatusId", 0);
  const int count = int(sizeof(kKicqXStatuses) / sizeof(kKicqXStatuses[0]));
  const char *guid = id > 0 && id <= count ? kKicqXStatuses[id - 1].guid : nullptr;
- Send(OscarPackets::setUserInfo(1, 0, 0, guid));
+ Send(OscarPackets::setUserInfo(1, 0, 0, guid, getByte("ClientIdPreset", 0)));
 }
 
 INT_PTR __cdecl CKicqProto::OnMenuXStatus(WPARAM, LPARAM)

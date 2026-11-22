@@ -1,0 +1,346 @@
+--- a/PMLICQ/normal/0.96.7/KICQ/src/proto.cpp
++++ b/PMLICQ/normal/0.96.7/KICQ/src/proto.cpp
+@@ -1636,6 +1636,38 @@
+  return ok;
+ }
+ 
++// A cache entry is usable only when it is an actual non-empty file.
++static bool KicqAvatarFileReady(const wchar_t *path)
++{
++ if (!path || !*path) return false;
++ WIN32_FILE_ATTRIBUTE_DATA attributes = {};
++ if (!GetFileAttributesExW(path, GetFileExInfoStandard, &attributes)) return false;
++ return !(attributes.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
++  (attributes.nFileSizeHigh != 0 || attributes.nFileSizeLow != 0);
++}
++
++// Decode only protocol-provided hex hashes. A missing disk cache can be fetched
++// again even if the server does not send another presence update.
++static bool KicqAvatarDecodeHash(const char *hex, bytes_t &raw)
++{
++ if (!hex) return false;
++ const size_t length = strlen(hex);
++ if (!length || length > 128 || (length & 1)) return false;
++ raw.clear();
++ for (size_t i = 0; i < length; i += 2) {
++  auto digit = [](char value) -> int {
++   if (value >= '0' && value <= '9') return value - '0';
++   if (value >= 'a' && value <= 'f') return value - 'a' + 10;
++   if (value >= 'A' && value <= 'F') return value - 'A' + 10;
++   return -1;
++  };
++  const int hi = digit(hex[i]), lo = digit(hex[i + 1]);
++  if (hi < 0 || lo < 0) { raw.clear(); return false; }
++  raw.push_back(char((hi << 4) | lo));
++ }
++ return !raw.empty();
++}
++
+ // Avatar Services (Miranda NG 0.96.x). Uses existing BART wire/session.
+ // Called by Miranda Avatar Service to obtain an actual cached contact image.
+ // An advertised hash alone is never reported as a successfully downloaded image.
+@@ -1644,7 +1676,11 @@
+  auto *info = reinterpret_cast<PROTO_AVATAR_INFORMATION *>(lParam);
+  if (!info || !info->hContact) return GAIR_NOAVATAR;
+  const auto file = getMStringW(info->hContact, "BartAvatarPath");
+- if (!file.IsEmpty() && GetFileAttributesW(file.c_str()) != INVALID_FILE_ATTRIBUTES) {
++ const auto advertisedHash = getMStringA(info->hContact, "BartAdvertisedHash");
++ const auto cachedHash = getMStringA(info->hContact, "BartAvatarHash");
++ // Do not show an earlier avatar while a newly announced BART ID downloads.
++ const bool isCurrent = advertisedHash.IsEmpty() || advertisedHash == cachedHash;
++ if (isCurrent && !file.IsEmpty() && KicqAvatarFileReady(file.c_str())) {
+   const wchar_t *ext = wcsrchr(file.c_str(), L'.');
+   info->format = PA_FORMAT_UNKNOWN;
+   if (ext) {
+@@ -1657,9 +1693,14 @@
+   wcscpy_s(info->filename, _countof(info->filename), file.c_str());
+   return GAIR_SUCCESS;
+  }
+- // The BART worker will send ACKTYPE_AVATAR with a completed filename.
+- // No metadata means no reliable way to fetch a contact image yet.
++ // If the cache file has gone missing (cleanup, profile move, etc.),
++ // fetch the last advertised image instead of waiting for another presence.
+  if (!m_bOnline) return GAIR_NOAVATAR;
++ const uint32_t uin = getDword(info->hContact, "UIN", 0);
++ const auto announced = getMStringA(info->hContact, "BartAdvertisedHash");
++ bytes_t announcedRaw;
++ if (uin && KicqAvatarDecodeHash(announced.c_str(), announcedRaw))
++  QueueBartAvatar(uin, db_get_w(info->hContact, m_szModuleName, "BartAdvertisedType", 1), announcedRaw);
+  mir_cslock lock(m_csBart);
+  for (const auto &pending : m_bartPending)
+   if (FindContact((uint32_t)strtoul(pending.screenName.c_str(), nullptr, 10)) == info->hContact)
+@@ -1670,7 +1711,7 @@
+ INT_PTR MIR_CDECL CKicqProto::OnAvatarCaps(WPARAM wParam, LPARAM lParam)
+ {
+  switch (wParam) {
+- case AF_ENABLED: return m_bOnline ? 1 : 0;
++ case AF_ENABLED: return 1; // Cached avatars remain available while offline.
+  case AF_MAXSIZE: if (lParam) { auto *size = reinterpret_cast<POINT *>(lParam); size->x = 128; size->y = 128; } return 0;
+  case AF_PROPORTION: return PIP_SQUARE;
+  case AF_MAXFILESIZE: return 7168;
+--- a/PMLICQ/normal/0.96.7/KICQ/src/proto.h
++++ b/PMLICQ/normal/0.96.7/KICQ/src/proto.h
+@@ -150,7 +150,7 @@
+ 	bool BartSend(HNETLIBCONN connection, uint8_t channel, const bytes_t &payload, uint16_t &sequence);
+ 	void HandleBartSnac(const bytes_t &body);
+ 	// Requests are queued by screen name and asset ID; only matching replies enter the cache.
+-	struct BartPending { std::string screenName; std::string hash; uint16_t type; };
++	struct BartPending { std::string screenName; std::string hash; uint16_t type; unsigned attempts = 0; };
+ 	std::vector<BartPending> m_bartPending;
+ 	std::vector<bytes_t> m_bartOutgoing;
+ 	// Own icon SSI state; only confirmed changes are committed.
+--- a/PMLICQ/normal/0.96.7/KICQ/src/server.cpp
++++ b/PMLICQ/normal/0.96.7/KICQ/src/server.cpp
+@@ -1815,7 +1815,13 @@
+ DWORD WINAPI CKicqProto::BartThreadEntry(LPVOID arg)
+ {
+  auto *self = static_cast<CKicqProto *>(arg);
+- self->BartThread();
++ // BART is a secondary connection. A dropped socket must not permanently
++ // suppress avatar downloads until the whole Miranda account reconnects.
++ while (!self->m_bTerminated && !InterlockedCompareExchange(&self->m_bartStop, 0, 0)) {
++  self->BartThread();
++  for (int i = 0; i < 30 && !self->m_bTerminated &&
++       !InterlockedCompareExchange(&self->m_bartStop, 0, 0); ++i) Sleep(100);
++ }
+  return 0;
+ }
+ 
+@@ -1848,6 +1854,8 @@
+   }
+   if (id.type != 1 || id.hash.empty() || id.hash.size() > 64) continue;
+   const std::string hash = bart::hexHash(id.hash);
++  db_set_s(contact, m_szModuleName, "BartAdvertisedHash", hash.c_str());
++  db_set_w(contact, m_szModuleName, "BartAdvertisedType", id.type);
+   // The hash in the database denotes a *downloaded* image, not merely an
+   // advertised one. Failed requests must be eligible for another attempt.
+   const auto stored = getMStringA(contact, "BartAvatarHash");
+@@ -2000,14 +2008,26 @@
+  if (!bart::parseDownloadReply(snac.payload, reply)) {
+   debugLogA("BART: malformed download response"); return;
+  }
+- // Never associate an unsolicited image with a contact.
+- bool matched = false;
++ // Match the exact BART ID. On a transient server error, retry at most
++ // twice; do not create an endless request/response loop.
++ const bool imageOk = reply.result == 0 && bart::isSupportedImage(reply.image);
++ bool matched = false, retry = false;
+  {
+   mir_cslock lock(m_csBart);
+   for (auto it = m_bartPending.begin(); it != m_bartPending.end(); ++it) {
+    if (it->screenName == reply.screenName && it->hash == reply.id.hash && it->type == reply.id.type) {
+-    m_bartPending.erase(it);
+     matched = true;
++    if (!imageOk && it->attempts < 2) {
++     ++it->attempts;
++     bart::AssetId id; id.type = it->type; id.hash = it->hash;
++     bytes_t request, wire;
++     if (bart::makeDownload(it->screenName, id, request) &&
++         bart::makeSnac({0x10, 0x06, 0, 0, request}, wire)) {
++      m_bartOutgoing.push_back(wire);
++      retry = true;
++     }
++    }
++    if (!retry) m_bartPending.erase(it);
+     break;
+    }
+   }
+@@ -2016,9 +2036,9 @@
+   debugLogA("BART: unsolicited or unmatched image reply for %s", reply.screenName.c_str());
+   return;
+  }
+- if (reply.result != 0 || !bart::isSupportedImage(reply.image)) {
+-  debugLogA("BART: image request failed for %s (result=%u size=%u)",
+-   reply.screenName.c_str(), (unsigned)reply.result, (unsigned)reply.image.size());
++ if (!imageOk) {
++  debugLogA("BART: image request failed for %s (result=%u size=%u retry=%d)",
++   reply.screenName.c_str(), (unsigned)reply.result, (unsigned)reply.image.size(), int(retry));
+   return;
+  }
+  // Cache path is segregated by Miranda account and uses only a hexadecimal hash.
+@@ -2055,6 +2075,12 @@
+  if (uin && std::to_string(uin) == reply.screenName) {
+   MCONTACT contact = FindContact((uint32_t)uin);
+   if (contact) {
++   // Ignore an older reply if presence already announced a different avatar.
++   const auto current = getMStringA(contact, "BartAdvertisedHash");
++   if (!current.IsEmpty() && current != name.c_str()) {
++    debugLogA("BART: discarded obsolete avatar for %lu", uin);
++    return;
++   }
+    db_set_ws(contact, m_szModuleName, "BartAvatarPath", path.c_str());
+    db_set_s(contact, m_szModuleName, "BartAvatarHash", name.c_str());
+    db_set_ws(contact, "ContactPhoto", "File", path.c_str());
+--- a/PMLICQ/normal/0.96.8/PMLICQ-avatar-ssi-update-delete/KICQ/src/proto.cpp
++++ b/PMLICQ/normal/0.96.8/PMLICQ-avatar-ssi-update-delete/KICQ/src/proto.cpp
+@@ -1631,6 +1631,38 @@
+  return ok;
+ }
+ 
++// A cache entry is usable only when it is an actual non-empty file.
++static bool KicqAvatarFileReady(const wchar_t *path)
++{
++ if (!path || !*path) return false;
++ WIN32_FILE_ATTRIBUTE_DATA attributes = {};
++ if (!GetFileAttributesExW(path, GetFileExInfoStandard, &attributes)) return false;
++ return !(attributes.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
++  (attributes.nFileSizeHigh != 0 || attributes.nFileSizeLow != 0);
++}
++
++// Decode only protocol-provided hex hashes. A missing disk cache can be fetched
++// again even if the server does not send another presence update.
++static bool KicqAvatarDecodeHash(const char *hex, bytes_t &raw)
++{
++ if (!hex) return false;
++ const size_t length = strlen(hex);
++ if (!length || length > 128 || (length & 1)) return false;
++ raw.clear();
++ for (size_t i = 0; i < length; i += 2) {
++  auto digit = [](char value) -> int {
++   if (value >= '0' && value <= '9') return value - '0';
++   if (value >= 'a' && value <= 'f') return value - 'a' + 10;
++   if (value >= 'A' && value <= 'F') return value - 'A' + 10;
++   return -1;
++  };
++  const int hi = digit(hex[i]), lo = digit(hex[i + 1]);
++  if (hi < 0 || lo < 0) { raw.clear(); return false; }
++  raw.push_back(char((hi << 4) | lo));
++ }
++ return !raw.empty();
++}
++
+ // Avatar Services (Miranda NG 0.96.x). Uses existing BART wire/session.
+ // Called by Miranda Avatar Service to obtain an actual cached contact image.
+ // An advertised hash alone is never reported as a successfully downloaded image.
+@@ -1639,7 +1671,11 @@
+  auto *info = reinterpret_cast<PROTO_AVATAR_INFORMATION *>(lParam);
+  if (!info || !info->hContact) return GAIR_NOAVATAR;
+  const auto file = getMStringW(info->hContact, "BartAvatarPath");
+- if (!file.IsEmpty() && GetFileAttributesW(file.c_str()) != INVALID_FILE_ATTRIBUTES) {
++ const auto advertisedHash = getMStringA(info->hContact, "BartAdvertisedHash");
++ const auto cachedHash = getMStringA(info->hContact, "BartAvatarHash");
++ // Do not show an earlier avatar while a newly announced BART ID downloads.
++ const bool isCurrent = advertisedHash.IsEmpty() || advertisedHash == cachedHash;
++ if (isCurrent && !file.IsEmpty() && KicqAvatarFileReady(file.c_str())) {
+   const wchar_t *ext = wcsrchr(file.c_str(), L'.');
+   info->format = PA_FORMAT_UNKNOWN;
+   if (ext) {
+@@ -1652,9 +1688,14 @@
+   wcscpy_s(info->filename, _countof(info->filename), file.c_str());
+   return GAIR_SUCCESS;
+  }
+- // The BART worker will send ACKTYPE_AVATAR with a completed filename.
+- // No metadata means no reliable way to fetch a contact image yet.
++ // If the cache file has gone missing (cleanup, profile move, etc.),
++ // fetch the last advertised image instead of waiting for another presence.
+  if (!m_bOnline) return GAIR_NOAVATAR;
++ const uint32_t uin = getDword(info->hContact, "UIN", 0);
++ const auto announced = getMStringA(info->hContact, "BartAdvertisedHash");
++ bytes_t announcedRaw;
++ if (uin && KicqAvatarDecodeHash(announced.c_str(), announcedRaw))
++  QueueBartAvatar(uin, db_get_w(info->hContact, m_szModuleName, "BartAdvertisedType", 1), announcedRaw);
+  mir_cslock lock(m_csBart);
+  for (const auto &pending : m_bartPending)
+   if (FindContact((uint32_t)strtoul(pending.screenName.c_str(), nullptr, 10)) == info->hContact)
+@@ -1665,7 +1706,7 @@
+ INT_PTR MIR_CDECL CKicqProto::OnAvatarCaps(WPARAM wParam, LPARAM lParam)
+ {
+  switch (wParam) {
+- case AF_ENABLED: return m_bOnline ? 1 : 0;
++ case AF_ENABLED: return 1; // Cached avatars remain available while offline.
+  case AF_MAXSIZE: if (lParam) { auto *size = reinterpret_cast<POINT *>(lParam); size->x = 128; size->y = 128; } return 0;
+  case AF_PROPORTION: return PIP_SQUARE;
+  case AF_MAXFILESIZE: return 7168;
+--- a/PMLICQ/normal/0.96.8/PMLICQ-avatar-ssi-update-delete/KICQ/src/proto.h
++++ b/PMLICQ/normal/0.96.8/PMLICQ-avatar-ssi-update-delete/KICQ/src/proto.h
+@@ -150,7 +150,7 @@
+ 	bool BartSend(HNETLIBCONN connection, uint8_t channel, const bytes_t &payload, uint16_t &sequence);
+ 	void HandleBartSnac(const bytes_t &body);
+ 	// Requests are queued by screen name and asset ID; only matching replies enter the cache.
+-	struct BartPending { std::string screenName; std::string hash; uint16_t type; };
++	struct BartPending { std::string screenName; std::string hash; uint16_t type; unsigned attempts = 0; };
+ 	std::vector<BartPending> m_bartPending;
+ 	std::vector<bytes_t> m_bartOutgoing;
+ 	// Own icon SSI state; only confirmed changes are committed.
+--- a/PMLICQ/normal/0.96.8/PMLICQ-avatar-ssi-update-delete/KICQ/src/server.cpp
++++ b/PMLICQ/normal/0.96.8/PMLICQ-avatar-ssi-update-delete/KICQ/src/server.cpp
+@@ -1815,7 +1815,13 @@
+ DWORD WINAPI CKicqProto::BartThreadEntry(LPVOID arg)
+ {
+  auto *self = static_cast<CKicqProto *>(arg);
+- self->BartThread();
++ // BART is a secondary connection. A dropped socket must not permanently
++ // suppress avatar downloads until the whole Miranda account reconnects.
++ while (!self->m_bTerminated && !InterlockedCompareExchange(&self->m_bartStop, 0, 0)) {
++  self->BartThread();
++  for (int i = 0; i < 30 && !self->m_bTerminated &&
++       !InterlockedCompareExchange(&self->m_bartStop, 0, 0); ++i) Sleep(100);
++ }
+  return 0;
+ }
+ 
+@@ -1848,6 +1854,8 @@
+   }
+   if (id.type != 1 || id.hash.empty() || id.hash.size() > 64) continue;
+   const std::string hash = bart::hexHash(id.hash);
++  db_set_s(contact, m_szModuleName, "BartAdvertisedHash", hash.c_str());
++  db_set_w(contact, m_szModuleName, "BartAdvertisedType", id.type);
+   // The hash in the database denotes a *downloaded* image, not merely an
+   // advertised one. Failed requests must be eligible for another attempt.
+   const auto stored = getMStringA(contact, "BartAvatarHash");
+@@ -2000,14 +2008,26 @@
+  if (!bart::parseDownloadReply(snac.payload, reply)) {
+   debugLogA("BART: malformed download response"); return;
+  }
+- // Never associate an unsolicited image with a contact.
+- bool matched = false;
++ // Match the exact BART ID. On a transient server error, retry at most
++ // twice; do not create an endless request/response loop.
++ const bool imageOk = reply.result == 0 && bart::isSupportedImage(reply.image);
++ bool matched = false, retry = false;
+  {
+   mir_cslock lock(m_csBart);
+   for (auto it = m_bartPending.begin(); it != m_bartPending.end(); ++it) {
+    if (it->screenName == reply.screenName && it->hash == reply.id.hash && it->type == reply.id.type) {
+-    m_bartPending.erase(it);
+     matched = true;
++    if (!imageOk && it->attempts < 2) {
++     ++it->attempts;
++     bart::AssetId id; id.type = it->type; id.hash = it->hash;
++     bytes_t request, wire;
++     if (bart::makeDownload(it->screenName, id, request) &&
++         bart::makeSnac({0x10, 0x06, 0, 0, request}, wire)) {
++      m_bartOutgoing.push_back(wire);
++      retry = true;
++     }
++    }
++    if (!retry) m_bartPending.erase(it);
+     break;
+    }
+   }
+@@ -2016,9 +2036,9 @@
+   debugLogA("BART: unsolicited or unmatched image reply for %s", reply.screenName.c_str());
+   return;
+  }
+- if (reply.result != 0 || !bart::isSupportedImage(reply.image)) {
+-  debugLogA("BART: image request failed for %s (result=%u size=%u)",
+-   reply.screenName.c_str(), (unsigned)reply.result, (unsigned)reply.image.size());
++ if (!imageOk) {
++  debugLogA("BART: image request failed for %s (result=%u size=%u retry=%d)",
++   reply.screenName.c_str(), (unsigned)reply.result, (unsigned)reply.image.size(), int(retry));
+   return;
+  }
+  // Cache path is segregated by Miranda account and uses only a hexadecimal hash.
+@@ -2055,6 +2075,12 @@
+  if (uin && std::to_string(uin) == reply.screenName) {
+   MCONTACT contact = FindContact((uint32_t)uin);
+   if (contact) {
++   // Ignore an older reply if presence already announced a different avatar.
++   const auto current = getMStringA(contact, "BartAdvertisedHash");
++   if (!current.IsEmpty() && current != name.c_str()) {
++    debugLogA("BART: discarded obsolete avatar for %lu", uin);
++    return;
++   }
+    db_set_ws(contact, m_szModuleName, "BartAvatarPath", path.c_str());
+    db_set_s(contact, m_szModuleName, "BartAvatarHash", name.c_str());
+    db_set_ws(contact, "ContactPhoto", "File", path.c_str());

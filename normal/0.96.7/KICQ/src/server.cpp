@@ -32,6 +32,7 @@ along with this program. If not, see <http://www.gnu.org/licenses/>.
 #include <m_avatars.h>
 #include "oft2_rendezvous.h"
 #include "xstatus_catalog.h"
+#include "client_catalog_qip.h"
 
 // Used by both incoming Xtraz requests and responses.
 static bytes_t KicqUnescapeXml(bytes_t text);
@@ -145,7 +146,7 @@ void CKicqProto::ServerThread(void *)
 			db_unset(h, m_szModuleName, "XStatusId");
 			db_unset(h, m_szModuleName, "XStatusName");
 			db_unset(h, m_szModuleName, "XStatusLive");
-			ExtraIcon_SetAll(h);
+			KicqRefreshSingleXStatus(h);
 		}
 	}
 	if (m_iLoginError)
@@ -352,7 +353,7 @@ CKicqProto::ConnResult CKicqProto::HandleFlap(int channel, const bytes_t &data, 
 		if (bLogin) {
 			debugLogA("login server hello, sending XOR login");
 			ptrA szPassword(getStringA("Password"));
-			Send(1, OscarPackets::xorLogin(m_szUin, szPassword ? szPassword.get() : ""));
+			Send(1, OscarPackets::xorLogin(m_szUin, szPassword ? szPassword.get() : "", getByte("ClientIdPreset", 0)));
 		}
 		else {
 			debugLogA("BOS hello, sending cookie");
@@ -673,7 +674,7 @@ void CKicqProto::FinishLogin()
 		m_iStatus = ID_STATUS_ONLINE;
 
 	auto *pVer = &pluginInfoEx.version;
-	Send(OscarPackets::setUserInfo(HIBYTE(HIWORD(*pVer)), LOBYTE(HIWORD(*pVer)), HIBYTE(LOWORD(*pVer))));
+	Send(OscarPackets::setUserInfo(HIBYTE(HIWORD(*pVer)), LOBYTE(HIWORD(*pVer)), HIBYTE(LOWORD(*pVer)), nullptr, getByte("ClientIdPreset", 0)));
 	Send(OscarPackets::setIcbmParams());
 	// Subscribe to presence for SSI contacts. The server sends 03/0B and
 	// 03/0C updates to clients registered via BuddyAddBuddies (03/04).
@@ -956,6 +957,7 @@ void CKicqProto::HandleUserOnline(const bytes_t &data)
 	MCONTACT hContact;
 	bool bFull;
 	bool xstatusChanged = false;
+	bool clientIconChanged = false;
 	{
 		mir_cslock lck(m_csRoster);
 		auto *pUser = FindUser(uin);
@@ -994,6 +996,10 @@ void CKicqProto::HandleUserOnline(const bytes_t &data)
 			/* Refresh after roster lock is released below. */
 			pUser->bUtf8 = pUser->bServerRelay = false;
 			CMStringA szMirVer;
+			bool detectedPmlichq = false;
+			bool hasPmlichqVersion = false;
+			uint16_t pmVersion[4] = {};
+			uint8_t pmPreset = 0;
 			if (caps) {
 				OscarReader cr(caps->data);
 				while (cr.remaining() >= 16) {
@@ -1003,11 +1009,22 @@ void CKicqProto::HandleUserOnline(const bytes_t &data)
 						pUser->bUtf8 = true;
 					else if (cap == CAP_SERVER_RELAY)
 						pUser->bServerRelay = true;
-					else if (!memcmp(raw.data(), "Jasmine ver\xFF", 12))
+					else if (raw.size() == 16 && memcmp(raw.data(), "PMLV", 4) == 0 &&
+						(uint8_t)raw[5] == 1 && raw[14] == 'P' && raw[15] == 'M') {
+						pmPreset = (uint8_t)raw[4];
+						for (int k = 0; k < 4; ++k)
+							pmVersion[k] = ((uint8_t)raw[6 + k * 2] << 8) | (uint8_t)raw[7 + k * 2];
+						hasPmlichqVersion = true;
+					}
+					else if (!memcmp(raw.data(), "Miranda PMLICQ", 14)) {
+						// A first-party fingerprint wins over any obsolete Jasmine marker,
+						// regardless of the order of capabilities in the packet.
+						detectedPmlichq = true;
+						 szMirVer = "Miranda NG PMLICQ";
+					}
+					else if (!memcmp(raw.data(), "Jasmine ver\xFF", 12) && !detectedPmlichq && szMirVer.IsEmpty())
 						szMirVer.Format("Jasmine IM %d.%d.%d", (uint8_t)raw[12], (uint8_t)raw[13], (uint8_t)raw[14]);
-					else if (!memcmp(raw.data(), "Miranda PMLICQ", 14) && szMirVer.IsEmpty())
-						szMirVer = "Miranda NG PMLICQ";
-					else if (!memcmp(raw.data(), "Miranda KICQ", 12) && szMirVer.IsEmpty())
+					else if (!memcmp(raw.data(), "Miranda KICQ", 12) && !detectedPmlichq && szMirVer.IsEmpty())
 						szMirVer = "Miranda NG KICQ";
 				}
 			}
@@ -1021,17 +1038,108 @@ void CKicqProto::HandleUserOnline(const bytes_t &data)
 						pUser->bServerRelay = true;
 				}
 			}
-			if (!szMirVer.IsEmpty())
-				setString(hContact, "MirVer", szMirVer);
+			// PMLV is a self-identifying PMLICQ version capability. A server may
+			// omit or reorder the older human-readable marker, so do not require it.
+			if (hasPmlichqVersion)
+				detectedPmlichq = true;
+			if (detectedPmlichq && hasPmlichqVersion) {
+				// Do not label it as genuine QIP/Jimm: this is still PMLICQ.
+				szMirVer.Format("Miranda NG PMLICQ %u.%u.%u.%u",
+					(unsigned)pmVersion[0], (unsigned)pmVersion[1],
+					(unsigned)pmVersion[2], (unsigned)pmVersion[3]);
+				if (pmPreset != 0 && pmPreset != 1) {
+					static const char *const presetNames[] = {
+						"PMLICQ", "Miranda NG", "Miranda IM", "QIP 2005",
+						"QIP 2010", "QIP Infium", "QIP 2012", "Jimm",
+						"ICQ 2003b", "ICQ 6", "AIM 5.x"
+					};
+					if (pmPreset < _countof(presetNames)) {
+						CMStringA suffix;
+						suffix.Format(" [Client ID: %s]", presetNames[pmPreset]);
+						szMirVer += suffix;
+					}
+				}
+			}
+			// QIP 2005 client catalog: identify remote clients by their real
+			// capability fingerprints, without changing status or advertised caps.
+			// Our own PMLICQ/PMLV marker always takes precedence.
+			if (!detectedPmlichq && szMirVer.IsEmpty()) {
+				// OSCAR buddy presence may carry legacy 16-byte capabilities in
+				// TLV 0x000D, compact 2-byte capabilities in TLV 0x0019, or both.
+				// Normalize compact 0x13xx GUIDs for detection ONLY. Never publish
+				// synthesized capabilities or use them to determine X-status.
+				const bytes_t combined = KicqCatalogMergeCapabilities(
+					caps ? &caps->data : nullptr,
+					shortCaps ? &shortCaps->data : nullptr);
+				// Prefer exact raw full-capability signatures before merging compact
+				// 0x0019 capabilities. Otherwise extra compact GUIDs can invalidate
+				// strict 14-GUID signatures and fall through to generic Jimm.
+				const char *catalogName = caps ? KicqDetectByQipCatalog(
+					reinterpret_cast<const unsigned char *>(caps->data.data()), caps->data.size()) : nullptr;
+				if (!catalogName) catalogName = KicqDetectByQipCatalog(
+					reinterpret_cast<const unsigned char *>(combined.data()), combined.size());
+				if (catalogName && *catalogName)
+					szMirVer = catalogName;
+			}
+			// The client identification is an observation, not the X-status.
+			// Do not erase a valid identification merely because a full presence
+			// refresh contains capabilities that our detector does not yet know.
+			// No arbitrary version may be inferred from generic OSCAR feature GUIDs.
+			if (!szMirVer.IsEmpty()) {
+				ptrA previous(db_get_sa(hContact, m_szModuleName, "MirVer"));
+				if (!previous || mir_strcmp(previous, szMirVer.c_str())) {
+					setString(hContact, "MirVer", szMirVer);
+					clientIconChanged = true;
+				}
+				if (!getByte(hContact, "ClientDetectKnown", 0))
+					setByte(hContact, "ClientDetectKnown", 1);
+			}
+			else if (caps || shortCaps) {
+				// Preserve known names on incomplete updates, but show unknown after a new session.
+				if (!getByte(hContact, "ClientDetectKnown", 0)) {
+					static const char *const unknown = "OSCAR client (unidentified)";
+					ptrA previous(db_get_sa(hContact, m_szModuleName, "MirVer"));
+					if (!previous || mir_strcmp(previous, unknown)) {
+						setString(hContact, "MirVer", unknown);
+						clientIconChanged = true;
+					}
+				}
+			}
+			if (caps) {
+				// Save the complete (bounded) raw capability fingerprint for comparing
+				// QIP, Jimm, Miranda and other actual clients in field tests.
+				// Neither this fingerprint nor the unknown label alters X-status logic.
+				const bytes_t bounded = caps->data.substr(0, min(caps->data.size(), size_t(1024)));
+				const CMStringA fingerprint(OscarText::hex(bounded));
+				ptrA previous(db_get_sa(hContact, m_szModuleName, "ClientCapsFingerprint"));
+				if (!previous || mir_strcmp(previous, fingerprint.c_str()))
+					setString(hContact, "ClientCapsFingerprint", fingerprint);
+				if (getDword(hContact, "ClientCapsSize", 0) != (uint32_t)caps->data.size())
+					setDword(hContact, "ClientCapsSize", (uint32_t)caps->data.size());
+			}
+			if (shortCaps) {
+				const bytes_t boundedShort = shortCaps->data.substr(0, min(shortCaps->data.size(), size_t(512)));
+				const CMStringA fingerprint(OscarText::hex(boundedShort));
+				ptrA previous(db_get_sa(hContact, m_szModuleName, "ClientShortCapsFingerprint"));
+				if (!previous || mir_strcmp(previous, fingerprint.c_str()))
+					setString(hContact, "ClientShortCapsFingerprint", fingerprint);
+				if (getDword(hContact, "ClientShortCapsSize", 0) != (uint32_t)shortCaps->data.size())
+					setDword(hContact, "ClientShortCapsSize", (uint32_t)shortCaps->data.size());
+			}
 		}
 	}
 
 	auto *st = tlvs.find(6);
 	int iStatus = st ? OscarReader(st->data, 2).u16() : ICQ_STATUS_ONLINE;
-	setWord(hContact, "Status", IcqToMirandaStatus(iStatus));
-	// Apply the registered extra icon after releasing the roster lock.
-	// A short capability update must not clear an existing X-status.
-	if (xstatusChanged) ExtraIcon_SetAll(hContact);
+	const WORD newStatus = IcqToMirandaStatus(iStatus);
+	if (getWord(hContact, "Status", ID_STATUS_OFFLINE) != newStatus)
+		setWord(hContact, "Status", newStatus);
+	// Both calls apply pre-registered icon handles to this contact only.
+	// Never rebuild all ExtraIcons for a repeated presence notification.
+	if (clientIconChanged)
+
+	if (xstatusChanged)
+		KicqRefreshSingleXStatus(hContact);
     // QIP can change the X-status title/description without changing its GUID.
     // Re-query on subsequent full presence notifications, throttled per contact.
     // This does not trigger ExtraIcon_SetAll, preserving the no-lag fix.
@@ -1114,11 +1222,16 @@ void CKicqProto::HandleUserOffline(const bytes_t &data)
 			return;
 		pUser->bOnline = false;
 		hContact = pUser->hContact;
+		// The next online announcement belongs to a new client session.
+		// Keep the historical MirVer for offline display, but do not trust it
+		// if the following session advertises an unknown capabilities set.
+		setByte(hContact, "ClientDetectKnown", 0);
 		{ db_unset(hContact, m_szModuleName, "XStatusId"); db_unset(hContact, m_szModuleName, "XStatusName"); db_unset(hContact, m_szModuleName, "XStatusLive"); db_unset(hContact, m_szModuleName, "XStatusMsg"); db_unset(hContact, m_szModuleName, "XStatusTextReceived"); db_unset(hContact, m_szModuleName, "XStatusQueryTS"); }
 	}
 
-	setWord(hContact, "Status", ID_STATUS_OFFLINE);
- ExtraIcon_SetAll(hContact);
+	if (getWord(hContact, "Status", ID_STATUS_OFFLINE) != ID_STATUS_OFFLINE)
+		setWord(hContact, "Status", ID_STATUS_OFFLINE);
+	KicqRefreshSingleXStatus(hContact);
 	db_unset(hContact, "CList", "StatusMsg");
 	CallService(MS_PROTO_CONTACTISTYPING, hContact, PROTOTYPE_CONTACTTYPING_OFF);
 }
@@ -1815,7 +1928,13 @@ void CKicqProto::HandleYouWereAdded(const bytes_t &data)
 DWORD WINAPI CKicqProto::BartThreadEntry(LPVOID arg)
 {
  auto *self = static_cast<CKicqProto *>(arg);
- self->BartThread();
+ // BART is a secondary connection. A dropped socket must not permanently
+ // suppress avatar downloads until the whole Miranda account reconnects.
+ while (!self->m_bTerminated && !InterlockedCompareExchange(&self->m_bartStop, 0, 0)) {
+  self->BartThread();
+  for (int i = 0; i < 30 && !self->m_bTerminated &&
+       !InterlockedCompareExchange(&self->m_bartStop, 0, 0); ++i) Sleep(100);
+ }
  return 0;
 }
 
@@ -1848,6 +1967,8 @@ void CKicqProto::ObserveBartPresence(uint32_t uin, const bytes_t &raw)
   }
   if (id.type != 1 || id.hash.empty() || id.hash.size() > 64) continue;
   const std::string hash = bart::hexHash(id.hash);
+  db_set_s(contact, m_szModuleName, "BartAdvertisedHash", hash.c_str());
+  db_set_w(contact, m_szModuleName, "BartAdvertisedType", id.type);
   // The hash in the database denotes a *downloaded* image, not merely an
   // advertised one. Failed requests must be eligible for another attempt.
   const auto stored = getMStringA(contact, "BartAvatarHash");
@@ -2000,14 +2121,26 @@ void CKicqProto::HandleBartSnac(const bytes_t &payload)
  if (!bart::parseDownloadReply(snac.payload, reply)) {
   debugLogA("BART: malformed download response"); return;
  }
- // Never associate an unsolicited image with a contact.
- bool matched = false;
+ // Match the exact BART ID. On a transient server error, retry at most
+ // twice; do not create an endless request/response loop.
+ const bool imageOk = reply.result == 0 && bart::isSupportedImage(reply.image);
+ bool matched = false, retry = false;
  {
   mir_cslock lock(m_csBart);
   for (auto it = m_bartPending.begin(); it != m_bartPending.end(); ++it) {
    if (it->screenName == reply.screenName && it->hash == reply.id.hash && it->type == reply.id.type) {
-    m_bartPending.erase(it);
     matched = true;
+    if (!imageOk && it->attempts < 2) {
+     ++it->attempts;
+     bart::AssetId id; id.type = it->type; id.hash = it->hash;
+     bytes_t request, wire;
+     if (bart::makeDownload(it->screenName, id, request) &&
+         bart::makeSnac({0x10, 0x06, 0, 0, request}, wire)) {
+      m_bartOutgoing.push_back(wire);
+      retry = true;
+     }
+    }
+    if (!retry) m_bartPending.erase(it);
     break;
    }
   }
@@ -2016,9 +2149,9 @@ void CKicqProto::HandleBartSnac(const bytes_t &payload)
   debugLogA("BART: unsolicited or unmatched image reply for %s", reply.screenName.c_str());
   return;
  }
- if (reply.result != 0 || !bart::isSupportedImage(reply.image)) {
-  debugLogA("BART: image request failed for %s (result=%u size=%u)",
-   reply.screenName.c_str(), (unsigned)reply.result, (unsigned)reply.image.size());
+ if (!imageOk) {
+  debugLogA("BART: image request failed for %s (result=%u size=%u retry=%d)",
+   reply.screenName.c_str(), (unsigned)reply.result, (unsigned)reply.image.size(), int(retry));
   return;
  }
  // Cache path is segregated by Miranda account and uses only a hexadecimal hash.
@@ -2055,6 +2188,12 @@ void CKicqProto::HandleBartSnac(const bytes_t &payload)
  if (uin && std::to_string(uin) == reply.screenName) {
   MCONTACT contact = FindContact((uint32_t)uin);
   if (contact) {
+   // Ignore an older reply if presence already announced a different avatar.
+   const auto current = getMStringA(contact, "BartAdvertisedHash");
+   if (!current.IsEmpty() && current != name.c_str()) {
+    debugLogA("BART: discarded obsolete avatar for %lu", uin);
+    return;
+   }
    db_set_ws(contact, m_szModuleName, "BartAvatarPath", path.c_str());
    db_set_s(contact, m_szModuleName, "BartAvatarHash", name.c_str());
    db_set_ws(contact, "ContactPhoto", "File", path.c_str());

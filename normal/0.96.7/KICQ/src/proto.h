@@ -1,4 +1,4 @@
-/*
+﻿/*
 Copyright (C) 2026 Miranda NG team
 
 This program is free software; you can redistribute it and/or
@@ -150,7 +150,7 @@ private:
 	bool BartSend(HNETLIBCONN connection, uint8_t channel, const bytes_t &payload, uint16_t &sequence);
 	void HandleBartSnac(const bytes_t &body);
 	// Requests are queued by screen name and asset ID; only matching replies enter the cache.
-	struct BartPending { std::string screenName; std::string hash; uint16_t type; };
+	struct BartPending { std::string screenName; std::string hash; uint16_t type; unsigned attempts = 0; };
 	std::vector<BartPending> m_bartPending;
 	std::vector<bytes_t> m_bartOutgoing;
 	// Own icon SSI state; only confirmed changes are committed.
@@ -314,3 +314,6 @@ struct CMPlugin : public ACCPROTOPLUGIN<CKicqProto>
 
 	int Load() override;
 };
+
+
+void KicqRefreshSingleXStatus(MCONTACT hContact);

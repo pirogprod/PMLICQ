@@ -1,4 +1,4 @@
-// Microsoft Visual C++ generated resource script.
+﻿// Microsoft Visual C++ generated resource script.
 //
 #include "..\src\resource.h"
 
@@ -23,7 +23,7 @@ LANGUAGE LANG_ENGLISH, SUBLANG_ENGLISH_US
 // Dialog
 //
 
-IDD_ACCMGRUI DIALOGEX 0, 0, 186, 126
+IDD_ACCMGRUI DIALOGEX 0, 0, 186, 150
 STYLE DS_SETFONT | DS_FIXEDSYS | WS_CHILD
 EXSTYLE WS_EX_CONTROLPARENT
 FONT 8, "MS Shell Dlg", 0, 0, 0x1
@@ -41,10 +41,12 @@ BEGIN
     LTEXT           "ARS proxy:",IDC_STATIC,0,87,60,8
     EDITTEXT        IDC_FILEPROXY,62,85,86,12,ES_AUTOHSCROLL
     EDITTEXT        IDC_FILEPROXY_PORT,150,85,35,12,ES_AUTOHSCROLL | ES_NUMBER
-    LTEXT           "Only the first 8 characters of the password are used by the ICQ login of this server.",IDC_STATIC,0,103,185,18
+    LTEXT           "Client ID:",IDC_STATIC,0,105,60,8
+    COMBOBOX        IDC_CLIENT_ID,62,103,123,92,CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "Only the first 8 characters of the password are used by the ICQ login of this server.",IDC_STATIC,0,124,185,18
 END
 
-IDD_OPTIONS DIALOGEX 0, 0, 305, 156
+IDD_OPTIONS DIALOGEX 0, 0, 305, 185
 STYLE DS_SETFONT | DS_FIXEDSYS | WS_CHILD
 EXSTYLE WS_EX_CONTROLPARENT
 FONT 8, "MS Shell Dlg", 0, 0, 0x1
@@ -54,7 +56,7 @@ BEGIN
     EDITTEXT        IDC_UIN,100,20,120,12,ES_AUTOHSCROLL | ES_NUMBER
     LTEXT           "Password:",IDC_STATIC,15,40,80,8
     EDITTEXT        IDC_PASSWORD,100,38,120,12,ES_PASSWORD | ES_AUTOHSCROLL
-    GROUPBOX        "Connection",IDC_STATIC,7,73,291,78
+    GROUPBOX        "Connection",IDC_STATIC,7,73,291,103
     LTEXT           "Server:",IDC_STATIC,15,88,80,8
     EDITTEXT        IDC_SERVER,100,86,120,12,ES_AUTOHSCROLL
     LTEXT           "Port:",IDC_STATIC,15,104,80,8
@@ -65,6 +67,8 @@ BEGIN
     EDITTEXT        IDC_FILEPROXY,100,134,120,12,ES_AUTOHSCROLL
     LTEXT           "Port:",IDC_STATIC,226,136,20,8
     EDITTEXT        IDC_FILEPROXY_PORT,248,134,40,12,ES_AUTOHSCROLL | ES_NUMBER
+    LTEXT           "Client ID:",IDC_STATIC,15,153,80,8
+    COMBOBOX        IDC_CLIENT_ID,100,150,185,110,CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
 END
 
 
@@ -98,6 +102,8 @@ END
 //
 
 IDI_KICQ                ICON                    "kicq.ico"
+
+// Client identification extra icons
 
 #endif    // English (United States) resources
 /////////////////////////////////////////////////////////////////////////////

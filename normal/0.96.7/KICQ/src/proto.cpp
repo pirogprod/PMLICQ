@@ -1,4 +1,4 @@
-/*
+﻿/*
 Copyright (C) 2026 Miranda NG team
 
 This program is free software; you can redistribute it and/or
@@ -33,6 +33,7 @@ along with this program. If not, see <http://www.gnu.org/licenses/>.
 static HICON g_kicqXIcons[35] = {};
 static HANDLE g_kicqExtraIcon = nullptr;
 static HANDLE g_kicqExtraImages[35] = {};
+
 // One shared extra-icon registration serves every PMLICQ account.
 // Never store one account name globally: a second account would hide the first.
 static std::vector<CMStringA> g_kicqIconModules;
@@ -43,6 +44,7 @@ static bool KicqIsOurAccount(const char *module)
   if (!mir_strcmp(name.c_str(), module)) return true;
  return false;
 }
+
 
 
 static HICON KicqXIcon(int id)
@@ -82,11 +84,18 @@ static int KicqExtraApply(WPARAM wParam, LPARAM)
  const int confirmed = db_get_b(contact, module, "XStatusLive", 0);
  int id = confirmed ? db_get_b(contact, module, "XStatusId", 0) : 0;
  if (id >= 1 && id <= 35) {
-  if (g_kicqExtraImages[id - 1] != INVALID_HANDLE_VALUE) ExtraIcon_SetIcon(g_kicqExtraIcon, contact, g_kicqExtraImages[id - 1]);
+  if (g_kicqExtraImages[id - 1] && g_kicqExtraImages[id - 1] != INVALID_HANDLE_VALUE) ExtraIcon_SetIcon(g_kicqExtraIcon, contact, g_kicqExtraImages[id - 1]);
   else ExtraIcon_SetIcon(g_kicqExtraIcon, contact, INVALID_HANDLE_VALUE);
  }
  else ExtraIcon_SetIcon(g_kicqExtraIcon, contact, INVALID_HANDLE_VALUE);
  return 0;
+}
+
+// Refresh only this contact, never the entire ExtraIcons registry on a presence event.
+void KicqRefreshSingleXStatus(MCONTACT hContact)
+{
+ if (hContact && g_kicqExtraIcon)
+  KicqExtraApply((WPARAM)hContact, 0);
 }
 
 static int CompareUsers(const KicqUser *p1, const KicqUser *p2)
@@ -634,7 +643,7 @@ int CKicqProto::OnSettingChanged(WPARAM hContact, LPARAM lParam)
 	if (hContact && cws && cws->szModule && cws->szSetting &&
 		!mir_strcmp(cws->szModule, m_szModuleName) &&
 		!mir_strcmp(cws->szSetting, "Status")) {
-		ExtraIcon_SetAll((MCONTACT)hContact);
+		KicqRefreshSingleXStatus((MCONTACT)hContact);
 	}
 	if (hContact == 0 && cws && cws->szModule && cws->szSetting &&
 		!mir_strcmp(cws->szModule, m_szModuleName) && !m_bProfileSync) {
@@ -936,7 +945,7 @@ void CKicqProto::SendXStatus()
  const int id = getByte("XStatusId", 0);
  const int count = int(sizeof(kKicqXStatuses) / sizeof(kKicqXStatuses[0]));
  const char *guid = id > 0 && id <= count ? kKicqXStatuses[id - 1].guid : nullptr;
- Send(OscarPackets::setUserInfo(1, 0, 0, guid));
+ Send(OscarPackets::setUserInfo(1, 0, 0, guid, getByte("ClientIdPreset", 0)));
 }
 
 INT_PTR __cdecl CKicqProto::OnMenuXStatus(WPARAM, LPARAM)
@@ -1636,6 +1645,38 @@ static bool CalcAvatarMd5(const bytes_t &data, bytes_t &digest)
  return ok;
 }
 
+// A cache entry is usable only when it is an actual non-empty file.
+static bool KicqAvatarFileReady(const wchar_t *path)
+{
+ if (!path || !*path) return false;
+ WIN32_FILE_ATTRIBUTE_DATA attributes = {};
+ if (!GetFileAttributesExW(path, GetFileExInfoStandard, &attributes)) return false;
+ return !(attributes.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+  (attributes.nFileSizeHigh != 0 || attributes.nFileSizeLow != 0);
+}
+
+// Decode only protocol-provided hex hashes. A missing disk cache can be fetched
+// again even if the server does not send another presence update.
+static bool KicqAvatarDecodeHash(const char *hex, bytes_t &raw)
+{
+ if (!hex) return false;
+ const size_t length = strlen(hex);
+ if (!length || length > 128 || (length & 1)) return false;
+ raw.clear();
+ for (size_t i = 0; i < length; i += 2) {
+  auto digit = [](char value) -> int {
+   if (value >= '0' && value <= '9') return value - '0';
+   if (value >= 'a' && value <= 'f') return value - 'a' + 10;
+   if (value >= 'A' && value <= 'F') return value - 'A' + 10;
+   return -1;
+  };
+  const int hi = digit(hex[i]), lo = digit(hex[i + 1]);
+  if (hi < 0 || lo < 0) { raw.clear(); return false; }
+  raw.push_back(char((hi << 4) | lo));
+ }
+ return !raw.empty();
+}
+
 // Avatar Services (Miranda NG 0.96.x). Uses existing BART wire/session.
 // Called by Miranda Avatar Service to obtain an actual cached contact image.
 // An advertised hash alone is never reported as a successfully downloaded image.
@@ -1644,7 +1685,11 @@ INT_PTR MIR_CDECL CKicqProto::OnGetAvatarInfo(WPARAM, LPARAM lParam)
  auto *info = reinterpret_cast<PROTO_AVATAR_INFORMATION *>(lParam);
  if (!info || !info->hContact) return GAIR_NOAVATAR;
  const auto file = getMStringW(info->hContact, "BartAvatarPath");
- if (!file.IsEmpty() && GetFileAttributesW(file.c_str()) != INVALID_FILE_ATTRIBUTES) {
+ const auto advertisedHash = getMStringA(info->hContact, "BartAdvertisedHash");
+ const auto cachedHash = getMStringA(info->hContact, "BartAvatarHash");
+ // Do not show an earlier avatar while a newly announced BART ID downloads.
+ const bool isCurrent = advertisedHash.IsEmpty() || advertisedHash == cachedHash;
+ if (isCurrent && !file.IsEmpty() && KicqAvatarFileReady(file.c_str())) {
   const wchar_t *ext = wcsrchr(file.c_str(), L'.');
   info->format = PA_FORMAT_UNKNOWN;
   if (ext) {
@@ -1657,9 +1702,14 @@ INT_PTR MIR_CDECL CKicqProto::OnGetAvatarInfo(WPARAM, LPARAM lParam)
   wcscpy_s(info->filename, _countof(info->filename), file.c_str());
   return GAIR_SUCCESS;
  }
- // The BART worker will send ACKTYPE_AVATAR with a completed filename.
- // No metadata means no reliable way to fetch a contact image yet.
+ // If the cache file has gone missing (cleanup, profile move, etc.),
+ // fetch the last advertised image instead of waiting for another presence.
  if (!m_bOnline) return GAIR_NOAVATAR;
+ const uint32_t uin = getDword(info->hContact, "UIN", 0);
+ const auto announced = getMStringA(info->hContact, "BartAdvertisedHash");
+ bytes_t announcedRaw;
+ if (uin && KicqAvatarDecodeHash(announced.c_str(), announcedRaw))
+  QueueBartAvatar(uin, db_get_w(info->hContact, m_szModuleName, "BartAdvertisedType", 1), announcedRaw);
  mir_cslock lock(m_csBart);
  for (const auto &pending : m_bartPending)
   if (FindContact((uint32_t)strtoul(pending.screenName.c_str(), nullptr, 10)) == info->hContact)
@@ -1670,7 +1720,7 @@ INT_PTR MIR_CDECL CKicqProto::OnGetAvatarInfo(WPARAM, LPARAM lParam)
 INT_PTR MIR_CDECL CKicqProto::OnAvatarCaps(WPARAM wParam, LPARAM lParam)
 {
  switch (wParam) {
- case AF_ENABLED: return m_bOnline ? 1 : 0;
+ case AF_ENABLED: return 1; // Cached avatars remain available while offline.
  case AF_MAXSIZE: if (lParam) { auto *size = reinterpret_cast<POINT *>(lParam); size->x = 128; size->y = 128; } return 0;
  case AF_PROPORTION: return PIP_SQUARE;
  case AF_MAXFILESIZE: return 7168;

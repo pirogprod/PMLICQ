@@ -34,6 +34,7 @@ along with this program. If not, see <http://www.gnu.org/licenses/>.
 #include <m_avatars.h>
 #include "oft2_rendezvous.h"
 #include "xstatus_catalog.h"
+#include "client_catalog_qip.h"
 
 // Used by both incoming Xtraz requests and responses.
 static bytes_t KicqUnescapeXml(bytes_t text);
@@ -382,7 +383,7 @@ CKicqProto::ConnResult CKicqProto::HandleFlap(int channel, const bytes_t &data, 
 		if (bLogin) {
 			debugLogA("login server hello, sending XOR login");
 			ptrA szPassword(getStringA("Password"));
-			Send(1, OscarPackets::xorLogin(m_szUin, szPassword ? szPassword.get() : ""));
+			Send(1, OscarPackets::xorLogin(m_szUin, szPassword ? szPassword.get() : "", getByte("ClientIdPreset", 0)));
 		}
 		else {
 			debugLogA("BOS hello, sending cookie");
@@ -772,7 +773,7 @@ void CKicqProto::FinishLogin()
 		m_iStatus = ID_STATUS_ONLINE;
 
 	auto *pVer = &pluginInfoEx.version;
-	Send(OscarPackets::setUserInfo(HIBYTE(HIWORD(*pVer)), LOBYTE(HIWORD(*pVer)), HIBYTE(LOWORD(*pVer))));
+	Send(OscarPackets::setUserInfo(HIBYTE(HIWORD(*pVer)), LOBYTE(HIWORD(*pVer)), HIBYTE(LOWORD(*pVer)), nullptr, getByte("ClientIdPreset", 0)));
 	Send(OscarPackets::setIcbmParams());
 	// Subscribe to presence for SSI contacts. The server sends 03/0B and
 	// 03/0C updates to clients registered via BuddyAddBuddies (03/04).
@@ -1065,6 +1066,7 @@ void CKicqProto::HandleUserOnline(const bytes_t &data)
 	MCONTACT hContact;
 	bool bFull;
 	bool xstatusChanged = false;
+	bool clientIconChanged = false;
 	{
 		mir_cslock lck(m_csRoster);
 		auto *pUser = FindUser(uin);
@@ -1103,6 +1105,10 @@ void CKicqProto::HandleUserOnline(const bytes_t &data)
 			/* Refresh after roster lock is released below. */
 			pUser->bUtf8 = pUser->bServerRelay = false;
 			CMStringA szMirVer;
+			bool detectedPmlichq = false;
+			bool hasPmlichqVersion = false;
+			uint16_t pmVersion[4] = {};
+			uint8_t pmPreset = 0;
 			if (caps) {
 				OscarReader cr(caps->data);
 				while (cr.remaining() >= 16) {
@@ -1112,11 +1118,22 @@ void CKicqProto::HandleUserOnline(const bytes_t &data)
 						pUser->bUtf8 = true;
 					else if (cap == CAP_SERVER_RELAY)
 						pUser->bServerRelay = true;
-					else if (!memcmp(raw.data(), "Jasmine ver\xFF", 12))
+					else if (raw.size() == 16 && memcmp(raw.data(), "PMLV", 4) == 0 &&
+						(uint8_t)raw[5] == 1 && raw[14] == 'P' && raw[15] == 'M') {
+						pmPreset = (uint8_t)raw[4];
+						for (int k = 0; k < 4; ++k)
+							pmVersion[k] = ((uint8_t)raw[6 + k * 2] << 8) | (uint8_t)raw[7 + k * 2];
+						hasPmlichqVersion = true;
+					}
+					else if (!memcmp(raw.data(), "Miranda PMLICQ", 14)) {
+						// A first-party fingerprint wins over any obsolete Jasmine marker,
+						// regardless of the order of capabilities in the packet.
+						detectedPmlichq = true;
+						 szMirVer = "Miranda NG PMLICQ";
+					}
+					else if (!memcmp(raw.data(), "Jasmine ver\xFF", 12) && !detectedPmlichq && szMirVer.IsEmpty())
 						szMirVer.Format("Jasmine IM %d.%d.%d", (uint8_t)raw[12], (uint8_t)raw[13], (uint8_t)raw[14]);
-					else if (!memcmp(raw.data(), "Miranda PMLICQ", 14) && szMirVer.IsEmpty())
-						szMirVer = "Miranda NG PMLICQ";
-					else if (!memcmp(raw.data(), "Miranda KICQ", 12) && szMirVer.IsEmpty())
+					else if (!memcmp(raw.data(), "Miranda KICQ", 12) && !detectedPmlichq && szMirVer.IsEmpty())
 						szMirVer = "Miranda NG KICQ";
 				}
 			}
@@ -1130,8 +1147,87 @@ void CKicqProto::HandleUserOnline(const bytes_t &data)
 						pUser->bServerRelay = true;
 				}
 			}
-			if (!szMirVer.IsEmpty())
-				setString(hContact, "MirVer", szMirVer);
+			// PMLV is a self-identifying PMLICQ version capability. A server may
+			// omit or reorder the older human-readable marker, so do not require it.
+			if (hasPmlichqVersion)
+				detectedPmlichq = true;
+			if (detectedPmlichq && hasPmlichqVersion) {
+				// Do not label it as genuine QIP/Jimm: this is still PMLICQ.
+				szMirVer.Format("Miranda NG PMLICQ %u.%u.%u.%u",
+					(unsigned)pmVersion[0], (unsigned)pmVersion[1],
+					(unsigned)pmVersion[2], (unsigned)pmVersion[3]);
+				if (pmPreset != 0 && pmPreset != 1) {
+					static const char *const presetNames[] = {
+						"PMLICQ", "Miranda NG", "Miranda IM", "QIP 2005",
+						"QIP 2010", "QIP Infium", "QIP 2012", "Jimm",
+						"ICQ 2003b", "ICQ 6", "AIM 5.x"
+					};
+					if (pmPreset < _countof(presetNames)) {
+						CMStringA suffix;
+						suffix.Format(" [Client ID: %s]", presetNames[pmPreset]);
+						szMirVer += suffix;
+					}
+				}
+			}
+			// QIP 2005 client catalog: identify remote clients by their real
+			// capability fingerprints, without changing status or advertised caps.
+			// Our own PMLICQ/PMLV marker always takes precedence.
+			if (!detectedPmlichq && szMirVer.IsEmpty()) {
+				// OSCAR buddy presence may carry legacy 16-byte capabilities in
+				// TLV 0x000D, compact 2-byte capabilities in TLV 0x0019, or both.
+				// Normalize compact 0x13xx GUIDs for detection ONLY. Never publish
+				// synthesized capabilities or use them to determine X-status.
+				const bytes_t combined = KicqCatalogMergeCapabilities(
+					caps ? &caps->data : nullptr,
+					shortCaps ? &shortCaps->data : nullptr);
+				// Prefer exact raw full-capability signatures before merging compact
+				// 0x0019 capabilities. Otherwise extra compact GUIDs can invalidate
+				// strict 14-GUID signatures and fall through to generic Jimm.
+				const char *catalogName = caps ? KicqDetectByQipCatalog(
+					reinterpret_cast<const unsigned char *>(caps->data.data()), caps->data.size()) : nullptr;
+				if (!catalogName) catalogName = KicqDetectByQipCatalog(
+					reinterpret_cast<const unsigned char *>(combined.data()), combined.size());
+				if (catalogName && *catalogName)
+					szMirVer = catalogName;
+			}
+			// The client identification is an observation, not the X-status.
+			// Do not erase a valid identification merely because a full presence
+			// refresh contains capabilities that our detector does not yet know.
+			// No arbitrary version may be inferred from generic OSCAR feature GUIDs.
+			if (!szMirVer.IsEmpty()) {
+				// XP x86: avoid needless DB events and ExtraIcon updates on
+				// repeated presence with an unchanged client fingerprint.
+				ptrA previous(db_get_sa(hContact, m_szModuleName, "MirVer"));
+				if (!previous || mir_strcmp(previous, szMirVer.c_str())) {
+					setString(hContact, "MirVer", szMirVer);
+					clientIconChanged = true;
+				}
+				setByte(hContact, "ClientDetectKnown", 1);
+			}
+			else if (caps || shortCaps) {
+				// Preserve the last known client across incomplete/unknown updates.
+				if (!getByte(hContact, "ClientDetectKnown", 0)) {
+					static const char *const unknown = "OSCAR client (unidentified)";
+					ptrA previous(db_get_sa(hContact, m_szModuleName, "MirVer"));
+					if (!previous || mir_strcmp(previous, unknown)) {
+						setString(hContact, "MirVer", unknown);
+						clientIconChanged = true;
+					}
+				}
+			}
+			if (caps) {
+				// Save the complete (bounded) raw capability fingerprint for comparing
+				// QIP, Jimm, Miranda and other actual clients in field tests.
+				// Neither this fingerprint nor the unknown label alters X-status logic.
+				const bytes_t bounded = caps->data.substr(0, min(caps->data.size(), size_t(1024)));
+				setString(hContact, "ClientCapsFingerprint", OscarText::hex(bounded));
+				setDword(hContact, "ClientCapsSize", (uint32_t)caps->data.size());
+			}
+			if (shortCaps) {
+				const bytes_t boundedShort = shortCaps->data.substr(0, min(shortCaps->data.size(), size_t(512)));
+				setString(hContact, "ClientShortCapsFingerprint", OscarText::hex(boundedShort));
+				setDword(hContact, "ClientShortCapsSize", (uint32_t)shortCaps->data.size());
+			}
 		}
 	}
 
@@ -1150,6 +1246,10 @@ void CKicqProto::HandleUserOnline(const bytes_t &data)
 	const bool presenceChanged = getWord(hContact, "Status", ID_STATUS_OFFLINE) != newStatus;
 	if (presenceChanged)
 		setWord(hContact, "Status", newStatus);
+	// Refresh only when the visible client name has actually changed.
+	// Keep ExtraIcons calls outside the roster critical section.
+	if (clientIconChanged)
+
 	// Apply the registered extra icon after releasing the roster lock.
 	// A short capability update must not clear an existing X-status.
 	if (xstatusChanged || presenceChanged)
@@ -1236,6 +1336,10 @@ void CKicqProto::HandleUserOffline(const bytes_t &data)
 			return;
 		pUser->bOnline = false;
 		hContact = pUser->hContact;
+		// The next online announcement belongs to a new client session.
+		// Keep the historical MirVer for offline display, but do not trust it
+		// if the following session advertises an unknown capabilities set.
+		setByte(hContact, "ClientDetectKnown", 0);
 		{ db_unset(hContact, m_szModuleName, "XStatusId"); db_unset(hContact, m_szModuleName, "XStatusName"); db_unset(hContact, m_szModuleName, "XStatusLive"); db_unset(hContact, m_szModuleName, "XStatusMsg"); db_unset(hContact, m_szModuleName, "XStatusTextReceived"); db_unset(hContact, m_szModuleName, "XStatusQueryTS"); }
 	}
 

@@ -210,7 +210,53 @@ static const uint8_t roast[16] = {
 	0xF3, 0x26, 0x81, 0xC4, 0x39, 0x86, 0xDB, 0x92, 0x71, 0xA3, 0xB9, 0xE6, 0x53, 0x7A, 0x95, 0x7C
 };
 
-static const char *clientString = "ICQ Inc. - Product of ICQ (TM).2000b.4.65.1.3281.85";
+#include <winver.h>
+
+// Selection affects the login TLV(0x03) and optional client version fields.
+// It does NOT advertise another client's proprietary capabilities.
+// Non-Miranda presets are compatibility experiments: there is no universal
+// OSCAR standard mapping a name to an authenticated client identity.
+static std::string KicqRealMirandaVersion(uint16_t *major = nullptr, uint16_t *minor = nullptr,
+ uint16_t *patch = nullptr, uint16_t *build = nullptr)
+{
+ wchar_t name[MAX_PATH] = {};
+ if (!GetModuleFileNameW(nullptr, name, _countof(name))) return "unknown";
+ DWORD dummy = 0;
+ const DWORD len = GetFileVersionInfoSizeW(name, &dummy);
+ if (!len || len > 1024*1024) return "unknown";
+ std::vector<BYTE> info(len);
+ if (!GetFileVersionInfoW(name, 0, len, info.data())) return "unknown";
+ VS_FIXEDFILEINFO *fixed = nullptr; UINT bytes = 0;
+ if (!VerQueryValueW(info.data(), L"\\", (LPVOID*)&fixed, &bytes) ||
+     !fixed || bytes < sizeof(*fixed) || fixed->dwSignature != 0xFEEF04BD)
+  return "unknown";
+ if (major) *major = HIWORD(fixed->dwFileVersionMS);
+ if (minor) *minor = LOWORD(fixed->dwFileVersionMS);
+ if (patch) *patch = HIWORD(fixed->dwFileVersionLS);
+ if (build) *build = LOWORD(fixed->dwFileVersionLS);
+ char version[80] = {};
+ mir_snprintf(version, "%u.%u.%u.%u",
+  HIWORD(fixed->dwFileVersionMS), LOWORD(fixed->dwFileVersionMS),
+  HIWORD(fixed->dwFileVersionLS), LOWORD(fixed->dwFileVersionLS));
+ return version;
+}
+static std::string KicqClientName(int preset)
+{
+ switch (preset) {
+ case 1: return "Miranda NG " + KicqRealMirandaVersion();
+ case 2: return "Miranda IM";
+ case 3: return "QIP 2005";
+ case 4: return "QIP 2010";
+ case 5: return "QIP Infium";
+ case 6: return "QIP 2012";
+ case 7: return "Jimm";
+ case 8: return "ICQ 2003b";
+ case 9: return "ICQ 6";
+ case 10: return "AIM 5.x";
+ default: return "PMLICQ (Miranda NG " + KicqRealMirandaVersion() + ")";
+ }
+}
+#pragma comment(lib, "Version.lib")
 
 // family/version pairs Jasmine announces
 static const uint32_t families[] = {
@@ -234,7 +280,7 @@ bytes_t snacBytes(const OscarSnac &s)
 	return w.data();
 }
 
-bytes_t xorLogin(const char *uin, const char *password)
+bytes_t xorLogin(const char *uin, const char *password, int clientIdPreset)
 {
 	bytes_t pw(password, min(strlen(password), size_t(8)));
 	for (size_t i = 0; i < pw.size(); i++)
@@ -244,12 +290,25 @@ bytes_t xorLogin(const char *uin, const char *password)
 	w.u32(1);
 	w.tlvAscii(0x01, uin);
 	w.tlv(0x02, pw);
-	w.tlvAscii(0x03, clientString);
-	w.tlv(0x16, unhex("010A"));
-	w.tlv(0x17, unhex("0004"));
-	w.tlv(0x18, unhex("0041"));
-	w.tlv(0x19, unhex("0001"));
-	w.tlv(0x1A, unhex("0CD1"));
+	const std::string clientName = KicqClientName(clientIdPreset);
+ w.tlvAscii(0x03, clientName.c_str());
+	if (clientIdPreset == 0 || clientIdPreset == 1) {
+	 // Advertise the actual executable version, not this PMLICQ plugin version.
+	 uint16_t a=0,b=0,c=0,d=0;
+	 KicqRealMirandaVersion(&a,&b,&c,&d);
+	 w.tlv(0x16, OscarWriter().u16(a).data());
+	 w.tlv(0x17, OscarWriter().u16(b).data());
+	 w.tlv(0x18, OscarWriter().u16(c).data());
+	 w.tlv(0x19, OscarWriter().u16(d).data());
+	 w.tlv(0x1A, unhex("0000"));
+	} else {
+	 // Preserve the legacy version fingerprint for maximum login compatibility.
+	 w.tlv(0x16, unhex("010A"));
+	 w.tlv(0x17, unhex("0004"));
+	 w.tlv(0x18, unhex("0041"));
+	 w.tlv(0x19, unhex("0001"));
+	 w.tlv(0x1A, unhex("0CD1"));
+	}
 	w.tlvU32(0x14, 0x00000055);
 	w.tlvAscii(0x0F, "en");
 	w.tlvAscii(0x0E, "us");
@@ -304,22 +363,107 @@ OscarSnac reqPrivacyRights() { return OscarSnac(9, 2, 2); }
 OscarSnac requestRoster() { return OscarSnac(0x13, 4, 0); }
 OscarSnac rosterActivate() { return OscarSnac(0x13, 7, 7); }
 
-OscarSnac setUserInfo(int major, int minor, int patch, const char *xstatusGuid)
+OscarSnac setUserInfo(int major, int minor, int patch, const char *xstatusGuid, int clientIdPreset)
 {
 	OscarWriter caps;
-	caps.bytes(unhex("4D6972616E646120504D4C4943512323"));   // "Miranda PMLICQ##" (16-byte OSCAR capability)
+	if (clientIdPreset == 0) {
+		caps.bytes(unhex("4D6972616E646120504D4C4943512323"));   // "Miranda PMLICQ##" (16-byte OSCAR capability)
+		// Private PMLICQ version marker, exactly 16 bytes, separate from X-status GUIDs.
+		// Bytes: "PMLV", preset, format=1, 4 big-endian WORDs of the Miranda EXE
+		// file version, "PM". Older PMLICQ builds safely ignore this capability.
+		uint16_t verMajor = 0, verMinor = 0, verPatch = 0, verBuild = 0;
+		const std::string actualVersion = KicqRealMirandaVersion(&verMajor, &verMinor, &verPatch, &verBuild);
+		if (actualVersion != "unknown") {
+			OscarWriter versionCap;
+			versionCap.bytes(bytes_t{ 'P', 'M', 'L', 'V' });
+			versionCap.u8((uint8_t)(clientIdPreset >= 0 && clientIdPreset <= 10 ? clientIdPreset : 0));
+			versionCap.u8(1);
+			versionCap.u16(verMajor).u16(verMinor).u16(verPatch).u16(verBuild);
+			versionCap.u8('P').u8('M');
+			caps.bytes(versionCap.data());
+			// QIP client-id catalog can render a textual version from Cap(prefix@9).
+			// This is an ADDITIONAL private PMLICQ capability, not a replacement
+			// for the binary PMLV marker. Keep the entire record exactly 16 bytes.
+			bytes_t qipReadableCap(16, '\0');
+			memcpy(&qipReadableCap[0], "PMLICQ ", 7);
+			const size_t nVersion = min(size_t(9), actualVersion.size());
+			memcpy(&qipReadableCap[7], actualVersion.data(), nVersion);
+			caps.bytes(qipReadableCap);
+	
+			// Legacy Miranda-compatible OSCAR fingerprint, based on the real
+			// Miranda executable version. The original QIP clients.cfg recognizes
+			// the 'MirandaM' prefix and can decode the version after its 0x00
+			// release marker. Keep PMLV above for precise PMLICQ identification.
+			// This is a compatibility hint, not a promise that every third-party
+			// client will show our preferred custom name.
+			if (clientIdPreset == 0) {
+				bytes_t mirandaCap(16, '\0');
+				memcpy(&mirandaCap[0], "MirandaM", 8);
+				mirandaCap[8] = '\0'; // release branch (not alpha)
+				mirandaCap[9] = (char)(verMinor > 255 ? 255 : verMinor);
+				mirandaCap[10] = (char)(verPatch > 255 ? 255 : verPatch);
+				mirandaCap[11] = (char)(verBuild > 255 ? 255 : verBuild);
+				caps.bytes(mirandaCap);
+			}
+		}
+	}
+	else {
+		// Do not mix PMLICQ markers into spoofed identities: QIP's legacy
+		// detectors inspect presence capabilities, not only login TLV(0x03).
+		// Use signatures sourced from client_catalog_qip.h, where available.
+		switch (clientIdPreset) {
+		case 1: // Miranda NG (actual executable version)
+		case 2: { // Miranda IM-compatible capability
+			uint16_t a = 0, b = 0, c = 0, d = 0;
+			KicqRealMirandaVersion(&a, &b, &c, &d);
+			bytes_t mirandaCap(16, '\0');
+			memcpy(&mirandaCap[0], "MirandaM", 8);
+			mirandaCap[8] = '\0';
+			mirandaCap[9] = (char)min(uint16_t(255), b);
+			mirandaCap[10] = (char)min(uint16_t(255), c);
+			mirandaCap[11] = (char)min(uint16_t(255), d);
+			caps.bytes(mirandaCap);
+			break;
+		}
+		case 3: // QIP 2005a (16-byte QIP catalog signature)
+			caps.bytes(unhex("563FC8090B6F41514950203230303561"));
+			break;
+		case 4: // QIP 2010 is Infium-based; no distinct 2010 signature in catalog
+		case 5: // QIP Infium
+		case 6: // QIP 2012: fallback to Infium-family signature
+			caps.bytes(unhex("7C737502C3BE4F3EA69F015313431E1A"));
+			break;
+		case 7: // Jimm pattern from the bundled QIP catalog
+			caps.bytes(unhex("563FC8090B6F41BD9F79422609DFA2F3"));
+			caps.bytes(unhex("1A093C6CD7FD4EC59D51A6474E34F5A0"));
+			caps.bytes(unhex("094613494C7F11D18222444553540000"));
+			caps.bytes(unhex("0946134E4C7F11D18222444553540000"));
+			caps.bytes(unhex("0946134C4C7F11D18222444553540000"));
+			caps.bytes(unhex("094613434C7F11D18222444553540000"));
+			break;
+		default:
+			// ICQ 2003b / ICQ 6 / AIM 5.x: no verified unique
+			// capability in the bundled catalog. Login version only.
+			break;
+		}
+	}
+
 	// EXPERIMENTAL: advertise File Transfer for interoperability discovery.
 	// The Miranda file API and TCP/OFT2 data transport are NOT yet implemented.
 	// Other clients may offer files that this build cannot accept.
 	caps.bytes(unhex(CAP_FILE));
-	caps.bytes(unhex("4a61736d696e6520766572ff"));           // "Jasmine ver" + 0xff, what kicq.ru knows
-	caps.u8(major).u8(minor).u8(patch).u8(0);
+	// Do not advertise Jasmine IM: other clients identify this signature as Jasmine.
+	// Our 16-byte "Miranda PMLICQ##" capability above identifies this implementation.
+	// Preserve OSCAR feature and X-status capabilities below.
+	(void)major; (void)minor; (void)patch;
 	caps.bytes(unhex("094600004C7F11D18222444553540000"));
 	caps.bytes(unhex(CAP_SERVER_RELAY));
 	caps.bytes(unhex(CAP_UTF8));
 	if (xstatusGuid && *xstatusGuid)
 		caps.bytes(unhex(xstatusGuid));
-	caps.bytes(unhex("563FC8090B6F41BD9F79422609DFA2F3"));
+	// Do not falsely advertise ICQ Lite/ICQ2Go's private fingerprint.
+	// It is documented as specific to those clients and can confuse third-party
+	// fingerprint databases. Our own PMLICQ marker above remains available.
 	caps.bytes(unhex("0946134D4C7F11D18222444553540000"));   // typing notifications
 	OscarWriter w;
 	w.tlv(5, caps);

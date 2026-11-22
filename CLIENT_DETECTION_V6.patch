@@ -1,0 +1,210 @@
+--- a/normal/0.96.7/KICQ/src/oscar.cpp
++++ b/normal/0.96.7/KICQ/src/oscar.cpp
+@@ -388,6 +388,22 @@
+ 		const size_t nVersion = min(size_t(9), actualVersion.size());
+ 		memcpy(&qipReadableCap[7], actualVersion.data(), nVersion);
+ 		caps.bytes(qipReadableCap);
++
++		// Legacy Miranda-compatible OSCAR fingerprint, based on the real
++		// Miranda executable version. The original QIP clients.cfg recognizes
++		// the 'MirandaM' prefix and can decode the version after its 0x00
++		// release marker. Keep PMLV above for precise PMLICQ identification.
++		// This is a compatibility hint, not a promise that every third-party
++		// client will show our preferred custom name.
++		if (clientIdPreset == 0 || clientIdPreset == 1) {
++			bytes_t mirandaCap(16, '\0');
++			memcpy(&mirandaCap[0], "MirandaM", 8);
++			mirandaCap[8] = '\0'; // release branch (not alpha)
++			mirandaCap[9] = (char)(verMinor > 255 ? 255 : verMinor);
++			mirandaCap[10] = (char)(verPatch > 255 ? 255 : verPatch);
++			mirandaCap[11] = (char)(verBuild > 255 ? 255 : verBuild);
++			caps.bytes(mirandaCap);
++		}
+ 	}
+ 
+ 	// EXPERIMENTAL: advertise File Transfer for interoperability discovery.
+--- a/normal/0.96.7/KICQ/src/server.cpp
++++ b/normal/0.96.7/KICQ/src/server.cpp
+@@ -1062,10 +1062,17 @@
+ 			// QIP 2005 client catalog: identify remote clients by their real
+ 			// capability fingerprints, without changing status or advertised caps.
+ 			// Our own PMLICQ/PMLV marker always takes precedence.
+-			if (!detectedPmlichq && caps && szMirVer.IsEmpty() && !caps->data.empty()) {
++			if (!detectedPmlichq && szMirVer.IsEmpty()) {
++				// OSCAR buddy presence may carry legacy 16-byte capabilities in
++				// TLV 0x000D, compact 2-byte capabilities in TLV 0x0019, or both.
++				// Normalize compact 0x13xx GUIDs for detection ONLY. Never publish
++				// synthesized capabilities or use them to determine X-status.
++				const bytes_t combined = KicqCatalogMergeCapabilities(
++					caps ? &caps->data : nullptr,
++					shortCaps ? &shortCaps->data : nullptr);
+ 				const char *catalogName = KicqDetectByQipCatalog(
+-					reinterpret_cast<const unsigned char *>(caps->data.data()), caps->data.size());
+-				if (catalogName)
++					reinterpret_cast<const unsigned char *>(combined.data()), combined.size());
++				if (catalogName && *catalogName)
+ 					szMirVer = catalogName;
+ 			}
+ 			// The client identification is an observation, not the X-status.
+@@ -1093,6 +1100,7 @@
+ 			if (shortCaps) {
+ 				const bytes_t boundedShort = shortCaps->data.substr(0, min(shortCaps->data.size(), size_t(512)));
+ 				setString(hContact, "ClientShortCapsFingerprint", OscarText::hex(boundedShort));
++				setDword(hContact, "ClientShortCapsSize", (uint32_t)shortCaps->data.size());
+ 			}
+ 		}
+ 	}
+--- a/normal/0.96.7/KICQ/src/client_catalog_qip.h
++++ b/normal/0.96.7/KICQ/src/client_catalog_qip.h
+@@ -5,6 +5,7 @@
+ #pragma once
+ #include <stddef.h>
+ #include <string.h>
++#include <string>
+ 
+ struct KicqCatalogRule { const char *name; const char *caps; const char *noCaps; bool exact; };
+ 
+@@ -240,6 +241,38 @@
+  {"BSFlite", "094613464C7F11D18222444553540000", "0138CA7B769A491588F213FC00979EA8|563FC8090B6F41BD9F79422609DFA2F3|094613444C7F11D18222444553540000|748F2420628711D18222444553540000|97B12751243C4334AD22D6ABF73F1492|0946134E4C7F11D18222444553540000|094613494C7F11D18222444553540000|0946134B4C7F11D18222444553540000|094613434C7F11D18222444553540000|178C2D9BDAA545BB8DDBF3BDBD53A10A|0946E0004C7F11D18222444553540000|F2E7C7F4FEAD4DFBB23536798BDF0000|094613454C7F11D18222444553540000|696371708008000E8003086900000000|696371700008000E8003086900000000|094600004C7F11D18222444553540000|0946010A4C7F11D18222444553540000|094601FF4C7F11D18222444553540000", false}, // QIP [451]
+ };
+ 
++
++// TLV 0x0019 stores the short form of the common OSCAR 0946xxxx GUID
++// family. Expand only the documented 0x13xx family for passive client
++// recognition. No status GUID, wire packet or contact metadata is changed.
++// Returns concatenated 16-byte capabilities; malformed trailing bytes are ignored.
++static std::string KicqCatalogMergeCapabilities(const std::string *fullCaps,
++                                                 const std::string *shortCaps)
++{
++ std::string out;
++ if (fullCaps) {
++  const size_t fullLen = (fullCaps->size() / 16) * 16;
++  out.assign(fullCaps->data(), fullLen);
++ }
++ if (shortCaps) {
++  static const unsigned char suffix[12] = {
++   0x4c,0x7f,0x11,0xd1,0x82,0x22,0x44,0x45,0x53,0x54,0x00,0x00
++  };
++  for (size_t i=0; i+1<shortCaps->size(); i+=2) {
++   const unsigned char hi=(unsigned char)(*shortCaps)[i];
++   const unsigned char lo=(unsigned char)(*shortCaps)[i+1];
++   if (hi != 0x13) continue;
++   unsigned char cap[16] = {0x09,0x46,hi,lo};
++   memcpy(cap+4,suffix,sizeof(suffix));
++   bool already=false;
++   for (size_t p=0; p+16<=out.size(); p+=16)
++    if (memcmp(out.data()+p,cap,16)==0) { already=true; break; }
++   if (!already) out.append((const char*)cap,16);
++  }
++ }
++ return out;
++}
++
+ static const char *KicqDetectByQipCatalog(const unsigned char *caps, size_t len)
+ {
+  if (!caps || len < 16) return nullptr;
+--- a/windows-xp-x86/0.96.7/KICQ/src/oscar.cpp
++++ b/windows-xp-x86/0.96.7/KICQ/src/oscar.cpp
+@@ -388,6 +388,22 @@
+ 		const size_t nVersion = min(size_t(9), actualVersion.size());
+ 		memcpy(&qipReadableCap[7], actualVersion.data(), nVersion);
+ 		caps.bytes(qipReadableCap);
++
++		// Legacy Miranda-compatible OSCAR fingerprint, based on the real
++		// Miranda executable version. The original QIP clients.cfg recognizes
++		// the 'MirandaM' prefix and can decode the version after its 0x00
++		// release marker. Keep PMLV above for precise PMLICQ identification.
++		// This is a compatibility hint, not a promise that every third-party
++		// client will show our preferred custom name.
++		if (clientIdPreset == 0 || clientIdPreset == 1) {
++			bytes_t mirandaCap(16, '\0');
++			memcpy(&mirandaCap[0], "MirandaM", 8);
++			mirandaCap[8] = '\0'; // release branch (not alpha)
++			mirandaCap[9] = (char)(verMinor > 255 ? 255 : verMinor);
++			mirandaCap[10] = (char)(verPatch > 255 ? 255 : verPatch);
++			mirandaCap[11] = (char)(verBuild > 255 ? 255 : verBuild);
++			caps.bytes(mirandaCap);
++		}
+ 	}
+ 
+ 	// EXPERIMENTAL: advertise File Transfer for interoperability discovery.
+--- a/windows-xp-x86/0.96.7/KICQ/src/server.cpp
++++ b/windows-xp-x86/0.96.7/KICQ/src/server.cpp
+@@ -1171,10 +1171,17 @@
+ 			// QIP 2005 client catalog: identify remote clients by their real
+ 			// capability fingerprints, without changing status or advertised caps.
+ 			// Our own PMLICQ/PMLV marker always takes precedence.
+-			if (!detectedPmlichq && caps && szMirVer.IsEmpty() && !caps->data.empty()) {
++			if (!detectedPmlichq && szMirVer.IsEmpty()) {
++				// OSCAR buddy presence may carry legacy 16-byte capabilities in
++				// TLV 0x000D, compact 2-byte capabilities in TLV 0x0019, or both.
++				// Normalize compact 0x13xx GUIDs for detection ONLY. Never publish
++				// synthesized capabilities or use them to determine X-status.
++				const bytes_t combined = KicqCatalogMergeCapabilities(
++					caps ? &caps->data : nullptr,
++					shortCaps ? &shortCaps->data : nullptr);
+ 				const char *catalogName = KicqDetectByQipCatalog(
+-					reinterpret_cast<const unsigned char *>(caps->data.data()), caps->data.size());
+-				if (catalogName)
++					reinterpret_cast<const unsigned char *>(combined.data()), combined.size());
++				if (catalogName && *catalogName)
+ 					szMirVer = catalogName;
+ 			}
+ 			// The client identification is an observation, not the X-status.
+@@ -1202,6 +1209,7 @@
+ 			if (shortCaps) {
+ 				const bytes_t boundedShort = shortCaps->data.substr(0, min(shortCaps->data.size(), size_t(512)));
+ 				setString(hContact, "ClientShortCapsFingerprint", OscarText::hex(boundedShort));
++				setDword(hContact, "ClientShortCapsSize", (uint32_t)shortCaps->data.size());
+ 			}
+ 		}
+ 	}
+--- a/windows-xp-x86/0.96.7/KICQ/src/client_catalog_qip.h
++++ b/windows-xp-x86/0.96.7/KICQ/src/client_catalog_qip.h
+@@ -5,6 +5,7 @@
+ #pragma once
+ #include <stddef.h>
+ #include <string.h>
++#include <string>
+ 
+ struct KicqCatalogRule { const char *name; const char *caps; const char *noCaps; bool exact; };
+ 
+@@ -240,6 +241,38 @@
+  {"BSFlite", "094613464C7F11D18222444553540000", "0138CA7B769A491588F213FC00979EA8|563FC8090B6F41BD9F79422609DFA2F3|094613444C7F11D18222444553540000|748F2420628711D18222444553540000|97B12751243C4334AD22D6ABF73F1492|0946134E4C7F11D18222444553540000|094613494C7F11D18222444553540000|0946134B4C7F11D18222444553540000|094613434C7F11D18222444553540000|178C2D9BDAA545BB8DDBF3BDBD53A10A|0946E0004C7F11D18222444553540000|F2E7C7F4FEAD4DFBB23536798BDF0000|094613454C7F11D18222444553540000|696371708008000E8003086900000000|696371700008000E8003086900000000|094600004C7F11D18222444553540000|0946010A4C7F11D18222444553540000|094601FF4C7F11D18222444553540000", false}, // QIP [451]
+ };
+ 
++
++// TLV 0x0019 stores the short form of the common OSCAR 0946xxxx GUID
++// family. Expand only the documented 0x13xx family for passive client
++// recognition. No status GUID, wire packet or contact metadata is changed.
++// Returns concatenated 16-byte capabilities; malformed trailing bytes are ignored.
++static std::string KicqCatalogMergeCapabilities(const std::string *fullCaps,
++                                                 const std::string *shortCaps)
++{
++ std::string out;
++ if (fullCaps) {
++  const size_t fullLen = (fullCaps->size() / 16) * 16;
++  out.assign(fullCaps->data(), fullLen);
++ }
++ if (shortCaps) {
++  static const unsigned char suffix[12] = {
++   0x4c,0x7f,0x11,0xd1,0x82,0x22,0x44,0x45,0x53,0x54,0x00,0x00
++  };
++  for (size_t i=0; i+1<shortCaps->size(); i+=2) {
++   const unsigned char hi=(unsigned char)(*shortCaps)[i];
++   const unsigned char lo=(unsigned char)(*shortCaps)[i+1];
++   if (hi != 0x13) continue;
++   unsigned char cap[16] = {0x09,0x46,hi,lo};
++   memcpy(cap+4,suffix,sizeof(suffix));
++   bool already=false;
++   for (size_t p=0; p+16<=out.size(); p+=16)
++    if (memcmp(out.data()+p,cap,16)==0) { already=true; break; }
++   if (!already) out.append((const char*)cap,16);
++  }
++ }
++ return out;
++}
++
+ static const char *KicqDetectByQipCatalog(const unsigned char *caps, size_t len)
+ {
+  if (!caps || len < 16) return nullptr;

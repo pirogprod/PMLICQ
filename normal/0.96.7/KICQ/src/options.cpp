@@ -20,6 +20,8 @@ along with this program. If not, see <http://www.gnu.org/licenses/>.
 class CKicqAccountDlg : public CKicqDlgBase
 {
 	CCtrlEdit edtUin, edtPassword, edtServer, edtPort, edtGroup, edtFileProxy, edtFileProxyPort;
+	CCtrlCombo cmbClientId;
+	CKicqProto *m_account;
 
 public:
 	CKicqAccountDlg(CKicqProto *ppro, int iDlgId) :
@@ -30,7 +32,8 @@ public:
 		edtPort(this, IDC_PORT),
 		edtGroup(this, IDC_GROUP),
         edtFileProxy(this, IDC_FILEPROXY),
-        edtFileProxyPort(this, IDC_FILEPROXY_PORT)
+        edtFileProxyPort(this, IDC_FILEPROXY_PORT),
+		cmbClientId(this, IDC_CLIENT_ID), m_account(ppro)
 	{
 		CreateLink(edtUin, "UIN", DBVT_DWORD, 0);
 		CreateLink(edtPassword, "Password", L"");
@@ -46,6 +49,23 @@ public:
 		// the XOR login of that ICQ era only uses the first 8 characters
 		edtPassword.SendMsg(EM_LIMITTEXT, 8, 0);
 		edtUin.SendMsg(EM_LIMITTEXT, 10, 0);
+		static const wchar_t* const choices[] = {
+			L"PMLICQ (default)", L"Miranda NG (actual EXE version)", L"Miranda IM",
+			L"QIP 2005", L"QIP 2010", L"QIP Infium", L"QIP 2012",
+			L"Jimm", L"ICQ 2003b", L"ICQ 6", L"AIM 5.x"
+		};
+		for (int i = 0; i < int(_countof(choices)); ++i) cmbClientId.AddString(choices[i], i);
+		const BYTE saved = m_account->getByte("ClientIdPreset", 0);
+		cmbClientId.SelectData(saved < _countof(choices) ? saved : 0);
+		return true;
+	}
+
+	bool OnApply() override
+	{
+		if (!CKicqDlgBase::OnApply()) return false;
+		const LPARAM preset = cmbClientId.GetCurData();
+		if (preset < 0 || preset > 10) return false;
+		m_account->setByte("ClientIdPreset", BYTE(preset));
 		return true;
 	}
 };

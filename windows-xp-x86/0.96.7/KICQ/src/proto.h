@@ -1,4 +1,4 @@
-/*
+﻿/*
 Copyright (C) 2026 Miranda NG team
 
 This program is free software; you can redistribute it and/or
@@ -314,3 +314,5 @@ struct CMPlugin : public ACCPROTOPLUGIN<CKicqProto>
 
 	int Load() override;
 };
+
+

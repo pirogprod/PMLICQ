@@ -194,7 +194,7 @@ namespace OscarPackets
 	bytes_t snacBytes(const OscarSnac &s);
 
 	// login (FLAP channel 1 / 4): the "roasted" XOR login cuts the password to 8 characters
-	bytes_t xorLogin(const char *uin, const char *password);
+	bytes_t xorLogin(const char *uin, const char *password, int clientIdPreset = 0);
 	bytes_t bosCookie(const bytes_t &cookie);
 
 	// session setup
@@ -209,7 +209,7 @@ namespace OscarPackets
 	OscarSnac reqPrivacyRights();
 	OscarSnac requestRoster();
 	OscarSnac rosterActivate();
-	OscarSnac setUserInfo(int major, int minor, int patch, const char *xstatusGuid = nullptr);
+	OscarSnac setUserInfo(int major, int minor, int patch, const char *xstatusGuid = nullptr, int clientIdPreset = 0);
 	OscarSnac setIcbmParams();
 	OscarSnac clientReady();
 	OscarSnac setDcInfo(int status, int flags, int protoVersion);

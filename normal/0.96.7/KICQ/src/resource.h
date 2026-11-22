@@ -1,4 +1,4 @@
-//{{NO_DEPENDENCIES}}
+﻿//{{NO_DEPENDENCIES}}
 // Microsoft Visual C++ generated include file.
 // Used by res\resource.rc
 //
@@ -62,3 +62,6 @@
 
 #define IDC_FILEPROXY 20841
 #define IDC_FILEPROXY_PORT 20842
+
+#define IDC_CLIENT_ID 29500  // OSCAR login fingerprint selection
+

@@ -1,0 +1,22 @@
+# Build artifacts and user-local files
+.vs/
+.vscode/
+CMakeFiles/
+CMakeCache.txt
+cmake-build-*/
+Debug/
+Release/
+x64/Debug/
+x64/Release/
+*.obj
+*.pdb
+*.ilk
+*.idb
+*.tlog
+*.lastbuildstate
+*.suo
+*.user
+*.dll
+*.exe
+*.db3
+*.dat
