@@ -354,7 +354,8 @@ OscarSnac reqLocationRights() { return OscarSnac(2, 2, 2); }
 OscarSnac reqBuddyRights()
 {
 	OscarWriter w;
-	w.u16(5).u16(2).u16(3);
+	// Preserve existing flags and opt in to BART metadata for offline buddies.
+	w.u16(5).u16(2).u16(3 | 0x0004);
 	return OscarSnac(3, 2, 2, w.data());
 }
 

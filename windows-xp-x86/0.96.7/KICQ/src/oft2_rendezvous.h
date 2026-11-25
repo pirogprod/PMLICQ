@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 // Bounds-checked OSCAR channel-2 file rendezvous TLV parser.
 // Parsing only: accepting an offer requires Miranda and OFT2 session handling.
 #include <stdint.h>
@@ -168,5 +168,42 @@ static inline bool build_rendezvous(const Rendezvous &rv, std::string &out) {
  }
  if (rv.hasOffer) { std::string v; if (!build_file_info(rv.offer, v) || !add_tlv(value, 0x2711, v)) return false; }
  out.swap(value); return true;
+}
+}
+
+// Stage-1 ARS offer for older OSCAR clients.  The generic serializer is kept
+// unchanged for direct offers, incoming replies, and redirects.  Only the
+// outgoing proxy offer uses this conventional TLV sequence (OSCAR file
+// transfer documentation, Stage 1): 000A,000F,0002,0016,0003,0005,0017,
+// 0010,2711.  The 0005 value is the ARS check/ticket, not its TCP port.
+namespace oft2 {
+static inline bool build_sender_proxy_offer(const Rendezvous &rv, std::string &out) {
+ if (rv.type != 0 || !rv.proxy || rv.requestNumber != 1 ||
+     !rv.externalIp || !rv.port || !rv.hasOffer) return false;
+ std::string value;
+ append16(value, rv.type);
+ value.append((const char *)rv.cookie.data(), rv.cookie.size());
+ value.append((const char *)rv.capability.data(), rv.capability.size());
+ std::string field;
+ append16(field, rv.requestNumber);
+ if (!add_tlv(value, 0x000A, field)) return false;
+ if (!add_tlv(value, 0x000F, std::string())) return false;
+ field.clear(); append32(field, rv.externalIp);
+ if (!add_tlv(value, 0x0002, field)) return false;
+ field.clear(); append32(field, ~rv.externalIp);
+ if (!add_tlv(value, 0x0016, field)) return false;
+ if (rv.internalIp) {
+  field.clear(); append32(field, rv.internalIp);
+  if (!add_tlv(value, 0x0003, field)) return false;
+ }
+ field.clear(); append16(field, rv.port);
+ if (!add_tlv(value, 0x0005, field)) return false;
+ field.clear(); append16(field, uint16_t(~rv.port));
+ if (!add_tlv(value, 0x0017, field)) return false;
+ if (!add_tlv(value, 0x0010, std::string())) return false;
+ field.clear();
+ if (!build_file_info(rv.offer, field) || !add_tlv(value, 0x2711, field)) return false;
+ out.swap(value);
+ return true;
 }
 }

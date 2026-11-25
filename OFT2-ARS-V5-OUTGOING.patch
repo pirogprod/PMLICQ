@@ -1,0 +1,636 @@
+--- a/normal/0.96.7/KICQ/src/proto.cpp
++++ b/normal/0.96.7/KICQ/src/proto.cpp
+@@ -1253,7 +1253,9 @@
+     rv.cookie = f->cookie;
+     memcpy(rv.capability.data(), cap.data(), 16);
+     rv.externalIp = ip;
+-    rv.internalIp = ip;
++    // 0x0003 is the sender's local address, NOT the proxy's advertised IP.
++    // Some legacy peers use it to distinguish a proxy offer from a direct one.
++    rv.internalIp = Oft2LocalIPv4(T2Utf(proto->m_wszServer));
+     rv.port = port;
+     rv.proxy = true;
+     rv.requestNumber = 1;
+@@ -1267,7 +1269,10 @@
+      WideCharToMultiByte(CP_ACP, 0, f->filename.c_str(), -1, &encoded[0], bytes, nullptr, nullptr);
+      rv.offer.name = encoded.c_str();
+      bytes_t payload;
+-     if (oft2::build_rendezvous(rv, payload)) {
++     // Legacy OSCAR peers may expect proxy TLVs in the conventional order.
++     // This serializer is used for outgoing ARS offers ONLY. Incoming and
++     // direct transfers keep their existing, tested packet format.
++     if (oft2::build_sender_proxy_offer(rv, payload)) {
+       char receiver[24]; _itoa(f->uin, receiver, 10);
+       bytes_t cookie((const char *)f->cookie.data(), 8);
+       uint32_t req;
+@@ -1276,8 +1281,12 @@
+       proto->Send(OscarPackets::fileRendezvous(receiver, cookie, payload, req));
+       offerSent = true;
+       proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE, ACKRESULT_LISTENING, f.get());
+-      proto->debugLogA("ARS DIAG3: OSCAR offer queued; now waiting for PROXY_READY. Check peer log for ARS DIAG3: incoming offer");
+-      bool ready = ars::waitReady(sock);
++      proto->debugLogA("ARS TX V5: waiting for relay READY after peer accepts (recipient=%u ticket=%u)",
++        (unsigned)f->uin, (unsigned)port);
++      unsigned relayResponse = 0;
++      bool ready = ars::waitReady(sock, &relayResponse);
++      if (!ready)
++       proto->debugLogA("ARS TX V5: relay did not become ready, last response=%u (0=socket/timeout; 1=proxy error; other=unexpected)", relayResponse);
+       if (!ready && InterlockedCompareExchange(&f->redirected, 0, 0) &&
+           !InterlockedCompareExchange(&f->cancelled, 0, 0)) {
+        uint32_t redirectIp; uint16_t redirectPort;
+@@ -1318,12 +1327,14 @@
+         memcpy(prompt + 192, rv.offer.name.c_str(), rv.offer.name.size());
+         proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE, ACKRESULT_CONNECTED, f.get());
+         proto->debugLogA("ARS TX: relay paired, sending OFT2 PROMPT, then awaiting ACK/data/DONE");
++        int transferStage = oft2::ST_VALIDATE;
+         success = oft2::send_one(sock, prompt, input, f->size,
+          [](uint64_t done, uint64_t, void *ctx) -> bool {
+           auto *args = (OutgoingThreadArgs *)ctx;
+           return args->proto->FileProgress(args->file.get(), done);
+-         }, ctx.get());
+-        proto->debugLogA("ARS TX: OFT2 send %s", success ? "completed" : "failed during PROMPT/ACK/data/DONE");
++         }, ctx.get(), &transferStage);
++        proto->debugLogA("ARS TX V5: OFT2 result=%s stage=%d (0=validate 1=PROMPT 2=ACK 3=data 4=DONE 5=finished)",
++          success ? "success" : "failure", transferStage);
+         fclose(input);
+        }
+       }
+--- a/normal/0.96.7/KICQ/src/ars_proxy.h
++++ b/normal/0.96.7/KICQ/src/ars_proxy.h
+@@ -73,9 +73,11 @@
+  setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&dataTimeout, sizeof(dataTimeout));
+  return ok;
+ }
+-static inline bool waitReady(SOCKET s) {
++static inline bool waitReady(SOCKET s, unsigned *lastResponse = nullptr) {
+  unsigned command = 0; std::string body;
+- return recvMessage(s, command, body) && command == 5;
++ const bool received = recvMessage(s, command, body);
++ if (lastResponse) *lastResponse = command;
++ return received && command == 5;
+ }
+ static inline bool connectTo(const char *host, uint16_t port, SOCKET &result) {
+  result = INVALID_SOCKET;
+--- a/normal/0.96.7/KICQ/src/oft2_rendezvous.h
++++ b/normal/0.96.7/KICQ/src/oft2_rendezvous.h
+@@ -170,3 +170,40 @@
+  out.swap(value); return true;
+ }
+ }
++
++// Stage-1 ARS offer for older OSCAR clients.  The generic serializer is kept
++// unchanged for direct offers, incoming replies, and redirects.  Only the
++// outgoing proxy offer uses this conventional TLV sequence (OSCAR file
++// transfer documentation, Stage 1): 000A,000F,0002,0016,0003,0005,0017,
++// 0010,2711.  The 0005 value is the ARS check/ticket, not its TCP port.
++namespace oft2 {
++static inline bool build_sender_proxy_offer(const Rendezvous &rv, std::string &out) {
++ if (rv.type != 0 || !rv.proxy || rv.requestNumber != 1 ||
++     !rv.externalIp || !rv.port || !rv.hasOffer) return false;
++ std::string value;
++ append16(value, rv.type);
++ value.append((const char *)rv.cookie.data(), rv.cookie.size());
++ value.append((const char *)rv.capability.data(), rv.capability.size());
++ std::string field;
++ append16(field, rv.requestNumber);
++ if (!add_tlv(value, 0x000A, field)) return false;
++ if (!add_tlv(value, 0x000F, std::string())) return false;
++ field.clear(); append32(field, rv.externalIp);
++ if (!add_tlv(value, 0x0002, field)) return false;
++ field.clear(); append32(field, ~rv.externalIp);
++ if (!add_tlv(value, 0x0016, field)) return false;
++ if (rv.internalIp) {
++  field.clear(); append32(field, rv.internalIp);
++  if (!add_tlv(value, 0x0003, field)) return false;
++ }
++ field.clear(); append16(field, rv.port);
++ if (!add_tlv(value, 0x0005, field)) return false;
++ field.clear(); append16(field, uint16_t(~rv.port));
++ if (!add_tlv(value, 0x0017, field)) return false;
++ if (!add_tlv(value, 0x0010, std::string())) return false;
++ field.clear();
++ if (!build_file_info(rv.offer, field) || !add_tlv(value, 0x2711, field)) return false;
++ out.swap(value);
++ return true;
++}
++}
+--- a/normal/0.96.7/KICQ/src/oft2_socket_transfer.h
++++ b/normal/0.96.7/KICQ/src/oft2_socket_transfer.h
+@@ -8,28 +8,38 @@
+ #include <string.h>
+ 
+ namespace oft2 {
++// Sender-only stage trace; 0=validation, 1=PROMPT, 2=ACK,
++// 3=data, 4=DONE, 5=finished. The receiver code remains untouched.
++enum TransferStage { ST_VALIDATE=0, ST_PROMPT=1, ST_ACK=2, ST_DATA=3, ST_DONE=4, ST_FINISHED=5 };
+ // The caller supplies the OFT2 PROMPT generated from the actual file metadata.
+ // Sending raw data before ACK is forbidden. A successful return requires DONE.
+ static inline bool send_one(SOCKET socket, const uint8_t (&prompt)[HEADER_SIZE],
+                             FILE *input, uint64_t length, Progress progress = nullptr,
+-                            void *ctx = nullptr) {
++                            void *ctx = nullptr, int *stage = nullptr) {
++ if (stage) *stage = ST_VALIDATE;
+  Header h, ack;
+  uint8_t response[HEADER_SIZE];
+  if (!decode(prompt, HEADER_SIZE, h) || h.type != 0x0101 ||
+      h.size != length || h.totalFiles != 1 || h.filesLeft != 1 ||
+      length > UINT32_MAX || !input) return false;
++ if (stage) *stage = ST_PROMPT;
+  if (!send_prompt(socket, prompt)) return false;
++ if (stage) *stage = ST_ACK;
+  if (!recv_expected(socket, 0x0202, response, ack)) return false;
+  // Never trust a peer acknowledgement for a different file.
+  if (memcmp(response + 8, prompt + 8, 8) != 0 ||
+      ack.size != h.size || ack.totalFiles != h.totalFiles ||
+      ack.filesLeft != h.filesLeft || ack.received != 0) return false;
++ if (stage) *stage = ST_DATA;
+  if (!send_file(socket, input, length, progress, ctx)) return false;
+  Header done;
++ if (stage) *stage = ST_DONE;
+  if (!recv_expected(socket, 0x0204, response, done)) return false;
+- return memcmp(response + 8, prompt + 8, 8) == 0 &&
++ const bool validDone = memcmp(response + 8, prompt + 8, 8) == 0 &&
+         done.totalFiles == h.totalFiles && done.filesLeft == h.filesLeft &&
+         done.size == h.size && done.received == length;
++ if (validDone && stage) *stage = ST_FINISHED;
++ return validDone;
+ }
+ 
+ // The receiver writes only the exact announced number of bytes. A temporary
+--- a/normal/0.96.8/KICQ/src/proto.cpp
++++ b/normal/0.96.8/KICQ/src/proto.cpp
+@@ -1251,7 +1251,9 @@
+     rv.cookie = f->cookie;
+     memcpy(rv.capability.data(), cap.data(), 16);
+     rv.externalIp = ip;
+-    rv.internalIp = ip;
++    // 0x0003 is the sender's local address, NOT the proxy's advertised IP.
++    // Some legacy peers use it to distinguish a proxy offer from a direct one.
++    rv.internalIp = Oft2LocalIPv4(T2Utf(proto->m_wszServer));
+     rv.port = port;
+     rv.proxy = true;
+     rv.requestNumber = 1;
+@@ -1265,7 +1267,10 @@
+      WideCharToMultiByte(CP_ACP, 0, f->filename.c_str(), -1, &encoded[0], bytes, nullptr, nullptr);
+      rv.offer.name = encoded.c_str();
+      bytes_t payload;
+-     if (oft2::build_rendezvous(rv, payload)) {
++     // Legacy OSCAR peers may expect proxy TLVs in the conventional order.
++     // This serializer is used for outgoing ARS offers ONLY. Incoming and
++     // direct transfers keep their existing, tested packet format.
++     if (oft2::build_sender_proxy_offer(rv, payload)) {
+       char receiver[24]; _itoa(f->uin, receiver, 10);
+       bytes_t cookie((const char *)f->cookie.data(), 8);
+       uint32_t req;
+@@ -1274,8 +1279,12 @@
+       proto->Send(OscarPackets::fileRendezvous(receiver, cookie, payload, req));
+       offerSent = true;
+       proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE, ACKRESULT_LISTENING, f.get());
+-      proto->debugLogA("ARS DIAG3: OSCAR offer queued; now waiting for PROXY_READY. Check peer log for ARS DIAG3: incoming offer");
+-      bool ready = ars::waitReady(sock);
++      proto->debugLogA("ARS TX V5: waiting for relay READY after peer accepts (recipient=%u ticket=%u)",
++        (unsigned)f->uin, (unsigned)port);
++      unsigned relayResponse = 0;
++      bool ready = ars::waitReady(sock, &relayResponse);
++      if (!ready)
++       proto->debugLogA("ARS TX V5: relay did not become ready, last response=%u (0=socket/timeout; 1=proxy error; other=unexpected)", relayResponse);
+       if (!ready && InterlockedCompareExchange(&f->redirected, 0, 0) &&
+           !InterlockedCompareExchange(&f->cancelled, 0, 0)) {
+        uint32_t redirectIp; uint16_t redirectPort;
+@@ -1316,12 +1325,14 @@
+         memcpy(prompt + 192, rv.offer.name.c_str(), rv.offer.name.size());
+         proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE, ACKRESULT_CONNECTED, f.get());
+         proto->debugLogA("ARS TX: relay paired, sending OFT2 PROMPT, then awaiting ACK/data/DONE");
++        int transferStage = oft2::ST_VALIDATE;
+         success = oft2::send_one(sock, prompt, input, f->size,
+          [](uint64_t done, uint64_t, void *ctx) -> bool {
+           auto *args = (OutgoingThreadArgs *)ctx;
+           return args->proto->FileProgress(args->file.get(), done);
+-         }, ctx.get());
+-        proto->debugLogA("ARS TX: OFT2 send %s", success ? "completed" : "failed during PROMPT/ACK/data/DONE");
++         }, ctx.get(), &transferStage);
++        proto->debugLogA("ARS TX V5: OFT2 result=%s stage=%d (0=validate 1=PROMPT 2=ACK 3=data 4=DONE 5=finished)",
++          success ? "success" : "failure", transferStage);
+         fclose(input);
+        }
+       }
+--- a/normal/0.96.8/KICQ/src/ars_proxy.h
++++ b/normal/0.96.8/KICQ/src/ars_proxy.h
+@@ -73,9 +73,11 @@
+  setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&dataTimeout, sizeof(dataTimeout));
+  return ok;
+ }
+-static inline bool waitReady(SOCKET s) {
++static inline bool waitReady(SOCKET s, unsigned *lastResponse = nullptr) {
+  unsigned command = 0; std::string body;
+- return recvMessage(s, command, body) && command == 5;
++ const bool received = recvMessage(s, command, body);
++ if (lastResponse) *lastResponse = command;
++ return received && command == 5;
+ }
+ static inline bool connectTo(const char *host, uint16_t port, SOCKET &result) {
+  result = INVALID_SOCKET;
+--- a/normal/0.96.8/KICQ/src/oft2_rendezvous.h
++++ b/normal/0.96.8/KICQ/src/oft2_rendezvous.h
+@@ -170,3 +170,40 @@
+  out.swap(value); return true;
+ }
+ }
++
++// Stage-1 ARS offer for older OSCAR clients.  The generic serializer is kept
++// unchanged for direct offers, incoming replies, and redirects.  Only the
++// outgoing proxy offer uses this conventional TLV sequence (OSCAR file
++// transfer documentation, Stage 1): 000A,000F,0002,0016,0003,0005,0017,
++// 0010,2711.  The 0005 value is the ARS check/ticket, not its TCP port.
++namespace oft2 {
++static inline bool build_sender_proxy_offer(const Rendezvous &rv, std::string &out) {
++ if (rv.type != 0 || !rv.proxy || rv.requestNumber != 1 ||
++     !rv.externalIp || !rv.port || !rv.hasOffer) return false;
++ std::string value;
++ append16(value, rv.type);
++ value.append((const char *)rv.cookie.data(), rv.cookie.size());
++ value.append((const char *)rv.capability.data(), rv.capability.size());
++ std::string field;
++ append16(field, rv.requestNumber);
++ if (!add_tlv(value, 0x000A, field)) return false;
++ if (!add_tlv(value, 0x000F, std::string())) return false;
++ field.clear(); append32(field, rv.externalIp);
++ if (!add_tlv(value, 0x0002, field)) return false;
++ field.clear(); append32(field, ~rv.externalIp);
++ if (!add_tlv(value, 0x0016, field)) return false;
++ if (rv.internalIp) {
++  field.clear(); append32(field, rv.internalIp);
++  if (!add_tlv(value, 0x0003, field)) return false;
++ }
++ field.clear(); append16(field, rv.port);
++ if (!add_tlv(value, 0x0005, field)) return false;
++ field.clear(); append16(field, uint16_t(~rv.port));
++ if (!add_tlv(value, 0x0017, field)) return false;
++ if (!add_tlv(value, 0x0010, std::string())) return false;
++ field.clear();
++ if (!build_file_info(rv.offer, field) || !add_tlv(value, 0x2711, field)) return false;
++ out.swap(value);
++ return true;
++}
++}
+--- a/normal/0.96.8/KICQ/src/oft2_socket_transfer.h
++++ b/normal/0.96.8/KICQ/src/oft2_socket_transfer.h
+@@ -8,28 +8,38 @@
+ #include <string.h>
+ 
+ namespace oft2 {
++// Sender-only stage trace; 0=validation, 1=PROMPT, 2=ACK,
++// 3=data, 4=DONE, 5=finished. The receiver code remains untouched.
++enum TransferStage { ST_VALIDATE=0, ST_PROMPT=1, ST_ACK=2, ST_DATA=3, ST_DONE=4, ST_FINISHED=5 };
+ // The caller supplies the OFT2 PROMPT generated from the actual file metadata.
+ // Sending raw data before ACK is forbidden. A successful return requires DONE.
+ static inline bool send_one(SOCKET socket, const uint8_t (&prompt)[HEADER_SIZE],
+                             FILE *input, uint64_t length, Progress progress = nullptr,
+-                            void *ctx = nullptr) {
++                            void *ctx = nullptr, int *stage = nullptr) {
++ if (stage) *stage = ST_VALIDATE;
+  Header h, ack;
+  uint8_t response[HEADER_SIZE];
+  if (!decode(prompt, HEADER_SIZE, h) || h.type != 0x0101 ||
+      h.size != length || h.totalFiles != 1 || h.filesLeft != 1 ||
+      length > UINT32_MAX || !input) return false;
++ if (stage) *stage = ST_PROMPT;
+  if (!send_prompt(socket, prompt)) return false;
++ if (stage) *stage = ST_ACK;
+  if (!recv_expected(socket, 0x0202, response, ack)) return false;
+  // Never trust a peer acknowledgement for a different file.
+  if (memcmp(response + 8, prompt + 8, 8) != 0 ||
+      ack.size != h.size || ack.totalFiles != h.totalFiles ||
+      ack.filesLeft != h.filesLeft || ack.received != 0) return false;
++ if (stage) *stage = ST_DATA;
+  if (!send_file(socket, input, length, progress, ctx)) return false;
+  Header done;
++ if (stage) *stage = ST_DONE;
+  if (!recv_expected(socket, 0x0204, response, done)) return false;
+- return memcmp(response + 8, prompt + 8, 8) == 0 &&
++ const bool validDone = memcmp(response + 8, prompt + 8, 8) == 0 &&
+         done.totalFiles == h.totalFiles && done.filesLeft == h.filesLeft &&
+         done.size == h.size && done.received == length;
++ if (validDone && stage) *stage = ST_FINISHED;
++ return validDone;
+ }
+ 
+ // The receiver writes only the exact announced number of bytes. A temporary
+--- a/windows-xp-x86/0.96.7/KICQ/src/proto.cpp
++++ b/windows-xp-x86/0.96.7/KICQ/src/proto.cpp
+@@ -1260,7 +1260,9 @@
+     rv.cookie = f->cookie;
+     memcpy(rv.capability.data(), cap.data(), 16);
+     rv.externalIp = ip;
+-    rv.internalIp = ip;
++    // 0x0003 is the sender's local address, NOT the proxy's advertised IP.
++    // Some legacy peers use it to distinguish a proxy offer from a direct one.
++    rv.internalIp = Oft2LocalIPv4(T2Utf(proto->m_wszServer));
+     rv.port = port;
+     rv.proxy = true;
+     rv.requestNumber = 1;
+@@ -1274,7 +1276,10 @@
+      WideCharToMultiByte(CP_ACP, 0, f->filename.c_str(), -1, &encoded[0], bytes, nullptr, nullptr);
+      rv.offer.name = encoded.c_str();
+      bytes_t payload;
+-     if (oft2::build_rendezvous(rv, payload)) {
++     // Legacy OSCAR peers may expect proxy TLVs in the conventional order.
++     // This serializer is used for outgoing ARS offers ONLY. Incoming and
++     // direct transfers keep their existing, tested packet format.
++     if (oft2::build_sender_proxy_offer(rv, payload)) {
+       char receiver[24]; _itoa(f->uin, receiver, 10);
+       bytes_t cookie((const char *)f->cookie.data(), 8);
+       uint32_t req;
+@@ -1283,8 +1288,12 @@
+       proto->Send(OscarPackets::fileRendezvous(receiver, cookie, payload, req));
+       offerSent = true;
+       proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE, ACKRESULT_LISTENING, f.get());
+-      proto->debugLogA("ARS DIAG3: OSCAR offer queued; now waiting for PROXY_READY. Check peer log for ARS DIAG3: incoming offer");
+-      bool ready = ars::waitReady(sock);
++      proto->debugLogA("ARS TX V5: waiting for relay READY after peer accepts (recipient=%u ticket=%u)",
++        (unsigned)f->uin, (unsigned)port);
++      unsigned relayResponse = 0;
++      bool ready = ars::waitReady(sock, &relayResponse);
++      if (!ready)
++       proto->debugLogA("ARS TX V5: relay did not become ready, last response=%u (0=socket/timeout; 1=proxy error; other=unexpected)", relayResponse);
+       if (!ready && InterlockedCompareExchange(&f->redirected, 0, 0) &&
+           !InterlockedCompareExchange(&f->cancelled, 0, 0)) {
+        uint32_t redirectIp; uint16_t redirectPort;
+@@ -1325,12 +1334,14 @@
+         memcpy(prompt + 192, rv.offer.name.c_str(), rv.offer.name.size());
+         proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE, ACKRESULT_CONNECTED, f.get());
+         proto->debugLogA("ARS TX: relay paired, sending OFT2 PROMPT, then awaiting ACK/data/DONE");
++        int transferStage = oft2::ST_VALIDATE;
+         success = oft2::send_one(sock, prompt, input, f->size,
+          [](uint64_t done, uint64_t, void *ctx) -> bool {
+           auto *args = (OutgoingThreadArgs *)ctx;
+           return args->proto->FileProgress(args->file.get(), done);
+-         }, ctx.get());
+-        proto->debugLogA("ARS TX: OFT2 send %s", success ? "completed" : "failed during PROMPT/ACK/data/DONE");
++         }, ctx.get(), &transferStage);
++        proto->debugLogA("ARS TX V5: OFT2 result=%s stage=%d (0=validate 1=PROMPT 2=ACK 3=data 4=DONE 5=finished)",
++          success ? "success" : "failure", transferStage);
+         fclose(input);
+        }
+       }
+--- a/windows-xp-x86/0.96.7/KICQ/src/ars_proxy.h
++++ b/windows-xp-x86/0.96.7/KICQ/src/ars_proxy.h
+@@ -73,9 +73,11 @@
+  setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&dataTimeout, sizeof(dataTimeout));
+  return ok;
+ }
+-static inline bool waitReady(SOCKET s) {
++static inline bool waitReady(SOCKET s, unsigned *lastResponse = nullptr) {
+  unsigned command = 0; std::string body;
+- return recvMessage(s, command, body) && command == 5;
++ const bool received = recvMessage(s, command, body);
++ if (lastResponse) *lastResponse = command;
++ return received && command == 5;
+ }
+ static inline bool connectTo(const char *host, uint16_t port, SOCKET &result) {
+  result = INVALID_SOCKET;
+--- a/windows-xp-x86/0.96.7/KICQ/src/oft2_rendezvous.h
++++ b/windows-xp-x86/0.96.7/KICQ/src/oft2_rendezvous.h
+@@ -170,3 +170,40 @@
+  out.swap(value); return true;
+ }
+ }
++
++// Stage-1 ARS offer for older OSCAR clients.  The generic serializer is kept
++// unchanged for direct offers, incoming replies, and redirects.  Only the
++// outgoing proxy offer uses this conventional TLV sequence (OSCAR file
++// transfer documentation, Stage 1): 000A,000F,0002,0016,0003,0005,0017,
++// 0010,2711.  The 0005 value is the ARS check/ticket, not its TCP port.
++namespace oft2 {
++static inline bool build_sender_proxy_offer(const Rendezvous &rv, std::string &out) {
++ if (rv.type != 0 || !rv.proxy || rv.requestNumber != 1 ||
++     !rv.externalIp || !rv.port || !rv.hasOffer) return false;
++ std::string value;
++ append16(value, rv.type);
++ value.append((const char *)rv.cookie.data(), rv.cookie.size());
++ value.append((const char *)rv.capability.data(), rv.capability.size());
++ std::string field;
++ append16(field, rv.requestNumber);
++ if (!add_tlv(value, 0x000A, field)) return false;
++ if (!add_tlv(value, 0x000F, std::string())) return false;
++ field.clear(); append32(field, rv.externalIp);
++ if (!add_tlv(value, 0x0002, field)) return false;
++ field.clear(); append32(field, ~rv.externalIp);
++ if (!add_tlv(value, 0x0016, field)) return false;
++ if (rv.internalIp) {
++  field.clear(); append32(field, rv.internalIp);
++  if (!add_tlv(value, 0x0003, field)) return false;
++ }
++ field.clear(); append16(field, rv.port);
++ if (!add_tlv(value, 0x0005, field)) return false;
++ field.clear(); append16(field, uint16_t(~rv.port));
++ if (!add_tlv(value, 0x0017, field)) return false;
++ if (!add_tlv(value, 0x0010, std::string())) return false;
++ field.clear();
++ if (!build_file_info(rv.offer, field) || !add_tlv(value, 0x2711, field)) return false;
++ out.swap(value);
++ return true;
++}
++}
+--- a/windows-xp-x86/0.96.7/KICQ/src/oft2_socket_transfer.h
++++ b/windows-xp-x86/0.96.7/KICQ/src/oft2_socket_transfer.h
+@@ -8,28 +8,38 @@
+ #include <string.h>
+ 
+ namespace oft2 {
++// Sender-only stage trace; 0=validation, 1=PROMPT, 2=ACK,
++// 3=data, 4=DONE, 5=finished. The receiver code remains untouched.
++enum TransferStage { ST_VALIDATE=0, ST_PROMPT=1, ST_ACK=2, ST_DATA=3, ST_DONE=4, ST_FINISHED=5 };
+ // The caller supplies the OFT2 PROMPT generated from the actual file metadata.
+ // Sending raw data before ACK is forbidden. A successful return requires DONE.
+ static inline bool send_one(SOCKET socket, const uint8_t (&prompt)[HEADER_SIZE],
+                             FILE *input, uint64_t length, Progress progress = nullptr,
+-                            void *ctx = nullptr) {
++                            void *ctx = nullptr, int *stage = nullptr) {
++ if (stage) *stage = ST_VALIDATE;
+  Header h, ack;
+  uint8_t response[HEADER_SIZE];
+  if (!decode(prompt, HEADER_SIZE, h) || h.type != 0x0101 ||
+      h.size != length || h.totalFiles != 1 || h.filesLeft != 1 ||
+      length > UINT32_MAX || !input) return false;
++ if (stage) *stage = ST_PROMPT;
+  if (!send_prompt(socket, prompt)) return false;
++ if (stage) *stage = ST_ACK;
+  if (!recv_expected(socket, 0x0202, response, ack)) return false;
+  // Never trust a peer acknowledgement for a different file.
+  if (memcmp(response + 8, prompt + 8, 8) != 0 ||
+      ack.size != h.size || ack.totalFiles != h.totalFiles ||
+      ack.filesLeft != h.filesLeft || ack.received != 0) return false;
++ if (stage) *stage = ST_DATA;
+  if (!send_file(socket, input, length, progress, ctx)) return false;
+  Header done;
++ if (stage) *stage = ST_DONE;
+  if (!recv_expected(socket, 0x0204, response, done)) return false;
+- return memcmp(response + 8, prompt + 8, 8) == 0 &&
++ const bool validDone = memcmp(response + 8, prompt + 8, 8) == 0 &&
+         done.totalFiles == h.totalFiles && done.filesLeft == h.filesLeft &&
+         done.size == h.size && done.received == length;
++ if (validDone && stage) *stage = ST_FINISHED;
++ return validDone;
+ }
+ 
+ // The receiver writes only the exact announced number of bytes. A temporary
+--- a/windows-xp-x86/0.96.8/KICQ/src/proto.cpp
++++ b/windows-xp-x86/0.96.8/KICQ/src/proto.cpp
+@@ -1255,7 +1255,9 @@
+     rv.cookie = f->cookie;
+     memcpy(rv.capability.data(), cap.data(), 16);
+     rv.externalIp = ip;
+-    rv.internalIp = ip;
++    // 0x0003 is the sender's local address, NOT the proxy's advertised IP.
++    // Some legacy peers use it to distinguish a proxy offer from a direct one.
++    rv.internalIp = Oft2LocalIPv4(T2Utf(proto->m_wszServer));
+     rv.port = port;
+     rv.proxy = true;
+     rv.requestNumber = 1;
+@@ -1269,7 +1271,10 @@
+      WideCharToMultiByte(CP_ACP, 0, f->filename.c_str(), -1, &encoded[0], bytes, nullptr, nullptr);
+      rv.offer.name = encoded.c_str();
+      bytes_t payload;
+-     if (oft2::build_rendezvous(rv, payload)) {
++     // Legacy OSCAR peers may expect proxy TLVs in the conventional order.
++     // This serializer is used for outgoing ARS offers ONLY. Incoming and
++     // direct transfers keep their existing, tested packet format.
++     if (oft2::build_sender_proxy_offer(rv, payload)) {
+       char receiver[24]; _itoa(f->uin, receiver, 10);
+       bytes_t cookie((const char *)f->cookie.data(), 8);
+       uint32_t req;
+@@ -1278,8 +1283,12 @@
+       proto->Send(OscarPackets::fileRendezvous(receiver, cookie, payload, req));
+       offerSent = true;
+       proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE, ACKRESULT_LISTENING, f.get());
+-      proto->debugLogA("ARS DIAG3: OSCAR offer queued; now waiting for PROXY_READY. Check peer log for ARS DIAG3: incoming offer");
+-      bool ready = ars::waitReady(sock);
++      proto->debugLogA("ARS TX V5: waiting for relay READY after peer accepts (recipient=%u ticket=%u)",
++        (unsigned)f->uin, (unsigned)port);
++      unsigned relayResponse = 0;
++      bool ready = ars::waitReady(sock, &relayResponse);
++      if (!ready)
++       proto->debugLogA("ARS TX V5: relay did not become ready, last response=%u (0=socket/timeout; 1=proxy error; other=unexpected)", relayResponse);
+       if (!ready && InterlockedCompareExchange(&f->redirected, 0, 0) &&
+           !InterlockedCompareExchange(&f->cancelled, 0, 0)) {
+        uint32_t redirectIp; uint16_t redirectPort;
+@@ -1320,12 +1329,14 @@
+         memcpy(prompt + 192, rv.offer.name.c_str(), rv.offer.name.size());
+         proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE, ACKRESULT_CONNECTED, f.get());
+         proto->debugLogA("ARS TX: relay paired, sending OFT2 PROMPT, then awaiting ACK/data/DONE");
++        int transferStage = oft2::ST_VALIDATE;
+         success = oft2::send_one(sock, prompt, input, f->size,
+          [](uint64_t done, uint64_t, void *ctx) -> bool {
+           auto *args = (OutgoingThreadArgs *)ctx;
+           return args->proto->FileProgress(args->file.get(), done);
+-         }, ctx.get());
+-        proto->debugLogA("ARS TX: OFT2 send %s", success ? "completed" : "failed during PROMPT/ACK/data/DONE");
++         }, ctx.get(), &transferStage);
++        proto->debugLogA("ARS TX V5: OFT2 result=%s stage=%d (0=validate 1=PROMPT 2=ACK 3=data 4=DONE 5=finished)",
++          success ? "success" : "failure", transferStage);
+         fclose(input);
+        }
+       }
+--- a/windows-xp-x86/0.96.8/KICQ/src/ars_proxy.h
++++ b/windows-xp-x86/0.96.8/KICQ/src/ars_proxy.h
+@@ -73,9 +73,11 @@
+  setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&dataTimeout, sizeof(dataTimeout));
+  return ok;
+ }
+-static inline bool waitReady(SOCKET s) {
++static inline bool waitReady(SOCKET s, unsigned *lastResponse = nullptr) {
+  unsigned command = 0; std::string body;
+- return recvMessage(s, command, body) && command == 5;
++ const bool received = recvMessage(s, command, body);
++ if (lastResponse) *lastResponse = command;
++ return received && command == 5;
+ }
+ static inline bool connectTo(const char *host, uint16_t port, SOCKET &result) {
+  result = INVALID_SOCKET;
+--- a/windows-xp-x86/0.96.8/KICQ/src/oft2_rendezvous.h
++++ b/windows-xp-x86/0.96.8/KICQ/src/oft2_rendezvous.h
+@@ -170,3 +170,40 @@
+  out.swap(value); return true;
+ }
+ }
++
++// Stage-1 ARS offer for older OSCAR clients.  The generic serializer is kept
++// unchanged for direct offers, incoming replies, and redirects.  Only the
++// outgoing proxy offer uses this conventional TLV sequence (OSCAR file
++// transfer documentation, Stage 1): 000A,000F,0002,0016,0003,0005,0017,
++// 0010,2711.  The 0005 value is the ARS check/ticket, not its TCP port.
++namespace oft2 {
++static inline bool build_sender_proxy_offer(const Rendezvous &rv, std::string &out) {
++ if (rv.type != 0 || !rv.proxy || rv.requestNumber != 1 ||
++     !rv.externalIp || !rv.port || !rv.hasOffer) return false;
++ std::string value;
++ append16(value, rv.type);
++ value.append((const char *)rv.cookie.data(), rv.cookie.size());
++ value.append((const char *)rv.capability.data(), rv.capability.size());
++ std::string field;
++ append16(field, rv.requestNumber);
++ if (!add_tlv(value, 0x000A, field)) return false;
++ if (!add_tlv(value, 0x000F, std::string())) return false;
++ field.clear(); append32(field, rv.externalIp);
++ if (!add_tlv(value, 0x0002, field)) return false;
++ field.clear(); append32(field, ~rv.externalIp);
++ if (!add_tlv(value, 0x0016, field)) return false;
++ if (rv.internalIp) {
++  field.clear(); append32(field, rv.internalIp);
++  if (!add_tlv(value, 0x0003, field)) return false;
++ }
++ field.clear(); append16(field, rv.port);
++ if (!add_tlv(value, 0x0005, field)) return false;
++ field.clear(); append16(field, uint16_t(~rv.port));
++ if (!add_tlv(value, 0x0017, field)) return false;
++ if (!add_tlv(value, 0x0010, std::string())) return false;
++ field.clear();
++ if (!build_file_info(rv.offer, field) || !add_tlv(value, 0x2711, field)) return false;
++ out.swap(value);
++ return true;
++}
++}
+--- a/windows-xp-x86/0.96.8/KICQ/src/oft2_socket_transfer.h
++++ b/windows-xp-x86/0.96.8/KICQ/src/oft2_socket_transfer.h
+@@ -8,28 +8,38 @@
+ #include <string.h>
+ 
+ namespace oft2 {
++// Sender-only stage trace; 0=validation, 1=PROMPT, 2=ACK,
++// 3=data, 4=DONE, 5=finished. The receiver code remains untouched.
++enum TransferStage { ST_VALIDATE=0, ST_PROMPT=1, ST_ACK=2, ST_DATA=3, ST_DONE=4, ST_FINISHED=5 };
+ // The caller supplies the OFT2 PROMPT generated from the actual file metadata.
+ // Sending raw data before ACK is forbidden. A successful return requires DONE.
+ static inline bool send_one(SOCKET socket, const uint8_t (&prompt)[HEADER_SIZE],
+                             FILE *input, uint64_t length, Progress progress = nullptr,
+-                            void *ctx = nullptr) {
++                            void *ctx = nullptr, int *stage = nullptr) {
++ if (stage) *stage = ST_VALIDATE;
+  Header h, ack;
+  uint8_t response[HEADER_SIZE];
+  if (!decode(prompt, HEADER_SIZE, h) || h.type != 0x0101 ||
+      h.size != length || h.totalFiles != 1 || h.filesLeft != 1 ||
+      length > UINT32_MAX || !input) return false;
++ if (stage) *stage = ST_PROMPT;
+  if (!send_prompt(socket, prompt)) return false;
++ if (stage) *stage = ST_ACK;
+  if (!recv_expected(socket, 0x0202, response, ack)) return false;
+  // Never trust a peer acknowledgement for a different file.
+  if (memcmp(response + 8, prompt + 8, 8) != 0 ||
+      ack.size != h.size || ack.totalFiles != h.totalFiles ||
+      ack.filesLeft != h.filesLeft || ack.received != 0) return false;
++ if (stage) *stage = ST_DATA;
+  if (!send_file(socket, input, length, progress, ctx)) return false;
+  Header done;
++ if (stage) *stage = ST_DONE;
+  if (!recv_expected(socket, 0x0204, response, done)) return false;
+- return memcmp(response + 8, prompt + 8, 8) == 0 &&
++ const bool validDone = memcmp(response + 8, prompt + 8, 8) == 0 &&
+         done.totalFiles == h.totalFiles && done.filesLeft == h.filesLeft &&
+         done.size == h.size && done.received == length;
++ if (validDone && stage) *stage = ST_FINISHED;
++ return validDone;
+ }
+ 
+ // The receiver writes only the exact announced number of bytes. A temporary

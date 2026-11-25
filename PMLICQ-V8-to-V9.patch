@@ -1,0 +1,216 @@
+--- V8/normal/0.96.7/KICQ/src/proto.cpp
++++ V9/normal/0.96.7/KICQ/src/proto.cpp
+@@ -1402,36 +1402,43 @@
+         // the relay at LAN speed (observed OSCAR CANCEL + WSAECONNRESET).
+         // A bounded, optional sender-side rate is used only for >=8 MiB.
+         // Preserve the already-working small ARS path byte-for-byte.
+-        const uint32_t configuredKiBps = proto->getDword("ArsUploadKiBps", 1024);
++        // V9: V8 slept at most 250 ms ONCE per block. If the sender fell
++        // behind its pacing schedule, the next block could be sent immediately,
++        // so ArsUploadKiBps was not a reliable bandwidth limit.
++        // Do not affect the already working <8 MiB transfers.
++        const uint32_t configuredKiBps = proto->getDword("ArsUploadKiBps", 512);
+         const uint32_t rateKiBps = f->size >= 8U * 1024U * 1024U ? configuredKiBps : 0;
+         struct ArsUploadContext {
+          OutgoingThreadArgs *args;
+          DWORD began;
+          uint32_t rate;
+         } upload = { ctx.get(), GetTickCount(), rateKiBps };
+-        proto->debugLogA("ARS TX V8: upload limiter=%u KiB/s, file=%u bytes (0=unlimited)",
++        proto->debugLogA("ARS TX V9: upload limiter=%u KiB/s, file=%u bytes (0=unlimited)",
+           (unsigned)rateKiBps, (unsigned)f->size);
+         success = oft2::send_one(sock, prompt, input, f->size,
+          [](uint64_t done, uint64_t, void *opaque) -> bool {
+           auto *upload = (ArsUploadContext *)opaque;
+           auto *args = upload->args;
+           if (done >= args->file->nextLogBytes || done == args->file->size) {
+-           args->proto->debugLogA("ARS TX V8: file data progress %llu/%u bytes", (unsigned long long)done, (unsigned)args->file->size);
++           args->proto->debugLogA("ARS TX V9: file data progress %llu/%u bytes", (unsigned long long)done, (unsigned)args->file->size);
+            args->file->nextLogBytes = done + 8ULL * 1024ULL * 1024ULL;
+           }
+           if (!args->proto->FileProgress(args->file.get(), done)) return false;
+           if (upload->rate) {
+-           // Integer math is 64-bit; GetTickCount wraparound is well-defined.
++           // Pace the entire transfer, not just the next 250 ms slice.
++           // Both the target and multiplication use 64-bit arithmetic;
++           // GetTickCount subtraction handles 32-bit timer wraparound.
+            const uint64_t targetMs = (done * 1000ULL) / (uint64_t(upload->rate) * 1024ULL);
+-           const DWORD elapsed = GetTickCount() - upload->began;
+-           if (targetMs > elapsed) {
++           while (!InterlockedCompareExchange(&args->file->cancelled, 0, 0)) {
++            const DWORD elapsed = GetTickCount() - upload->began;
++            if ((uint64_t)elapsed >= targetMs) break;
+             const uint64_t remaining = targetMs - elapsed;
+-            Sleep((DWORD)(remaining > 250 ? 250 : remaining));
++            Sleep((DWORD)(remaining > 100 ? 100 : remaining));
+            }
+           }
+           return !InterlockedCompareExchange(&args->file->cancelled, 0, 0);
+          }, &upload, &transferStage, &transferred);
+-        proto->debugLogA("ARS TX V8: OFT2 result=%s stage=%d dataSent=%llu/%u elapsedMs=%llu lastWSA=%d cancelled=%ld (stage 3=data, 4=waiting DONE)",
++        proto->debugLogA("ARS TX V9: OFT2 result=%s stage=%d dataSent=%llu/%u elapsedMs=%llu lastWSA=%d cancelled=%ld (stage 3=data, 4=waiting DONE)",
+           success ? "success" : "failure", transferStage,
+           (unsigned long long)transferred, (unsigned)f->size,
+           (unsigned long long)(DWORD)(GetTickCount()-startedAt), success ? 0 : WSAGetLastError(), (long)InterlockedCompareExchange(&f->cancelled, 0, 0));
+--- V8/normal/0.96.8/KICQ/src/proto.cpp
++++ V9/normal/0.96.8/KICQ/src/proto.cpp
+@@ -1400,36 +1400,43 @@
+         // the relay at LAN speed (observed OSCAR CANCEL + WSAECONNRESET).
+         // A bounded, optional sender-side rate is used only for >=8 MiB.
+         // Preserve the already-working small ARS path byte-for-byte.
+-        const uint32_t configuredKiBps = proto->getDword("ArsUploadKiBps", 1024);
++        // V9: V8 slept at most 250 ms ONCE per block. If the sender fell
++        // behind its pacing schedule, the next block could be sent immediately,
++        // so ArsUploadKiBps was not a reliable bandwidth limit.
++        // Do not affect the already working <8 MiB transfers.
++        const uint32_t configuredKiBps = proto->getDword("ArsUploadKiBps", 512);
+         const uint32_t rateKiBps = f->size >= 8U * 1024U * 1024U ? configuredKiBps : 0;
+         struct ArsUploadContext {
+          OutgoingThreadArgs *args;
+          DWORD began;
+          uint32_t rate;
+         } upload = { ctx.get(), GetTickCount(), rateKiBps };
+-        proto->debugLogA("ARS TX V8: upload limiter=%u KiB/s, file=%u bytes (0=unlimited)",
++        proto->debugLogA("ARS TX V9: upload limiter=%u KiB/s, file=%u bytes (0=unlimited)",
+           (unsigned)rateKiBps, (unsigned)f->size);
+         success = oft2::send_one(sock, prompt, input, f->size,
+          [](uint64_t done, uint64_t, void *opaque) -> bool {
+           auto *upload = (ArsUploadContext *)opaque;
+           auto *args = upload->args;
+           if (done >= args->file->nextLogBytes || done == args->file->size) {
+-           args->proto->debugLogA("ARS TX V8: file data progress %llu/%u bytes", (unsigned long long)done, (unsigned)args->file->size);
++           args->proto->debugLogA("ARS TX V9: file data progress %llu/%u bytes", (unsigned long long)done, (unsigned)args->file->size);
+            args->file->nextLogBytes = done + 8ULL * 1024ULL * 1024ULL;
+           }
+           if (!args->proto->FileProgress(args->file.get(), done)) return false;
+           if (upload->rate) {
+-           // Integer math is 64-bit; GetTickCount wraparound is well-defined.
++           // Pace the entire transfer, not just the next 250 ms slice.
++           // Both the target and multiplication use 64-bit arithmetic;
++           // GetTickCount subtraction handles 32-bit timer wraparound.
+            const uint64_t targetMs = (done * 1000ULL) / (uint64_t(upload->rate) * 1024ULL);
+-           const DWORD elapsed = GetTickCount() - upload->began;
+-           if (targetMs > elapsed) {
++           while (!InterlockedCompareExchange(&args->file->cancelled, 0, 0)) {
++            const DWORD elapsed = GetTickCount() - upload->began;
++            if ((uint64_t)elapsed >= targetMs) break;
+             const uint64_t remaining = targetMs - elapsed;
+-            Sleep((DWORD)(remaining > 250 ? 250 : remaining));
++            Sleep((DWORD)(remaining > 100 ? 100 : remaining));
+            }
+           }
+           return !InterlockedCompareExchange(&args->file->cancelled, 0, 0);
+          }, &upload, &transferStage, &transferred);
+-        proto->debugLogA("ARS TX V8: OFT2 result=%s stage=%d dataSent=%llu/%u elapsedMs=%llu lastWSA=%d cancelled=%ld (stage 3=data, 4=waiting DONE)",
++        proto->debugLogA("ARS TX V9: OFT2 result=%s stage=%d dataSent=%llu/%u elapsedMs=%llu lastWSA=%d cancelled=%ld (stage 3=data, 4=waiting DONE)",
+           success ? "success" : "failure", transferStage,
+           (unsigned long long)transferred, (unsigned)f->size,
+           (unsigned long long)(DWORD)(GetTickCount()-startedAt), success ? 0 : WSAGetLastError(), (long)InterlockedCompareExchange(&f->cancelled, 0, 0));
+--- V8/windows-xp-x86/0.96.7/KICQ/src/proto.cpp
++++ V9/windows-xp-x86/0.96.7/KICQ/src/proto.cpp
+@@ -1409,36 +1409,43 @@
+         // the relay at LAN speed (observed OSCAR CANCEL + WSAECONNRESET).
+         // A bounded, optional sender-side rate is used only for >=8 MiB.
+         // Preserve the already-working small ARS path byte-for-byte.
+-        const uint32_t configuredKiBps = proto->getDword("ArsUploadKiBps", 1024);
++        // V9: V8 slept at most 250 ms ONCE per block. If the sender fell
++        // behind its pacing schedule, the next block could be sent immediately,
++        // so ArsUploadKiBps was not a reliable bandwidth limit.
++        // Do not affect the already working <8 MiB transfers.
++        const uint32_t configuredKiBps = proto->getDword("ArsUploadKiBps", 512);
+         const uint32_t rateKiBps = f->size >= 8U * 1024U * 1024U ? configuredKiBps : 0;
+         struct ArsUploadContext {
+          OutgoingThreadArgs *args;
+          DWORD began;
+          uint32_t rate;
+         } upload = { ctx.get(), GetTickCount(), rateKiBps };
+-        proto->debugLogA("ARS TX V8: upload limiter=%u KiB/s, file=%u bytes (0=unlimited)",
++        proto->debugLogA("ARS TX V9: upload limiter=%u KiB/s, file=%u bytes (0=unlimited)",
+           (unsigned)rateKiBps, (unsigned)f->size);
+         success = oft2::send_one(sock, prompt, input, f->size,
+          [](uint64_t done, uint64_t, void *opaque) -> bool {
+           auto *upload = (ArsUploadContext *)opaque;
+           auto *args = upload->args;
+           if (done >= args->file->nextLogBytes || done == args->file->size) {
+-           args->proto->debugLogA("ARS TX V8: file data progress %llu/%u bytes", (unsigned long long)done, (unsigned)args->file->size);
++           args->proto->debugLogA("ARS TX V9: file data progress %llu/%u bytes", (unsigned long long)done, (unsigned)args->file->size);
+            args->file->nextLogBytes = done + 8ULL * 1024ULL * 1024ULL;
+           }
+           if (!args->proto->FileProgress(args->file.get(), done)) return false;
+           if (upload->rate) {
+-           // Integer math is 64-bit; GetTickCount wraparound is well-defined.
++           // Pace the entire transfer, not just the next 250 ms slice.
++           // Both the target and multiplication use 64-bit arithmetic;
++           // GetTickCount subtraction handles 32-bit timer wraparound.
+            const uint64_t targetMs = (done * 1000ULL) / (uint64_t(upload->rate) * 1024ULL);
+-           const DWORD elapsed = GetTickCount() - upload->began;
+-           if (targetMs > elapsed) {
++           while (!InterlockedCompareExchange(&args->file->cancelled, 0, 0)) {
++            const DWORD elapsed = GetTickCount() - upload->began;
++            if ((uint64_t)elapsed >= targetMs) break;
+             const uint64_t remaining = targetMs - elapsed;
+-            Sleep((DWORD)(remaining > 250 ? 250 : remaining));
++            Sleep((DWORD)(remaining > 100 ? 100 : remaining));
+            }
+           }
+           return !InterlockedCompareExchange(&args->file->cancelled, 0, 0);
+          }, &upload, &transferStage, &transferred);
+-        proto->debugLogA("ARS TX V8: OFT2 result=%s stage=%d dataSent=%llu/%u elapsedMs=%llu lastWSA=%d cancelled=%ld (stage 3=data, 4=waiting DONE)",
++        proto->debugLogA("ARS TX V9: OFT2 result=%s stage=%d dataSent=%llu/%u elapsedMs=%llu lastWSA=%d cancelled=%ld (stage 3=data, 4=waiting DONE)",
+           success ? "success" : "failure", transferStage,
+           (unsigned long long)transferred, (unsigned)f->size,
+           (unsigned long long)(DWORD)(GetTickCount()-startedAt), success ? 0 : WSAGetLastError(), (long)InterlockedCompareExchange(&f->cancelled, 0, 0));
+--- V8/windows-xp-x86/0.96.8/KICQ/src/proto.cpp
++++ V9/windows-xp-x86/0.96.8/KICQ/src/proto.cpp
+@@ -1404,36 +1404,43 @@
+         // the relay at LAN speed (observed OSCAR CANCEL + WSAECONNRESET).
+         // A bounded, optional sender-side rate is used only for >=8 MiB.
+         // Preserve the already-working small ARS path byte-for-byte.
+-        const uint32_t configuredKiBps = proto->getDword("ArsUploadKiBps", 1024);
++        // V9: V8 slept at most 250 ms ONCE per block. If the sender fell
++        // behind its pacing schedule, the next block could be sent immediately,
++        // so ArsUploadKiBps was not a reliable bandwidth limit.
++        // Do not affect the already working <8 MiB transfers.
++        const uint32_t configuredKiBps = proto->getDword("ArsUploadKiBps", 512);
+         const uint32_t rateKiBps = f->size >= 8U * 1024U * 1024U ? configuredKiBps : 0;
+         struct ArsUploadContext {
+          OutgoingThreadArgs *args;
+          DWORD began;
+          uint32_t rate;
+         } upload = { ctx.get(), GetTickCount(), rateKiBps };
+-        proto->debugLogA("ARS TX V8: upload limiter=%u KiB/s, file=%u bytes (0=unlimited)",
++        proto->debugLogA("ARS TX V9: upload limiter=%u KiB/s, file=%u bytes (0=unlimited)",
+           (unsigned)rateKiBps, (unsigned)f->size);
+         success = oft2::send_one(sock, prompt, input, f->size,
+          [](uint64_t done, uint64_t, void *opaque) -> bool {
+           auto *upload = (ArsUploadContext *)opaque;
+           auto *args = upload->args;
+           if (done >= args->file->nextLogBytes || done == args->file->size) {
+-           args->proto->debugLogA("ARS TX V8: file data progress %llu/%u bytes", (unsigned long long)done, (unsigned)args->file->size);
++           args->proto->debugLogA("ARS TX V9: file data progress %llu/%u bytes", (unsigned long long)done, (unsigned)args->file->size);
+            args->file->nextLogBytes = done + 8ULL * 1024ULL * 1024ULL;
+           }
+           if (!args->proto->FileProgress(args->file.get(), done)) return false;
+           if (upload->rate) {
+-           // Integer math is 64-bit; GetTickCount wraparound is well-defined.
++           // Pace the entire transfer, not just the next 250 ms slice.
++           // Both the target and multiplication use 64-bit arithmetic;
++           // GetTickCount subtraction handles 32-bit timer wraparound.
+            const uint64_t targetMs = (done * 1000ULL) / (uint64_t(upload->rate) * 1024ULL);
+-           const DWORD elapsed = GetTickCount() - upload->began;
+-           if (targetMs > elapsed) {
++           while (!InterlockedCompareExchange(&args->file->cancelled, 0, 0)) {
++            const DWORD elapsed = GetTickCount() - upload->began;
++            if ((uint64_t)elapsed >= targetMs) break;
+             const uint64_t remaining = targetMs - elapsed;
+-            Sleep((DWORD)(remaining > 250 ? 250 : remaining));
++            Sleep((DWORD)(remaining > 100 ? 100 : remaining));
+            }
+           }
+           return !InterlockedCompareExchange(&args->file->cancelled, 0, 0);
+          }, &upload, &transferStage, &transferred);
+-        proto->debugLogA("ARS TX V8: OFT2 result=%s stage=%d dataSent=%llu/%u elapsedMs=%llu lastWSA=%d cancelled=%ld (stage 3=data, 4=waiting DONE)",
++        proto->debugLogA("ARS TX V9: OFT2 result=%s stage=%d dataSent=%llu/%u elapsedMs=%llu lastWSA=%d cancelled=%ld (stage 3=data, 4=waiting DONE)",
+           success ? "success" : "failure", transferStage,
+           (unsigned long long)transferred, (unsigned)f->size,
+           (unsigned long long)(DWORD)(GetTickCount()-startedAt), success ? 0 : WSAGetLastError(), (long)InterlockedCompareExchange(&f->cancelled, 0, 0));

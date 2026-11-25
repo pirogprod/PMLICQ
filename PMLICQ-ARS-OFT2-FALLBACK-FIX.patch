@@ -1,0 +1,719 @@
+--- a/normal/0.96.7/KICQ/src/proto.cpp
++++ b/normal/0.96.7/KICQ/src/proto.cpp
+@@ -1109,6 +1109,65 @@
+  return true;
+ }
+ 
++// ARS may fail before an OSCAR offer is sent. In that case try a fresh
++// direct OFT2 offer using the SAME transfer handle and cookie. Never use this
++// after the relay offer has been sent, as the peer may still accept it.
++bool CKicqProto::StartDirectFileFallback(const std::shared_ptr<OutgoingFile> &f)
++{
++ if (!f || InterlockedCompareExchange(&f->cancelled, 0, 0) || !m_bOnline)
++  return false;
++ if (!f->listener.open()) {
++  debugLogA("OFT2 fallback: cannot open TCP listener");
++  return false;
++ }
++ const uint32_t ip = Oft2LocalIPv4();
++ const bytes_t cap = OscarText::unhex(CAP_FILE);
++ if (!ip || cap.size() != 16) {
++  debugLogA("OFT2 fallback: no route to OSCAR server or invalid file capability");
++  f->listener.close();
++  return false;
++ }
++ const int length = WideCharToMultiByte(CP_ACP, 0, f->filename.c_str(), -1, nullptr, 0, nullptr, nullptr);
++ if (length <= 1 || length > 61) {
++  debugLogA("OFT2 fallback: filename cannot be represented in the legacy transfer header");
++  f->listener.close();
++  return false;
++ }
++ std::string encoded(size_t(length), '\0');
++ if (!WideCharToMultiByte(CP_ACP, 0, f->filename.c_str(), -1, &encoded[0], length, nullptr, nullptr)) {
++  f->listener.close();
++  return false;
++ }
++ oft2::Rendezvous rv;
++ rv.type = 0;
++ rv.cookie = f->cookie;
++ memcpy(rv.capability.data(), cap.data(), 16);
++ rv.externalIp = ip;
++ rv.internalIp = ip;
++ rv.port = f->listener.port();
++ rv.requestNumber = 1;
++ rv.hasOffer = true;
++ rv.offer.kind = 1;
++ rv.offer.count = 1;
++ rv.offer.size = f->size;
++ rv.offer.name.assign(encoded.c_str());
++ bytes_t payload;
++ if (!oft2::build_rendezvous(rv, payload)) {
++  f->listener.close();
++  debugLogA("OFT2 fallback: failed to encode direct offer");
++  return false;
++ }
++ char receiver[24];
++ _itoa(f->uin, receiver, 10);
++ bytes_t cookie((const char *)f->cookie.data(), 8);
++ uint32_t req;
++ { mir_cslock lk(m_csPending); req = m_nextMsgReq++; }
++ Send(OscarPackets::fileRendezvous(receiver, cookie, payload, req));
++ debugLogA("OFT2 fallback: direct file offer sent to %u, port=%u, local IP=%s (NAT may block it)",
++   (unsigned)f->uin, (unsigned)rv.port, ars::ip4(ip).c_str());
++ return true;
++}
++
+ void CKicqProto::ShutdownOutgoingFiles()
+ {
+  std::vector<std::shared_ptr<OutgoingFile>> files;
+@@ -1166,6 +1225,7 @@
+  // All sockets are owned by this worker; callbacks may only call shutdown().
+  if (f->viaProxy) {
+   bool success = false;
++  bool offerSent = false;
+   SOCKET sock = INVALID_SOCKET;
+   uint32_t ip = 0;
+   uint16_t port = 0;
+@@ -1202,6 +1262,7 @@
+       uint32_t req;
+       { mir_cslock lk(proto->m_csPending); req = proto->m_nextMsgReq++; }
+       proto->Send(OscarPackets::fileRendezvous(receiver, cookie, payload, req));
++      offerSent = true;
+       proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE, ACKRESULT_LISTENING, f.get());
+       proto->debugLogA("ARS DIAG3: OSCAR offer queued; now waiting for PROXY_READY. Check peer log for ARS DIAG3: incoming offer");
+       bool ready = ars::waitReady(sock);
+@@ -1263,9 +1324,21 @@
+    { mir_cslock lk(proto->m_csFiles); if (f->active == sock) f->active = INVALID_SOCKET; }
+    closesocket(sock);
+   }
+-  proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE,
+-    success ? ACKRESULT_SUCCESS : ACKRESULT_FAILED, f.get(), 0);
+-  return 0;
++  // Never send a competing direct offer once the ARS offer is visible to the peer.
++  // Such a duplicate can leave two pending dialogs and mismatched rendezvous state.
++  if (offerSent || success || InterlockedCompareExchange(&f->cancelled, 0, 0)) {
++   if (!success) proto->debugLogA("ARS sender: offer was sent but transfer failed; no duplicate direct offer");
++   proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE,
++     success ? ACKRESULT_SUCCESS : ACKRESULT_FAILED, f.get(), 0);
++   return 0;
++  }
++  // The relay never yielded an offer: fall back to direct TCP/OFT2.
++  proto->debugLogA("ARS sender: no relay offer sent; attempting direct OFT2 fallback");
++  f->viaProxy = false;
++  if (!proto->StartDirectFileFallback(f)) {
++   proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE, ACKRESULT_FAILED, f.get(), 0);
++   return 0;
++  }
+  }
+ 
+  SOCKET sock = f->listener.accept_one(120000, &f->cancelled);
+@@ -1304,6 +1377,8 @@
+   closesocket(sock);
+  }
+  f->listener.close();
++ if (!success)
++  proto->debugLogA("OFT2 sender: direct transport failed or recipient did not connect");
+  proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE,
+   success ? ACKRESULT_SUCCESS : ACKRESULT_FAILED, f.get(), 0);
+  return 0;
+@@ -1311,9 +1386,12 @@
+ 
+ HANDLE CKicqProto::SendFile(MCONTACT contact, const wchar_t *, wchar_t **files)
+ {
+- if (!m_bOnline || !contact || !files || !files[0] || files[1]) return nullptr;
++ if (!m_bOnline || !contact || !files || !files[0] || files[1]) {
++  debugLogA("OFT2 sender: rejected before transfer creation (offline, missing contact/file, or multiple files)");
++  return nullptr;
++ }
+  const uint32_t uin = getDword(contact, "UIN");
+- if (!uin) return nullptr;
++ if (!uin) { debugLogA("OFT2 sender: missing UIN on selected contact"); return nullptr; }
+  auto f = std::make_shared<OutgoingFile>();
+  f->contact = contact;
+  f->path = files[0];
+@@ -1367,7 +1445,11 @@
+  char recipient[20];
+  _itoa(uin, recipient, 10);
+  bytes_t cookie((char *)f->cookie.data(), 8);
+- if (!f->viaProxy) Send(OscarPackets::fileRendezvous(recipient, cookie, payload, m_nextMsgReq++));
++ if (!f->viaProxy) {
++  debugLogA("OFT2 sender: sending initial direct OSCAR file offer to %u", (unsigned)uin);
++  Send(OscarPackets::fileRendezvous(recipient, cookie, payload, m_nextMsgReq++));
++ }
++ else debugLogA("ARS sender: starting relay allocation for %u (offer not yet sent)", (unsigned)uin);
+  return f.get();
+ }
+ 
+
+--- a/normal/0.96.7/KICQ/src/proto.h
++++ b/normal/0.96.7/KICQ/src/proto.h
+@@ -108,6 +108,7 @@
+ 	mir_cs m_csFiles;
+ 	std::map<HANDLE, std::shared_ptr<OutgoingFile>> m_outgoingFiles;
+ 	static DWORD WINAPI OutgoingFileThread(LPVOID parameter);
++	bool StartDirectFileFallback(const std::shared_ptr<OutgoingFile> &file);
+ 	struct OutgoingThreadArgs { CKicqProto *proto; std::shared_ptr<OutgoingFile> file; };
+ 	void ShutdownOutgoingFiles();
+ 	bool FileProgress(OutgoingFile *file, uint64_t done);
+
+--- a/normal/0.96.7/KICQ/src/ars_proxy.h
++++ b/normal/0.96.7/KICQ/src/ars_proxy.h
+@@ -45,8 +45,16 @@
+                          const std::string &cap, uint32_t &ip, uint16_t &port) {
+  std::string packet, body;
+  unsigned cmd = 0;
+- if (!encode(packet, uin, cookie, cap, false, 0) || !oft2::send_all(s, packet.data(), packet.size()) ||
+-     !recvMessage(s, cmd, body) || cmd != 3 || body.size() < 16) return false;
++ // ALLOCATE is a control exchange, not file data. On a silent/broken
++ // proxy fail promptly so the sender can issue a direct OFT2 offer.
++ DWORD allocateTimeout = 15000;
++ setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&allocateTimeout, sizeof(allocateTimeout));
++ const bool received = encode(packet, uin, cookie, cap, false, 0) &&
++   oft2::send_all(s, packet.data(), packet.size()) &&
++   recvMessage(s, cmd, body) && cmd == 3 && body.size() >= 16;
++ DWORD dataTimeout = kTimeoutMs;
++ setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&dataTimeout, sizeof(dataTimeout));
++ if (!received) return false;
+  const unsigned char *p = (const unsigned char *)body.data();
+  port = (uint16_t)r16(p + 10); ip = r32(p + 12);
+  return port != 0 && ip != 0;
+
+--- a/normal/0.96.8/KICQ/src/proto.cpp
++++ b/normal/0.96.8/KICQ/src/proto.cpp
+@@ -1107,6 +1107,65 @@
+  return true;
+ }
+ 
++// ARS may fail before an OSCAR offer is sent. In that case try a fresh
++// direct OFT2 offer using the SAME transfer handle and cookie. Never use this
++// after the relay offer has been sent, as the peer may still accept it.
++bool CKicqProto::StartDirectFileFallback(const std::shared_ptr<OutgoingFile> &f)
++{
++ if (!f || InterlockedCompareExchange(&f->cancelled, 0, 0) || !m_bOnline)
++  return false;
++ if (!f->listener.open()) {
++  debugLogA("OFT2 fallback: cannot open TCP listener");
++  return false;
++ }
++ const uint32_t ip = Oft2LocalIPv4();
++ const bytes_t cap = OscarText::unhex(CAP_FILE);
++ if (!ip || cap.size() != 16) {
++  debugLogA("OFT2 fallback: no route to OSCAR server or invalid file capability");
++  f->listener.close();
++  return false;
++ }
++ const int length = WideCharToMultiByte(CP_ACP, 0, f->filename.c_str(), -1, nullptr, 0, nullptr, nullptr);
++ if (length <= 1 || length > 61) {
++  debugLogA("OFT2 fallback: filename cannot be represented in the legacy transfer header");
++  f->listener.close();
++  return false;
++ }
++ std::string encoded(size_t(length), '\0');
++ if (!WideCharToMultiByte(CP_ACP, 0, f->filename.c_str(), -1, &encoded[0], length, nullptr, nullptr)) {
++  f->listener.close();
++  return false;
++ }
++ oft2::Rendezvous rv;
++ rv.type = 0;
++ rv.cookie = f->cookie;
++ memcpy(rv.capability.data(), cap.data(), 16);
++ rv.externalIp = ip;
++ rv.internalIp = ip;
++ rv.port = f->listener.port();
++ rv.requestNumber = 1;
++ rv.hasOffer = true;
++ rv.offer.kind = 1;
++ rv.offer.count = 1;
++ rv.offer.size = f->size;
++ rv.offer.name.assign(encoded.c_str());
++ bytes_t payload;
++ if (!oft2::build_rendezvous(rv, payload)) {
++  f->listener.close();
++  debugLogA("OFT2 fallback: failed to encode direct offer");
++  return false;
++ }
++ char receiver[24];
++ _itoa(f->uin, receiver, 10);
++ bytes_t cookie((const char *)f->cookie.data(), 8);
++ uint32_t req;
++ { mir_cslock lk(m_csPending); req = m_nextMsgReq++; }
++ Send(OscarPackets::fileRendezvous(receiver, cookie, payload, req));
++ debugLogA("OFT2 fallback: direct file offer sent to %u, port=%u, local IP=%s (NAT may block it)",
++   (unsigned)f->uin, (unsigned)rv.port, ars::ip4(ip).c_str());
++ return true;
++}
++
+ void CKicqProto::ShutdownOutgoingFiles()
+ {
+  std::vector<std::shared_ptr<OutgoingFile>> files;
+@@ -1164,6 +1223,7 @@
+  // All sockets are owned by this worker; callbacks may only call shutdown().
+  if (f->viaProxy) {
+   bool success = false;
++  bool offerSent = false;
+   SOCKET sock = INVALID_SOCKET;
+   uint32_t ip = 0;
+   uint16_t port = 0;
+@@ -1200,6 +1260,7 @@
+       uint32_t req;
+       { mir_cslock lk(proto->m_csPending); req = proto->m_nextMsgReq++; }
+       proto->Send(OscarPackets::fileRendezvous(receiver, cookie, payload, req));
++      offerSent = true;
+       proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE, ACKRESULT_LISTENING, f.get());
+       proto->debugLogA("ARS DIAG3: OSCAR offer queued; now waiting for PROXY_READY. Check peer log for ARS DIAG3: incoming offer");
+       bool ready = ars::waitReady(sock);
+@@ -1261,9 +1322,21 @@
+    { mir_cslock lk(proto->m_csFiles); if (f->active == sock) f->active = INVALID_SOCKET; }
+    closesocket(sock);
+   }
+-  proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE,
+-    success ? ACKRESULT_SUCCESS : ACKRESULT_FAILED, f.get(), 0);
+-  return 0;
++  // Never send a competing direct offer once the ARS offer is visible to the peer.
++  // Such a duplicate can leave two pending dialogs and mismatched rendezvous state.
++  if (offerSent || success || InterlockedCompareExchange(&f->cancelled, 0, 0)) {
++   if (!success) proto->debugLogA("ARS sender: offer was sent but transfer failed; no duplicate direct offer");
++   proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE,
++     success ? ACKRESULT_SUCCESS : ACKRESULT_FAILED, f.get(), 0);
++   return 0;
++  }
++  // The relay never yielded an offer: fall back to direct TCP/OFT2.
++  proto->debugLogA("ARS sender: no relay offer sent; attempting direct OFT2 fallback");
++  f->viaProxy = false;
++  if (!proto->StartDirectFileFallback(f)) {
++   proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE, ACKRESULT_FAILED, f.get(), 0);
++   return 0;
++  }
+  }
+ 
+  SOCKET sock = f->listener.accept_one(120000, &f->cancelled);
+@@ -1302,6 +1375,8 @@
+   closesocket(sock);
+  }
+  f->listener.close();
++ if (!success)
++  proto->debugLogA("OFT2 sender: direct transport failed or recipient did not connect");
+  proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE,
+   success ? ACKRESULT_SUCCESS : ACKRESULT_FAILED, f.get(), 0);
+  return 0;
+@@ -1309,9 +1384,12 @@
+ 
+ HANDLE CKicqProto::SendFile(MCONTACT contact, const wchar_t *, wchar_t **files)
+ {
+- if (!m_bOnline || !contact || !files || !files[0] || files[1]) return nullptr;
++ if (!m_bOnline || !contact || !files || !files[0] || files[1]) {
++  debugLogA("OFT2 sender: rejected before transfer creation (offline, missing contact/file, or multiple files)");
++  return nullptr;
++ }
+  const uint32_t uin = getDword(contact, "UIN");
+- if (!uin) return nullptr;
++ if (!uin) { debugLogA("OFT2 sender: missing UIN on selected contact"); return nullptr; }
+  auto f = std::make_shared<OutgoingFile>();
+  f->contact = contact;
+  f->path = files[0];
+@@ -1365,7 +1443,11 @@
+  char recipient[20];
+  _itoa(uin, recipient, 10);
+  bytes_t cookie((char *)f->cookie.data(), 8);
+- if (!f->viaProxy) Send(OscarPackets::fileRendezvous(recipient, cookie, payload, m_nextMsgReq++));
++ if (!f->viaProxy) {
++  debugLogA("OFT2 sender: sending initial direct OSCAR file offer to %u", (unsigned)uin);
++  Send(OscarPackets::fileRendezvous(recipient, cookie, payload, m_nextMsgReq++));
++ }
++ else debugLogA("ARS sender: starting relay allocation for %u (offer not yet sent)", (unsigned)uin);
+  return f.get();
+ }
+ 
+
+--- a/normal/0.96.8/KICQ/src/proto.h
++++ b/normal/0.96.8/KICQ/src/proto.h
+@@ -108,6 +108,7 @@
+ 	mir_cs m_csFiles;
+ 	std::map<HANDLE, std::shared_ptr<OutgoingFile>> m_outgoingFiles;
+ 	static DWORD WINAPI OutgoingFileThread(LPVOID parameter);
++	bool StartDirectFileFallback(const std::shared_ptr<OutgoingFile> &file);
+ 	struct OutgoingThreadArgs { CKicqProto *proto; std::shared_ptr<OutgoingFile> file; };
+ 	void ShutdownOutgoingFiles();
+ 	bool FileProgress(OutgoingFile *file, uint64_t done);
+
+--- a/normal/0.96.8/KICQ/src/ars_proxy.h
++++ b/normal/0.96.8/KICQ/src/ars_proxy.h
+@@ -45,8 +45,16 @@
+                          const std::string &cap, uint32_t &ip, uint16_t &port) {
+  std::string packet, body;
+  unsigned cmd = 0;
+- if (!encode(packet, uin, cookie, cap, false, 0) || !oft2::send_all(s, packet.data(), packet.size()) ||
+-     !recvMessage(s, cmd, body) || cmd != 3 || body.size() < 16) return false;
++ // ALLOCATE is a control exchange, not file data. On a silent/broken
++ // proxy fail promptly so the sender can issue a direct OFT2 offer.
++ DWORD allocateTimeout = 15000;
++ setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&allocateTimeout, sizeof(allocateTimeout));
++ const bool received = encode(packet, uin, cookie, cap, false, 0) &&
++   oft2::send_all(s, packet.data(), packet.size()) &&
++   recvMessage(s, cmd, body) && cmd == 3 && body.size() >= 16;
++ DWORD dataTimeout = kTimeoutMs;
++ setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&dataTimeout, sizeof(dataTimeout));
++ if (!received) return false;
+  const unsigned char *p = (const unsigned char *)body.data();
+  port = (uint16_t)r16(p + 10); ip = r32(p + 12);
+  return port != 0 && ip != 0;
+
+--- a/windows-xp-x86/0.96.7/KICQ/src/proto.cpp
++++ b/windows-xp-x86/0.96.7/KICQ/src/proto.cpp
+@@ -1116,6 +1116,65 @@
+  return true;
+ }
+ 
++// ARS may fail before an OSCAR offer is sent. In that case try a fresh
++// direct OFT2 offer using the SAME transfer handle and cookie. Never use this
++// after the relay offer has been sent, as the peer may still accept it.
++bool CKicqProto::StartDirectFileFallback(const std::shared_ptr<OutgoingFile> &f)
++{
++ if (!f || InterlockedCompareExchange(&f->cancelled, 0, 0) || !m_bOnline)
++  return false;
++ if (!f->listener.open()) {
++  debugLogA("OFT2 fallback: cannot open TCP listener");
++  return false;
++ }
++ const uint32_t ip = Oft2LocalIPv4();
++ const bytes_t cap = OscarText::unhex(CAP_FILE);
++ if (!ip || cap.size() != 16) {
++  debugLogA("OFT2 fallback: no route to OSCAR server or invalid file capability");
++  f->listener.close();
++  return false;
++ }
++ const int length = WideCharToMultiByte(CP_ACP, 0, f->filename.c_str(), -1, nullptr, 0, nullptr, nullptr);
++ if (length <= 1 || length > 61) {
++  debugLogA("OFT2 fallback: filename cannot be represented in the legacy transfer header");
++  f->listener.close();
++  return false;
++ }
++ std::string encoded(size_t(length), '\0');
++ if (!WideCharToMultiByte(CP_ACP, 0, f->filename.c_str(), -1, &encoded[0], length, nullptr, nullptr)) {
++  f->listener.close();
++  return false;
++ }
++ oft2::Rendezvous rv;
++ rv.type = 0;
++ rv.cookie = f->cookie;
++ memcpy(rv.capability.data(), cap.data(), 16);
++ rv.externalIp = ip;
++ rv.internalIp = ip;
++ rv.port = f->listener.port();
++ rv.requestNumber = 1;
++ rv.hasOffer = true;
++ rv.offer.kind = 1;
++ rv.offer.count = 1;
++ rv.offer.size = f->size;
++ rv.offer.name.assign(encoded.c_str());
++ bytes_t payload;
++ if (!oft2::build_rendezvous(rv, payload)) {
++  f->listener.close();
++  debugLogA("OFT2 fallback: failed to encode direct offer");
++  return false;
++ }
++ char receiver[24];
++ _itoa(f->uin, receiver, 10);
++ bytes_t cookie((const char *)f->cookie.data(), 8);
++ uint32_t req;
++ { mir_cslock lk(m_csPending); req = m_nextMsgReq++; }
++ Send(OscarPackets::fileRendezvous(receiver, cookie, payload, req));
++ debugLogA("OFT2 fallback: direct file offer sent to %u, port=%u, local IP=%s (NAT may block it)",
++   (unsigned)f->uin, (unsigned)rv.port, ars::ip4(ip).c_str());
++ return true;
++}
++
+ void CKicqProto::ShutdownOutgoingFiles()
+ {
+  std::vector<std::shared_ptr<OutgoingFile>> files;
+@@ -1173,6 +1232,7 @@
+  // All sockets are owned by this worker; callbacks may only call shutdown().
+  if (f->viaProxy) {
+   bool success = false;
++  bool offerSent = false;
+   SOCKET sock = INVALID_SOCKET;
+   uint32_t ip = 0;
+   uint16_t port = 0;
+@@ -1209,6 +1269,7 @@
+       uint32_t req;
+       { mir_cslock lk(proto->m_csPending); req = proto->m_nextMsgReq++; }
+       proto->Send(OscarPackets::fileRendezvous(receiver, cookie, payload, req));
++      offerSent = true;
+       proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE, ACKRESULT_LISTENING, f.get());
+       proto->debugLogA("ARS DIAG3: OSCAR offer queued; now waiting for PROXY_READY. Check peer log for ARS DIAG3: incoming offer");
+       bool ready = ars::waitReady(sock);
+@@ -1270,9 +1331,21 @@
+    { mir_cslock lk(proto->m_csFiles); if (f->active == sock) f->active = INVALID_SOCKET; }
+    closesocket(sock);
+   }
+-  proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE,
+-    success ? ACKRESULT_SUCCESS : ACKRESULT_FAILED, f.get(), 0);
+-  return 0;
++  // Never send a competing direct offer once the ARS offer is visible to the peer.
++  // Such a duplicate can leave two pending dialogs and mismatched rendezvous state.
++  if (offerSent || success || InterlockedCompareExchange(&f->cancelled, 0, 0)) {
++   if (!success) proto->debugLogA("ARS sender: offer was sent but transfer failed; no duplicate direct offer");
++   proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE,
++     success ? ACKRESULT_SUCCESS : ACKRESULT_FAILED, f.get(), 0);
++   return 0;
++  }
++  // The relay never yielded an offer: fall back to direct TCP/OFT2.
++  proto->debugLogA("ARS sender: no relay offer sent; attempting direct OFT2 fallback");
++  f->viaProxy = false;
++  if (!proto->StartDirectFileFallback(f)) {
++   proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE, ACKRESULT_FAILED, f.get(), 0);
++   return 0;
++  }
+  }
+ 
+  SOCKET sock = f->listener.accept_one(120000, &f->cancelled);
+@@ -1311,6 +1384,8 @@
+   closesocket(sock);
+  }
+  f->listener.close();
++ if (!success)
++  proto->debugLogA("OFT2 sender: direct transport failed or recipient did not connect");
+  proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE,
+   success ? ACKRESULT_SUCCESS : ACKRESULT_FAILED, f.get(), 0);
+  return 0;
+@@ -1318,9 +1393,12 @@
+ 
+ HANDLE CKicqProto::SendFile(MCONTACT contact, const wchar_t *, wchar_t **files)
+ {
+- if (!m_bOnline || !contact || !files || !files[0] || files[1]) return nullptr;
++ if (!m_bOnline || !contact || !files || !files[0] || files[1]) {
++  debugLogA("OFT2 sender: rejected before transfer creation (offline, missing contact/file, or multiple files)");
++  return nullptr;
++ }
+  const uint32_t uin = getDword(contact, "UIN");
+- if (!uin) return nullptr;
++ if (!uin) { debugLogA("OFT2 sender: missing UIN on selected contact"); return nullptr; }
+  auto f = std::make_shared<OutgoingFile>();
+  f->contact = contact;
+  f->path = files[0];
+@@ -1374,7 +1452,11 @@
+  char recipient[20];
+  _itoa(uin, recipient, 10);
+  bytes_t cookie((char *)f->cookie.data(), 8);
+- if (!f->viaProxy) Send(OscarPackets::fileRendezvous(recipient, cookie, payload, m_nextMsgReq++));
++ if (!f->viaProxy) {
++  debugLogA("OFT2 sender: sending initial direct OSCAR file offer to %u", (unsigned)uin);
++  Send(OscarPackets::fileRendezvous(recipient, cookie, payload, m_nextMsgReq++));
++ }
++ else debugLogA("ARS sender: starting relay allocation for %u (offer not yet sent)", (unsigned)uin);
+  return f.get();
+ }
+ 
+
+--- a/windows-xp-x86/0.96.7/KICQ/src/proto.h
++++ b/windows-xp-x86/0.96.7/KICQ/src/proto.h
+@@ -108,6 +108,7 @@
+ 	mir_cs m_csFiles;
+ 	std::map<HANDLE, std::shared_ptr<OutgoingFile>> m_outgoingFiles;
+ 	static DWORD WINAPI OutgoingFileThread(LPVOID parameter);
++	bool StartDirectFileFallback(const std::shared_ptr<OutgoingFile> &file);
+ 	struct OutgoingThreadArgs { CKicqProto *proto; std::shared_ptr<OutgoingFile> file; };
+ 	void ShutdownOutgoingFiles();
+ 	bool FileProgress(OutgoingFile *file, uint64_t done);
+
+--- a/windows-xp-x86/0.96.7/KICQ/src/ars_proxy.h
++++ b/windows-xp-x86/0.96.7/KICQ/src/ars_proxy.h
+@@ -45,8 +45,16 @@
+                          const std::string &cap, uint32_t &ip, uint16_t &port) {
+  std::string packet, body;
+  unsigned cmd = 0;
+- if (!encode(packet, uin, cookie, cap, false, 0) || !oft2::send_all(s, packet.data(), packet.size()) ||
+-     !recvMessage(s, cmd, body) || cmd != 3 || body.size() < 16) return false;
++ // ALLOCATE is a control exchange, not file data. On a silent/broken
++ // proxy fail promptly so the sender can issue a direct OFT2 offer.
++ DWORD allocateTimeout = 15000;
++ setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&allocateTimeout, sizeof(allocateTimeout));
++ const bool received = encode(packet, uin, cookie, cap, false, 0) &&
++   oft2::send_all(s, packet.data(), packet.size()) &&
++   recvMessage(s, cmd, body) && cmd == 3 && body.size() >= 16;
++ DWORD dataTimeout = kTimeoutMs;
++ setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&dataTimeout, sizeof(dataTimeout));
++ if (!received) return false;
+  const unsigned char *p = (const unsigned char *)body.data();
+  port = (uint16_t)r16(p + 10); ip = r32(p + 12);
+  return port != 0 && ip != 0;
+
+--- a/windows-xp-x86/0.96.8/KICQ/src/proto.cpp
++++ b/windows-xp-x86/0.96.8/KICQ/src/proto.cpp
+@@ -1111,6 +1111,65 @@
+  return true;
+ }
+ 
++// ARS may fail before an OSCAR offer is sent. In that case try a fresh
++// direct OFT2 offer using the SAME transfer handle and cookie. Never use this
++// after the relay offer has been sent, as the peer may still accept it.
++bool CKicqProto::StartDirectFileFallback(const std::shared_ptr<OutgoingFile> &f)
++{
++ if (!f || InterlockedCompareExchange(&f->cancelled, 0, 0) || !m_bOnline)
++  return false;
++ if (!f->listener.open()) {
++  debugLogA("OFT2 fallback: cannot open TCP listener");
++  return false;
++ }
++ const uint32_t ip = Oft2LocalIPv4();
++ const bytes_t cap = OscarText::unhex(CAP_FILE);
++ if (!ip || cap.size() != 16) {
++  debugLogA("OFT2 fallback: no route to OSCAR server or invalid file capability");
++  f->listener.close();
++  return false;
++ }
++ const int length = WideCharToMultiByte(CP_ACP, 0, f->filename.c_str(), -1, nullptr, 0, nullptr, nullptr);
++ if (length <= 1 || length > 61) {
++  debugLogA("OFT2 fallback: filename cannot be represented in the legacy transfer header");
++  f->listener.close();
++  return false;
++ }
++ std::string encoded(size_t(length), '\0');
++ if (!WideCharToMultiByte(CP_ACP, 0, f->filename.c_str(), -1, &encoded[0], length, nullptr, nullptr)) {
++  f->listener.close();
++  return false;
++ }
++ oft2::Rendezvous rv;
++ rv.type = 0;
++ rv.cookie = f->cookie;
++ memcpy(rv.capability.data(), cap.data(), 16);
++ rv.externalIp = ip;
++ rv.internalIp = ip;
++ rv.port = f->listener.port();
++ rv.requestNumber = 1;
++ rv.hasOffer = true;
++ rv.offer.kind = 1;
++ rv.offer.count = 1;
++ rv.offer.size = f->size;
++ rv.offer.name.assign(encoded.c_str());
++ bytes_t payload;
++ if (!oft2::build_rendezvous(rv, payload)) {
++  f->listener.close();
++  debugLogA("OFT2 fallback: failed to encode direct offer");
++  return false;
++ }
++ char receiver[24];
++ _itoa(f->uin, receiver, 10);
++ bytes_t cookie((const char *)f->cookie.data(), 8);
++ uint32_t req;
++ { mir_cslock lk(m_csPending); req = m_nextMsgReq++; }
++ Send(OscarPackets::fileRendezvous(receiver, cookie, payload, req));
++ debugLogA("OFT2 fallback: direct file offer sent to %u, port=%u, local IP=%s (NAT may block it)",
++   (unsigned)f->uin, (unsigned)rv.port, ars::ip4(ip).c_str());
++ return true;
++}
++
+ void CKicqProto::ShutdownOutgoingFiles()
+ {
+  std::vector<std::shared_ptr<OutgoingFile>> files;
+@@ -1168,6 +1227,7 @@
+  // All sockets are owned by this worker; callbacks may only call shutdown().
+  if (f->viaProxy) {
+   bool success = false;
++  bool offerSent = false;
+   SOCKET sock = INVALID_SOCKET;
+   uint32_t ip = 0;
+   uint16_t port = 0;
+@@ -1204,6 +1264,7 @@
+       uint32_t req;
+       { mir_cslock lk(proto->m_csPending); req = proto->m_nextMsgReq++; }
+       proto->Send(OscarPackets::fileRendezvous(receiver, cookie, payload, req));
++      offerSent = true;
+       proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE, ACKRESULT_LISTENING, f.get());
+       proto->debugLogA("ARS DIAG3: OSCAR offer queued; now waiting for PROXY_READY. Check peer log for ARS DIAG3: incoming offer");
+       bool ready = ars::waitReady(sock);
+@@ -1265,9 +1326,21 @@
+    { mir_cslock lk(proto->m_csFiles); if (f->active == sock) f->active = INVALID_SOCKET; }
+    closesocket(sock);
+   }
+-  proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE,
+-    success ? ACKRESULT_SUCCESS : ACKRESULT_FAILED, f.get(), 0);
+-  return 0;
++  // Never send a competing direct offer once the ARS offer is visible to the peer.
++  // Such a duplicate can leave two pending dialogs and mismatched rendezvous state.
++  if (offerSent || success || InterlockedCompareExchange(&f->cancelled, 0, 0)) {
++   if (!success) proto->debugLogA("ARS sender: offer was sent but transfer failed; no duplicate direct offer");
++   proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE,
++     success ? ACKRESULT_SUCCESS : ACKRESULT_FAILED, f.get(), 0);
++   return 0;
++  }
++  // The relay never yielded an offer: fall back to direct TCP/OFT2.
++  proto->debugLogA("ARS sender: no relay offer sent; attempting direct OFT2 fallback");
++  f->viaProxy = false;
++  if (!proto->StartDirectFileFallback(f)) {
++   proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE, ACKRESULT_FAILED, f.get(), 0);
++   return 0;
++  }
+  }
+ 
+  SOCKET sock = f->listener.accept_one(120000, &f->cancelled);
+@@ -1306,6 +1379,8 @@
+   closesocket(sock);
+  }
+  f->listener.close();
++ if (!success)
++  proto->debugLogA("OFT2 sender: direct transport failed or recipient did not connect");
+  proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE,
+   success ? ACKRESULT_SUCCESS : ACKRESULT_FAILED, f.get(), 0);
+  return 0;
+@@ -1313,9 +1388,12 @@
+ 
+ HANDLE CKicqProto::SendFile(MCONTACT contact, const wchar_t *, wchar_t **files)
+ {
+- if (!m_bOnline || !contact || !files || !files[0] || files[1]) return nullptr;
++ if (!m_bOnline || !contact || !files || !files[0] || files[1]) {
++  debugLogA("OFT2 sender: rejected before transfer creation (offline, missing contact/file, or multiple files)");
++  return nullptr;
++ }
+  const uint32_t uin = getDword(contact, "UIN");
+- if (!uin) return nullptr;
++ if (!uin) { debugLogA("OFT2 sender: missing UIN on selected contact"); return nullptr; }
+  auto f = std::make_shared<OutgoingFile>();
+  f->contact = contact;
+  f->path = files[0];
+@@ -1369,7 +1447,11 @@
+  char recipient[20];
+  _itoa(uin, recipient, 10);
+  bytes_t cookie((char *)f->cookie.data(), 8);
+- if (!f->viaProxy) Send(OscarPackets::fileRendezvous(recipient, cookie, payload, m_nextMsgReq++));
++ if (!f->viaProxy) {
++  debugLogA("OFT2 sender: sending initial direct OSCAR file offer to %u", (unsigned)uin);
++  Send(OscarPackets::fileRendezvous(recipient, cookie, payload, m_nextMsgReq++));
++ }
++ else debugLogA("ARS sender: starting relay allocation for %u (offer not yet sent)", (unsigned)uin);
+  return f.get();
+ }
+ 
+
+--- a/windows-xp-x86/0.96.8/KICQ/src/proto.h
++++ b/windows-xp-x86/0.96.8/KICQ/src/proto.h
+@@ -108,6 +108,7 @@
+ 	mir_cs m_csFiles;
+ 	std::map<HANDLE, std::shared_ptr<OutgoingFile>> m_outgoingFiles;
+ 	static DWORD WINAPI OutgoingFileThread(LPVOID parameter);
++	bool StartDirectFileFallback(const std::shared_ptr<OutgoingFile> &file);
+ 	struct OutgoingThreadArgs { CKicqProto *proto; std::shared_ptr<OutgoingFile> file; };
+ 	void ShutdownOutgoingFiles();
+ 	bool FileProgress(OutgoingFile *file, uint64_t done);
+
+--- a/windows-xp-x86/0.96.8/KICQ/src/ars_proxy.h
++++ b/windows-xp-x86/0.96.8/KICQ/src/ars_proxy.h
+@@ -45,8 +45,16 @@
+                          const std::string &cap, uint32_t &ip, uint16_t &port) {
+  std::string packet, body;
+  unsigned cmd = 0;
+- if (!encode(packet, uin, cookie, cap, false, 0) || !oft2::send_all(s, packet.data(), packet.size()) ||
+-     !recvMessage(s, cmd, body) || cmd != 3 || body.size() < 16) return false;
++ // ALLOCATE is a control exchange, not file data. On a silent/broken
++ // proxy fail promptly so the sender can issue a direct OFT2 offer.
++ DWORD allocateTimeout = 15000;
++ setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&allocateTimeout, sizeof(allocateTimeout));
++ const bool received = encode(packet, uin, cookie, cap, false, 0) &&
++   oft2::send_all(s, packet.data(), packet.size()) &&
++   recvMessage(s, cmd, body) && cmd == 3 && body.size() >= 16;
++ DWORD dataTimeout = kTimeoutMs;
++ setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&dataTimeout, sizeof(dataTimeout));
++ if (!received) return false;
+  const unsigned char *p = (const unsigned char *)body.data();
+  port = (uint16_t)r16(p + 10); ip = r32(p + 12);
+  return port != 0 && ip != 0;

@@ -1,0 +1,1862 @@
+--- a/normal/0.96.7/KICQ/src/bart_codec.h
++++ b/normal/0.96.7/KICQ/src/bart_codec.h
+@@ -7,6 +7,7 @@
+ #include <string>
+ #include <vector>
+ #include <limits>
++#include <utility>
+ 
+ namespace bart {
+ using Bytes = std::string;
+@@ -37,6 +38,47 @@
+  Bytes b; b.push_back(char(screenName.size())); b+=screenName; b.push_back('\x01');
+  if (!appendId(b,id)) return false;
+  payload.swap(b); return true;
++}
++// LOCATE 02/15: basic USERINFO plus capabilities, with a length-prefixed name.
++// No BART download can be constructed until a real asset ID is advertised.
++inline bool makeUserInfoQuery(const std::string &name, Bytes &payload) {
++ if (name.empty() || name.size()>255) return false;
++ Bytes b; put16(b,0); put16(b,4); b.push_back(char(name.size())); b+=name;
++ payload.swap(b); return true;
++}
++struct UserInfoBart {
++ std::string name;
++ std::vector<Bytes> metadata;
++ bool offline = false;
++};
++// USERINFO can be followed by unrelated LOCATE response TLVs. Only consume
++// the counted presence TLVs, and commit nothing if any counted TLV is truncated.
++inline bool parseUserInfoBart(const Bytes &b, UserInfoBart &out) {
++ size_t p=0; uint8_t n; uint16_t warning, count;
++ UserInfoBart r;
++ if (!get8(b,p,n) || !n || b.size()-p<n) return false;
++ r.name=b.substr(p,n); p+=n;
++ if (!get16(b,p,warning) || !get16(b,p,count)) return false;
++ bool zeroFlags=false, hasStatus=false, offlineStatus=false;
++ for (unsigned i=0;i<count;++i) {
++  uint16_t tag,len;
++  if (!get16(b,p,tag) || !get16(b,p,len) || b.size()-p<len) return false;
++  if (tag==0x001d) r.metadata.push_back(b.substr(p,len));
++  if (tag==1 && len==2) zeroFlags=(b[p]==0 && b[p+1]==0);
++  if (tag==6 && len==4) { hasStatus=true; offlineStatus=(uint8_t(b[p+2])==255 && uint8_t(b[p+3])==255); }
++  p+=len;
++ }
++ // Standard OSCAR offline BART notifications may arrive as 03/0B. Do not
++ // override an explicit ICQ online status on servers using zero user flags.
++ bool hasIcon=false;
++ for (const auto &raw:r.metadata) {
++  size_t at=0; AssetId id;
++  while (at<raw.size() && parseId(raw,at,id)) {
++   if (id.type==1 && !id.hash.empty()) { hasIcon=true; break; }
++  }
++ }
++ r.offline=offlineStatus || (zeroFlags && !hasStatus && hasIcon);
++ out=std::move(r); return true;
+ }
+ // BART__UPLOAD_QUERY (10/02): type + 16-bit length + image bytes.
+ inline bool makeUpload(uint16_t type, const Bytes &image, Bytes &payload) {
+--- a/normal/0.96.7/KICQ/src/oscar.cpp
++++ b/normal/0.96.7/KICQ/src/oscar.cpp
+@@ -354,7 +354,8 @@
+ OscarSnac reqBuddyRights()
+ {
+ 	OscarWriter w;
+-	w.u16(5).u16(2).u16(3);
++	// Preserve existing flags and opt in to BART metadata for offline buddies.
++	w.u16(5).u16(2).u16(3 | 0x0004);
+ 	return OscarSnac(3, 2, 2, w.data());
+ }
+ 
+--- a/normal/0.96.7/KICQ/src/proto.cpp
++++ b/normal/0.96.7/KICQ/src/proto.cpp
+@@ -640,6 +640,7 @@
+ 			}
+ 		}
+ 	}
++	if (m_bOnline) ScheduleBartRefresh(peer, true);
+ 	return hContact;
+ }
+ 
+@@ -2016,6 +2017,20 @@
+  return !raw.empty();
+ }
+ 
++// Use the same cache validation from proactive discovery and AVS requests.
++void CKicqProto::QueueCachedBartAvatar(MCONTACT contact)
++{
++ if (!contact) return;
++ auto announced = getMStringA(contact, "BartAdvertisedHash");
++ const auto cached = getMStringA(contact, "BartAvatarHash");
++ const auto file = getMStringW(contact, "BartAvatarPath");
++ if (announced.IsEmpty()) announced = cached; // older XP profiles saved only the verified hash
++ if (announced == cached && KicqAvatarFileReady(file.c_str())) return;
++ bytes_t raw;
++ if (KicqAvatarDecodeHash(announced.c_str(), raw))
++  QueueBartAvatar(ContactId(contact), db_get_w(contact, m_szModuleName, "BartAdvertisedType", 1), raw);
++}
++
+ // Avatar Services (Miranda NG 0.96.x). Uses existing BART wire/session.
+ // Called by Miranda Avatar Service to obtain an actual cached contact image.
+ // An advertised hash alone is never reported as a successfully downloaded image.
+@@ -2044,15 +2059,13 @@
+  // If the cache file has gone missing (cleanup, profile move, etc.),
+  // fetch the last advertised image instead of waiting for another presence.
+  if (!m_bOnline) return GAIR_NOAVATAR;
+- const uint32_t uin = getDword(info->hContact, "UIN", 0);
+- const auto announced = getMStringA(info->hContact, "BartAdvertisedHash");
+- bytes_t announcedRaw;
+- if (uin && KicqAvatarDecodeHash(announced.c_str(), announcedRaw))
+-  QueueBartAvatar(uin, db_get_w(info->hContact, m_szModuleName, "BartAdvertisedType", 1), announcedRaw);
++ const auto peer = ContactId(info->hContact);
++ QueueCachedBartAvatar(info->hContact);
++ // Unknown hash: schedule discovery once per session, not on every AVS call.
++ ScheduleBartRefresh(peer);
+  mir_cslock lock(m_csBart);
+  for (const auto &pending : m_bartPending)
+-  if (FindContact((uint32_t)strtoul(pending.screenName.c_str(), nullptr, 10)) == info->hContact)
+-   return GAIR_WAITFOR;
++  if (pending.screenName == peer) return GAIR_WAITFOR;
+  return GAIR_NOAVATAR;
+ }
+ 
+--- a/normal/0.96.7/KICQ/src/proto.h
++++ b/normal/0.96.7/KICQ/src/proto.h
+@@ -175,13 +175,21 @@
+ 	void HandleOwnIconSsiAck(int result, uint32_t reqId);
+ 	void HandleBartUploadReply(const bytes_t &payload);
+ 
+-	void QueueBartAvatar(uint32_t uin, uint16_t type, const bytes_t &hash);
++	void QueueBartAvatar(const std::string &name, uint16_t type, const bytes_t &hash);
++	void QueueBartAvatar(uint32_t uin, uint16_t type, const bytes_t &hash) { if (uin) QueueBartAvatar(std::to_string(uin), type, hash); }
++	// Session-local discovery queue; protected by m_csBart, drained by BOS thread.
++	std::set<std::string> m_bartRefreshPending, m_bartRefreshUrgent, m_bartRefreshDone;
++	time_t m_lastBartRefresh = 0;
++	mir_cs m_csBartLifecycle;
++	void ScheduleBartRefresh(const std::string &name, bool force = false);
++	void PumpBartRefresh(time_t now);
++	void QueueCachedBartAvatar(MCONTACT contact);
+ 	void FlushBartRequests(HNETLIBCONN conn, uint16_t &seq);
+ 	INT_PTR MIR_CDECL OnAvatarCaps(WPARAM, LPARAM);
+ 	INT_PTR MIR_CDECL OnGetAvatarInfo(WPARAM, LPARAM);
+ 	INT_PTR MIR_CDECL OnGetMyAvatar(WPARAM, LPARAM);
+ 	INT_PTR MIR_CDECL OnSetMyAvatar(WPARAM, LPARAM);
+-	void ObserveBartPresence(uint32_t uin, const bytes_t &raw);
++	void ObserveBartPresence(const std::string &name, const bytes_t &raw);
+ 	void HandleBartUserInfoUpdate(const bytes_t &body); // 01/0F, 02/06: avatar hash updates
+ 
+ 
+--- a/normal/0.96.7/KICQ/src/server.cpp
++++ b/normal/0.96.7/KICQ/src/server.cpp
+@@ -94,7 +94,17 @@
+ {
+ 	m_iLoginError = 0;
+ 	m_cookie.clear();
++	StopBart(); // previous BOS session may have left an exited BART worker
+ 	m_szUin = AccountId().c_str();
++	{
++		mir_cslock lock(m_csBart);
++		m_bartPending.clear();
++		m_bartOutgoing.clear();
++		m_bartRefreshPending.clear();
++		m_bartRefreshUrgent.clear();
++		m_bartRefreshDone.clear();
++		m_lastBartRefresh = 0;
++	}
+ 	{
+ 		mir_cslock lck(m_csRoster);
+ 		m_arUsers.destroy();
+@@ -274,6 +284,7 @@
+ void CKicqProto::CheckTimeouts()
+ {
+ 	time_t now = time(0);
++	if (m_bOnline) PumpBartRefresh(now);
+ 
+ 	if (m_bOnline && now - m_lastProbe >= KEEPALIVE_INTERVAL) {
+ 		// OSCAR transport keepalive is FLAP channel 5 (empty payload).
+@@ -519,6 +530,7 @@
+  }
+  m_bartCookie = cookie->data;
+  debugLogA("BART: server redirect to %s:%d received", m_bartHost.c_str(), m_bartPort);
++ mir_cslock lifecycle(m_csBartLifecycle);
+  if (!m_hBartThread && !m_bTerminated) {
+   InterlockedExchange(&m_bartStop, 0);
+   m_hBartThread = CreateThread(nullptr, 0, BartThreadEntry, this, 0, nullptr);
+@@ -580,6 +592,15 @@
+ 	else
+ 		setByte(hContact, "Auth", 1);
+ 
++	if (!bFromLogin && m_bOnline) {
++		// Server-pushed additions must also discover the avatar. A newly
++		// created local contact has not yet been subscribed on this session.
++		if (bNew) {
++			OscarWriter buddy; buddy.ascii8(name.c_str());
++			Send(OscarSnac(3, 4, 0, buddy.data()));
++		}
++		ScheduleBartRefresh(name);
++	}
+ 	if (bTemporary)
+ 		return;
+ 
+@@ -714,6 +735,9 @@
+ 	if(getDword("UIN")) Send(OscarPackets::offlineMsgsRequest(atoi(m_szUin), m_seq));
+ 
+ 	m_bOnline = true;
++	// Include local contacts too, not just the online subset of the SSI roster.
++	// Discovery is deliberately queued, after the BOS client-ready sequence.
++	for (auto &contact : AccContacts()) ScheduleBartRefresh(ContactId(contact));
+ 	if (getByte("XStatusId", 0)) SendXStatus();
+ 	m_bProbeAnswered = true;
+ 	m_lastProbe = time(0);
+@@ -808,7 +832,6 @@
+ 			}
+ 			setWString(m_pendAdd.hContact, "SrvNick", m_pendAdd.name);
+  if(result==0)delSetting(m_pendAdd.hContact,"Auth");
+- if(!oscarid::uin(m_pendAdd.id)){OscarWriter buddy;buddy.ascii8(szUin);Send(OscarSnac(3,4,0,buddy.data()));}
+ 
+ 			if (result == 0x0E) {
+ 				// the contact requires authorization: add it flagged, then ask
+@@ -819,6 +842,10 @@
+ 				Send(OscarPackets::futureAuthGrant(szUin));
+ 				Send(OscarPackets::authRequest(szUin, TranslateT("Please authorize me")));
+ 			}
++			// Both numeric UIN and AIM SN need an explicit presence subscription.
++			OscarWriter buddy; buddy.ascii8(szUin);
++			Send(OscarSnac(3, 4, 0, buddy.data()));
++			ScheduleBartRefresh(m_pendAdd.id, true);
+ 			m_pendAdd.id.clear();
+ 		}
+ 		else {
+@@ -990,10 +1017,16 @@
+ 	r.skip(2); // warning level
+ 	r.skip(2); // TLV count
+ 	OscarTlvList tlvs(r);
++ // Process offline BART metadata without marking the buddy online or
++ // modifying its fingerprint/X-status. AIM names use the same discovery path.
++ bart::UserInfoBart avatarInfo;
++ if (bart::parseUserInfoBart(data, avatarInfo)) {
++  if (avatarInfo.offline) { HandleUserOffline(data); return; }
++  for (const auto &raw : avatarInfo.metadata) ObserveBartPresence(name, raw);
++ }
+  if(!uin){MCONTACT c=0;{mir_cslock lock(m_csRoster);if(auto *u=FindUser(name)){u->bOnline=true;c=u->hContact;}}
+   if(c){const auto *flags=tlvs.find(1);setWord(c,"Status",flags && (flags->u16()&0x20)?ID_STATUS_AWAY:ID_STATUS_ONLINE);}return;}
+ 
+-	if (const auto *bartId = tlvs.find(0x1D)) if(uin) ObserveBartPresence(uin, bartId->data);
+ 
+     // Only trace changes for the target Jimm Multi UIN. A presence refresh can
+     // repeat hundreds of times; logging each repeat hid the relevant packets.
+@@ -1313,6 +1346,9 @@
+ 
+ void CKicqProto::HandleUserOffline(const bytes_t &data)
+ {
++ // Some servers attach full USERINFO to an offline notification; a bare
++ // screen name remains valid and does not erase the cached avatar.
++ HandleBartUserInfoUpdate(data);
+ 	OscarReader r(data);
+ 	const auto name = oscarid::key(r.ascii8());
+  if(name.empty()) return;
+@@ -2130,66 +2166,79 @@
+ // 02/06 may also include TLV 0x001D.  Do not alter status/X-status here.
+ void CKicqProto::HandleBartUserInfoUpdate(const bytes_t &body)
+ {
+- // userinfo = byte SN length + SN + word warning + word TLV count + TLVs
+- if (body.size() < 5) return;
+- const size_t nameLen = uint8_t(body[0]);
+- const size_t head = 1 + nameLen;
+- if (!nameLen || head + 4 > body.size()) return;
+- const bytes_t name = body.substr(1, nameLen);
+- if (name.find_first_not_of("0123456789") != bytes_t::npos) return;
+- const unsigned long parsed = strtoul(name.c_str(), nullptr, 10);
+- if (!parsed || parsed > 0xffffffffUL || std::to_string(parsed) != name) return;
+- size_t pos = head + 2; // warning level
+- const uint16_t count = (uint16_t(uint8_t(body[pos])) << 8) | uint8_t(body[pos + 1]);
+- pos += 2;
+- // Strict TLV framing: ignore truncated packets instead of interpreting
+- // arbitrary trailing bytes as an avatar ID.
+- for (unsigned i = 0; i < count; ++i) {
+-  if (body.size() - pos < 4) return;
+-  const unsigned type = (unsigned(uint8_t(body[pos])) << 8) | uint8_t(body[pos + 1]);
+-  const size_t length = (size_t(uint8_t(body[pos + 2])) << 8) | uint8_t(body[pos + 3]);
+-  pos += 4;
+-  if (body.size() - pos < length) return;
+-  if (type == 0x001D) {
+-   debugLogA("BART LIVE BETA2: userinfo avatar metadata for %lu (%u bytes)", parsed, (unsigned)length);
+-   ObserveBartPresence(uint32_t(parsed), body.substr(pos, length));
++ bart::UserInfoBart info;
++ if (!bart::parseUserInfoBart(body, info)) return;
++ const auto name = oscarid::key(info.name);
++ if (name.empty()) return;
++ for (const auto &raw : info.metadata) ObserveBartPresence(name, raw);
++}
++
++void CKicqProto::ScheduleBartRefresh(const std::string &name, bool force)
++{
++ if (name.empty() || name == AccountId() || !m_bOnline) return;
++ mir_cslock lock(m_csBart);
++ if (force) {
++  m_bartRefreshDone.erase(name);
++  m_bartRefreshPending.erase(name);
++  m_bartRefreshUrgent.insert(name);
++ } else if (!m_bartRefreshDone.count(name) && !m_bartRefreshUrgent.count(name))
++  m_bartRefreshPending.insert(name);
++}
++
++void CKicqProto::PumpBartRefresh(time_t now)
++{
++ std::vector<std::string> batch;
++ {
++  mir_cslock lock(m_csBart);
++  if (m_lastBartRefresh == now) return;
++  m_lastBartRefresh = now;
++  // Maximum four LOCATE requests per second, regardless of packet/UI activity.
++  while ((!m_bartRefreshUrgent.empty() || !m_bartRefreshPending.empty()) && batch.size() < 4) {
++   auto &queue = m_bartRefreshUrgent.empty() ? m_bartRefreshPending : m_bartRefreshUrgent;
++   auto it = queue.begin();
++   batch.push_back(*it);
++   m_bartRefreshDone.insert(*it);
++   queue.erase(it);
+   }
+-  pos += length;
++ }
++ for (const auto &name : batch) {
++  MCONTACT contact = FindContact(name);
++  if (!contact) continue;
++  // Recover an already advertised hash even if the server does not answer LOCATE.
++  QueueCachedBartAvatar(contact);
++  bytes_t query;
++  if (bart::makeUserInfoQuery(name, query)) {
++   Send(OscarSnac(2, 0x15, 0, query));
++   debugLogA("BART: requested avatar metadata for %s (LOCATE 02/15)", name.c_str());
++  }
+  }
+ }
+ 
+ // Requests stay queued until the BART connection can send them.
+-void CKicqProto::ObserveBartPresence(uint32_t uin, const bytes_t &raw)
+-{
+- if (!uin || raw.empty()) return;
+- MCONTACT contact = FindContact(uin);
++void CKicqProto::ObserveBartPresence(const std::string &name, const bytes_t &raw)
++{
++ if (name.empty() || raw.empty()) return;
++ MCONTACT contact = FindContact(name);
+  if (!contact) return;
+  size_t offset = 0;
+  while (offset < raw.size()) {
+   bart::AssetId id;
+   if (!bart::parseId(raw, offset, id)) {
+-   debugLogA("BART: invalid avatar metadata for %u", uin);
++   debugLogA("BART: invalid avatar metadata for %s", name.c_str());
+    return;
+   }
+   if (id.type != 1 || id.hash.empty() || id.hash.size() > 64) continue;
+   const std::string hash = bart::hexHash(id.hash);
++  db_set_w(contact, m_szModuleName, "BartAdvertisedType", id.type);
+   db_set_s(contact, m_szModuleName, "BartAdvertisedHash", hash.c_str());
+-  db_set_w(contact, m_szModuleName, "BartAdvertisedType", id.type);
+-  // The hash in the database denotes a *downloaded* image, not merely an
+-  // advertised one. Failed requests must be eligible for another attempt.
+-  const auto stored = getMStringA(contact, "BartAvatarHash");
+-  const auto path = getMStringW(contact, "BartAvatarPath");
+-  if (stored == hash.c_str() && !path.IsEmpty() &&
+-      GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) continue;
+-  debugLogA("BART: contact %u advertises avatar type=%u hash=%s", uin, (unsigned)id.type, hash.c_str());
+-  QueueBartAvatar(uin, id.type, id.hash);
+- }
+-}
+-
+-void CKicqProto::QueueBartAvatar(uint32_t uin, uint16_t type, const bytes_t &hash)
+-{
+- if (!uin || hash.empty() || hash.size() > 64) return;
+- const std::string name = std::to_string(uin);
++  // A real cache file is required even when the stored hash matches.
++  QueueCachedBartAvatar(contact);
++ }
++}
++
++void CKicqProto::QueueBartAvatar(const std::string &name, uint16_t type, const bytes_t &hash)
++{
++ if (name.empty() || hash.empty() || hash.size() > 64) return;
+  bart::AssetId id; id.type = type; id.hash = hash;
+  bytes_t payload;
+  if (!bart::makeDownload(name, id, payload)) return;
+@@ -2201,7 +2250,7 @@
+   if (item.screenName == name && item.hash == hash && item.type == type) return;
+  m_bartPending.push_back({name, hash, type});
+  m_bartOutgoing.push_back(wire);
+- debugLogA("BART: queued image request for %u (type %u)", uin, (unsigned)type);
++ debugLogA("BART: queued image request for %s (type %u)", name.c_str(), (unsigned)type);
+ }
+ 
+ void CKicqProto::FlushBartRequests(HNETLIBCONN conn, uint16_t &seq)
+@@ -2334,7 +2383,7 @@
+  {
+   mir_cslock lock(m_csBart);
+   for (auto it = m_bartPending.begin(); it != m_bartPending.end(); ++it) {
+-   if (it->screenName == reply.screenName && it->hash == reply.id.hash && it->type == reply.id.type) {
++   if (it->screenName == oscarid::key(reply.screenName) && it->hash == reply.id.hash && it->type == reply.id.type) {
+     matched = true;
+     if (!imageOk && it->attempts < 2) {
+      ++it->attempts;
+@@ -2390,14 +2439,14 @@
+   return;
+  }
+  // Store per-contact cache location. The Avatar API must subsequently use this file.
+- const unsigned long uin = strtoul(reply.screenName.c_str(), nullptr, 10);
+- if (uin && std::to_string(uin) == reply.screenName) {
+-  MCONTACT contact = FindContact((uint32_t)uin);
++ const auto peer = oscarid::key(reply.screenName);
++ if (!peer.empty()) {
++  MCONTACT contact = FindContact(peer);
+   if (contact) {
+    // Ignore an older reply if presence already announced a different avatar.
+    const auto current = getMStringA(contact, "BartAdvertisedHash");
+    if (!current.IsEmpty() && current != name.c_str()) {
+-    debugLogA("BART: discarded obsolete avatar for %lu", uin);
++    debugLogA("BART: discarded obsolete avatar for %s", peer.c_str());
+     return;
+    }
+    db_set_ws(contact, m_szModuleName, "BartAvatarPath", path.c_str());
+@@ -2413,7 +2462,7 @@
+    // Synchronous ACK: Miranda AVS consumes the pointer during this call.
+    // A nullptr on SUCCESS means 'no avatar' and caused the empty UI.
+    ProtoBroadcastAck(contact, ACKTYPE_AVATAR, ACKRESULT_SUCCESS, (HANDLE)&info);
+-   debugLogA("BART: cached and announced contact %lu avatar", uin);
++   debugLogA("BART: cached and announced contact %s avatar", peer.c_str());
+   }
+  }
+ }
+@@ -2527,6 +2576,7 @@
+ 
+ void CKicqProto::StopBart()
+ {
++ mir_cslock lifecycle(m_csBartLifecycle);
+  InterlockedExchange(&m_bartStop, 1);
+  {
+   mir_cslock lock(m_csBart);
+--- a/normal/0.96.8/KICQ/src/bart_codec.h
++++ b/normal/0.96.8/KICQ/src/bart_codec.h
+@@ -7,6 +7,7 @@
+ #include <string>
+ #include <vector>
+ #include <limits>
++#include <utility>
+ 
+ namespace bart {
+ using Bytes = std::string;
+@@ -37,6 +38,47 @@
+  Bytes b; b.push_back(char(screenName.size())); b+=screenName; b.push_back('\x01');
+  if (!appendId(b,id)) return false;
+  payload.swap(b); return true;
++}
++// LOCATE 02/15: basic USERINFO plus capabilities, with a length-prefixed name.
++// No BART download can be constructed until a real asset ID is advertised.
++inline bool makeUserInfoQuery(const std::string &name, Bytes &payload) {
++ if (name.empty() || name.size()>255) return false;
++ Bytes b; put16(b,0); put16(b,4); b.push_back(char(name.size())); b+=name;
++ payload.swap(b); return true;
++}
++struct UserInfoBart {
++ std::string name;
++ std::vector<Bytes> metadata;
++ bool offline = false;
++};
++// USERINFO can be followed by unrelated LOCATE response TLVs. Only consume
++// the counted presence TLVs, and commit nothing if any counted TLV is truncated.
++inline bool parseUserInfoBart(const Bytes &b, UserInfoBart &out) {
++ size_t p=0; uint8_t n; uint16_t warning, count;
++ UserInfoBart r;
++ if (!get8(b,p,n) || !n || b.size()-p<n) return false;
++ r.name=b.substr(p,n); p+=n;
++ if (!get16(b,p,warning) || !get16(b,p,count)) return false;
++ bool zeroFlags=false, hasStatus=false, offlineStatus=false;
++ for (unsigned i=0;i<count;++i) {
++  uint16_t tag,len;
++  if (!get16(b,p,tag) || !get16(b,p,len) || b.size()-p<len) return false;
++  if (tag==0x001d) r.metadata.push_back(b.substr(p,len));
++  if (tag==1 && len==2) zeroFlags=(b[p]==0 && b[p+1]==0);
++  if (tag==6 && len==4) { hasStatus=true; offlineStatus=(uint8_t(b[p+2])==255 && uint8_t(b[p+3])==255); }
++  p+=len;
++ }
++ // Standard OSCAR offline BART notifications may arrive as 03/0B. Do not
++ // override an explicit ICQ online status on servers using zero user flags.
++ bool hasIcon=false;
++ for (const auto &raw:r.metadata) {
++  size_t at=0; AssetId id;
++  while (at<raw.size() && parseId(raw,at,id)) {
++   if (id.type==1 && !id.hash.empty()) { hasIcon=true; break; }
++  }
++ }
++ r.offline=offlineStatus || (zeroFlags && !hasStatus && hasIcon);
++ out=std::move(r); return true;
+ }
+ // BART__UPLOAD_QUERY (10/02): type + 16-bit length + image bytes.
+ inline bool makeUpload(uint16_t type, const Bytes &image, Bytes &payload) {
+--- a/normal/0.96.8/KICQ/src/oscar.cpp
++++ b/normal/0.96.8/KICQ/src/oscar.cpp
+@@ -354,7 +354,8 @@
+ OscarSnac reqBuddyRights()
+ {
+ 	OscarWriter w;
+-	w.u16(5).u16(2).u16(3);
++	// Preserve existing flags and opt in to BART metadata for offline buddies.
++	w.u16(5).u16(2).u16(3 | 0x0004);
+ 	return OscarSnac(3, 2, 2, w.data());
+ }
+ 
+--- a/normal/0.96.8/KICQ/src/proto.cpp
++++ b/normal/0.96.8/KICQ/src/proto.cpp
+@@ -638,6 +638,7 @@
+ 			}
+ 		}
+ 	}
++	if (m_bOnline) ScheduleBartRefresh(peer, true);
+ 	return hContact;
+ }
+ 
+@@ -2014,6 +2015,20 @@
+  return !raw.empty();
+ }
+ 
++// Use the same cache validation from proactive discovery and AVS requests.
++void CKicqProto::QueueCachedBartAvatar(MCONTACT contact)
++{
++ if (!contact) return;
++ auto announced = getMStringA(contact, "BartAdvertisedHash");
++ const auto cached = getMStringA(contact, "BartAvatarHash");
++ const auto file = getMStringW(contact, "BartAvatarPath");
++ if (announced.IsEmpty()) announced = cached; // older XP profiles saved only the verified hash
++ if (announced == cached && KicqAvatarFileReady(file.c_str())) return;
++ bytes_t raw;
++ if (KicqAvatarDecodeHash(announced.c_str(), raw))
++  QueueBartAvatar(ContactId(contact), db_get_w(contact, m_szModuleName, "BartAdvertisedType", 1), raw);
++}
++
+ // Avatar Services (Miranda NG 0.96.x). Uses existing BART wire/session.
+ // Called by Miranda Avatar Service to obtain an actual cached contact image.
+ // An advertised hash alone is never reported as a successfully downloaded image.
+@@ -2042,15 +2057,13 @@
+  // If the cache file has gone missing (cleanup, profile move, etc.),
+  // fetch the last advertised image instead of waiting for another presence.
+  if (!m_bOnline) return GAIR_NOAVATAR;
+- const uint32_t uin = getDword(info->hContact, "UIN", 0);
+- const auto announced = getMStringA(info->hContact, "BartAdvertisedHash");
+- bytes_t announcedRaw;
+- if (uin && KicqAvatarDecodeHash(announced.c_str(), announcedRaw))
+-  QueueBartAvatar(uin, db_get_w(info->hContact, m_szModuleName, "BartAdvertisedType", 1), announcedRaw);
++ const auto peer = ContactId(info->hContact);
++ QueueCachedBartAvatar(info->hContact);
++ // Unknown hash: schedule discovery once per session, not on every AVS call.
++ ScheduleBartRefresh(peer);
+  mir_cslock lock(m_csBart);
+  for (const auto &pending : m_bartPending)
+-  if (FindContact((uint32_t)strtoul(pending.screenName.c_str(), nullptr, 10)) == info->hContact)
+-   return GAIR_WAITFOR;
++  if (pending.screenName == peer) return GAIR_WAITFOR;
+  return GAIR_NOAVATAR;
+ }
+ 
+--- a/normal/0.96.8/KICQ/src/proto.h
++++ b/normal/0.96.8/KICQ/src/proto.h
+@@ -175,13 +175,21 @@
+ 	void HandleOwnIconSsiAck(int result, uint32_t reqId);
+ 	void HandleBartUploadReply(const bytes_t &payload);
+ 
+-	void QueueBartAvatar(uint32_t uin, uint16_t type, const bytes_t &hash);
++	void QueueBartAvatar(const std::string &name, uint16_t type, const bytes_t &hash);
++	void QueueBartAvatar(uint32_t uin, uint16_t type, const bytes_t &hash) { if (uin) QueueBartAvatar(std::to_string(uin), type, hash); }
++	// Session-local discovery queue; protected by m_csBart, drained by BOS thread.
++	std::set<std::string> m_bartRefreshPending, m_bartRefreshUrgent, m_bartRefreshDone;
++	time_t m_lastBartRefresh = 0;
++	mir_cs m_csBartLifecycle;
++	void ScheduleBartRefresh(const std::string &name, bool force = false);
++	void PumpBartRefresh(time_t now);
++	void QueueCachedBartAvatar(MCONTACT contact);
+ 	void FlushBartRequests(HNETLIBCONN conn, uint16_t &seq);
+ 	INT_PTR MIR_CDECL OnAvatarCaps(WPARAM, LPARAM);
+ 	INT_PTR MIR_CDECL OnGetAvatarInfo(WPARAM, LPARAM);
+ 	INT_PTR MIR_CDECL OnGetMyAvatar(WPARAM, LPARAM);
+ 	INT_PTR MIR_CDECL OnSetMyAvatar(WPARAM, LPARAM);
+-	void ObserveBartPresence(uint32_t uin, const bytes_t &raw);
++	void ObserveBartPresence(const std::string &name, const bytes_t &raw);
+ 	void HandleBartUserInfoUpdate(const bytes_t &body); // 01/0F, 02/06: avatar hash updates
+ 
+ 
+--- a/normal/0.96.8/KICQ/src/server.cpp
++++ b/normal/0.96.8/KICQ/src/server.cpp
+@@ -94,7 +94,17 @@
+ {
+ 	m_iLoginError = 0;
+ 	m_cookie.clear();
++	StopBart(); // previous BOS session may have left an exited BART worker
+ 	m_szUin = AccountId().c_str();
++	{
++		mir_cslock lock(m_csBart);
++		m_bartPending.clear();
++		m_bartOutgoing.clear();
++		m_bartRefreshPending.clear();
++		m_bartRefreshUrgent.clear();
++		m_bartRefreshDone.clear();
++		m_lastBartRefresh = 0;
++	}
+ 	{
+ 		mir_cslock lck(m_csRoster);
+ 		m_arUsers.destroy();
+@@ -274,6 +284,7 @@
+ void CKicqProto::CheckTimeouts()
+ {
+ 	time_t now = time(0);
++	if (m_bOnline) PumpBartRefresh(now);
+ 
+ 	if (m_bOnline && now - m_lastProbe >= KEEPALIVE_INTERVAL) {
+ 		// OSCAR transport keepalive is FLAP channel 5 (empty payload).
+@@ -519,6 +530,7 @@
+  }
+  m_bartCookie = cookie->data;
+  debugLogA("BART: server redirect to %s:%d received", m_bartHost.c_str(), m_bartPort);
++ mir_cslock lifecycle(m_csBartLifecycle);
+  if (!m_hBartThread && !m_bTerminated) {
+   InterlockedExchange(&m_bartStop, 0);
+   m_hBartThread = CreateThread(nullptr, 0, BartThreadEntry, this, 0, nullptr);
+@@ -580,6 +592,15 @@
+ 	else
+ 		setByte(hContact, "Auth", 1);
+ 
++	if (!bFromLogin && m_bOnline) {
++		// Server-pushed additions must also discover the avatar. A newly
++		// created local contact has not yet been subscribed on this session.
++		if (bNew) {
++			OscarWriter buddy; buddy.ascii8(name.c_str());
++			Send(OscarSnac(3, 4, 0, buddy.data()));
++		}
++		ScheduleBartRefresh(name);
++	}
+ 	if (bTemporary)
+ 		return;
+ 
+@@ -714,6 +735,9 @@
+ 	if(getDword("UIN")) Send(OscarPackets::offlineMsgsRequest(atoi(m_szUin), m_seq));
+ 
+ 	m_bOnline = true;
++	// Include local contacts too, not just the online subset of the SSI roster.
++	// Discovery is deliberately queued, after the BOS client-ready sequence.
++	for (auto &contact : AccContacts()) ScheduleBartRefresh(ContactId(contact));
+ 	if (getByte("XStatusId", 0)) SendXStatus();
+ 	m_bProbeAnswered = true;
+ 	m_lastProbe = time(0);
+@@ -808,7 +832,6 @@
+ 			}
+ 			setWString(m_pendAdd.hContact, "SrvNick", m_pendAdd.name);
+  if(result==0)delSetting(m_pendAdd.hContact,"Auth");
+- if(!oscarid::uin(m_pendAdd.id)){OscarWriter buddy;buddy.ascii8(szUin);Send(OscarSnac(3,4,0,buddy.data()));}
+ 
+ 			if (result == 0x0E) {
+ 				// the contact requires authorization: add it flagged, then ask
+@@ -819,6 +842,10 @@
+ 				Send(OscarPackets::futureAuthGrant(szUin));
+ 				Send(OscarPackets::authRequest(szUin, TranslateT("Please authorize me")));
+ 			}
++			// Both numeric UIN and AIM SN need an explicit presence subscription.
++			OscarWriter buddy; buddy.ascii8(szUin);
++			Send(OscarSnac(3, 4, 0, buddy.data()));
++			ScheduleBartRefresh(m_pendAdd.id, true);
+ 			m_pendAdd.id.clear();
+ 		}
+ 		else {
+@@ -990,10 +1017,16 @@
+ 	r.skip(2); // warning level
+ 	r.skip(2); // TLV count
+ 	OscarTlvList tlvs(r);
++ // Process offline BART metadata without marking the buddy online or
++ // modifying its fingerprint/X-status. AIM names use the same discovery path.
++ bart::UserInfoBart avatarInfo;
++ if (bart::parseUserInfoBart(data, avatarInfo)) {
++  if (avatarInfo.offline) { HandleUserOffline(data); return; }
++  for (const auto &raw : avatarInfo.metadata) ObserveBartPresence(name, raw);
++ }
+  if(!uin){MCONTACT c=0;{mir_cslock lock(m_csRoster);if(auto *u=FindUser(name)){u->bOnline=true;c=u->hContact;}}
+   if(c){const auto *flags=tlvs.find(1);setWord(c,"Status",flags && (flags->u16()&0x20)?ID_STATUS_AWAY:ID_STATUS_ONLINE);}return;}
+ 
+-	if (const auto *bartId = tlvs.find(0x1D)) if(uin) ObserveBartPresence(uin, bartId->data);
+ 
+     // Only trace changes for the target Jimm Multi UIN. A presence refresh can
+     // repeat hundreds of times; logging each repeat hid the relevant packets.
+@@ -1313,6 +1346,9 @@
+ 
+ void CKicqProto::HandleUserOffline(const bytes_t &data)
+ {
++ // Some servers attach full USERINFO to an offline notification; a bare
++ // screen name remains valid and does not erase the cached avatar.
++ HandleBartUserInfoUpdate(data);
+ 	OscarReader r(data);
+ 	const auto name = oscarid::key(r.ascii8());
+  if(name.empty()) return;
+@@ -2130,66 +2166,79 @@
+ // 02/06 may also include TLV 0x001D.  Do not alter status/X-status here.
+ void CKicqProto::HandleBartUserInfoUpdate(const bytes_t &body)
+ {
+- // userinfo = byte SN length + SN + word warning + word TLV count + TLVs
+- if (body.size() < 5) return;
+- const size_t nameLen = uint8_t(body[0]);
+- const size_t head = 1 + nameLen;
+- if (!nameLen || head + 4 > body.size()) return;
+- const bytes_t name = body.substr(1, nameLen);
+- if (name.find_first_not_of("0123456789") != bytes_t::npos) return;
+- const unsigned long parsed = strtoul(name.c_str(), nullptr, 10);
+- if (!parsed || parsed > 0xffffffffUL || std::to_string(parsed) != name) return;
+- size_t pos = head + 2; // warning level
+- const uint16_t count = (uint16_t(uint8_t(body[pos])) << 8) | uint8_t(body[pos + 1]);
+- pos += 2;
+- // Strict TLV framing: ignore truncated packets instead of interpreting
+- // arbitrary trailing bytes as an avatar ID.
+- for (unsigned i = 0; i < count; ++i) {
+-  if (body.size() - pos < 4) return;
+-  const unsigned type = (unsigned(uint8_t(body[pos])) << 8) | uint8_t(body[pos + 1]);
+-  const size_t length = (size_t(uint8_t(body[pos + 2])) << 8) | uint8_t(body[pos + 3]);
+-  pos += 4;
+-  if (body.size() - pos < length) return;
+-  if (type == 0x001D) {
+-   debugLogA("BART LIVE BETA2: userinfo avatar metadata for %lu (%u bytes)", parsed, (unsigned)length);
+-   ObserveBartPresence(uint32_t(parsed), body.substr(pos, length));
++ bart::UserInfoBart info;
++ if (!bart::parseUserInfoBart(body, info)) return;
++ const auto name = oscarid::key(info.name);
++ if (name.empty()) return;
++ for (const auto &raw : info.metadata) ObserveBartPresence(name, raw);
++}
++
++void CKicqProto::ScheduleBartRefresh(const std::string &name, bool force)
++{
++ if (name.empty() || name == AccountId() || !m_bOnline) return;
++ mir_cslock lock(m_csBart);
++ if (force) {
++  m_bartRefreshDone.erase(name);
++  m_bartRefreshPending.erase(name);
++  m_bartRefreshUrgent.insert(name);
++ } else if (!m_bartRefreshDone.count(name) && !m_bartRefreshUrgent.count(name))
++  m_bartRefreshPending.insert(name);
++}
++
++void CKicqProto::PumpBartRefresh(time_t now)
++{
++ std::vector<std::string> batch;
++ {
++  mir_cslock lock(m_csBart);
++  if (m_lastBartRefresh == now) return;
++  m_lastBartRefresh = now;
++  // Maximum four LOCATE requests per second, regardless of packet/UI activity.
++  while ((!m_bartRefreshUrgent.empty() || !m_bartRefreshPending.empty()) && batch.size() < 4) {
++   auto &queue = m_bartRefreshUrgent.empty() ? m_bartRefreshPending : m_bartRefreshUrgent;
++   auto it = queue.begin();
++   batch.push_back(*it);
++   m_bartRefreshDone.insert(*it);
++   queue.erase(it);
+   }
+-  pos += length;
++ }
++ for (const auto &name : batch) {
++  MCONTACT contact = FindContact(name);
++  if (!contact) continue;
++  // Recover an already advertised hash even if the server does not answer LOCATE.
++  QueueCachedBartAvatar(contact);
++  bytes_t query;
++  if (bart::makeUserInfoQuery(name, query)) {
++   Send(OscarSnac(2, 0x15, 0, query));
++   debugLogA("BART: requested avatar metadata for %s (LOCATE 02/15)", name.c_str());
++  }
+  }
+ }
+ 
+ // Requests stay queued until the BART connection can send them.
+-void CKicqProto::ObserveBartPresence(uint32_t uin, const bytes_t &raw)
+-{
+- if (!uin || raw.empty()) return;
+- MCONTACT contact = FindContact(uin);
++void CKicqProto::ObserveBartPresence(const std::string &name, const bytes_t &raw)
++{
++ if (name.empty() || raw.empty()) return;
++ MCONTACT contact = FindContact(name);
+  if (!contact) return;
+  size_t offset = 0;
+  while (offset < raw.size()) {
+   bart::AssetId id;
+   if (!bart::parseId(raw, offset, id)) {
+-   debugLogA("BART: invalid avatar metadata for %u", uin);
++   debugLogA("BART: invalid avatar metadata for %s", name.c_str());
+    return;
+   }
+   if (id.type != 1 || id.hash.empty() || id.hash.size() > 64) continue;
+   const std::string hash = bart::hexHash(id.hash);
++  db_set_w(contact, m_szModuleName, "BartAdvertisedType", id.type);
+   db_set_s(contact, m_szModuleName, "BartAdvertisedHash", hash.c_str());
+-  db_set_w(contact, m_szModuleName, "BartAdvertisedType", id.type);
+-  // The hash in the database denotes a *downloaded* image, not merely an
+-  // advertised one. Failed requests must be eligible for another attempt.
+-  const auto stored = getMStringA(contact, "BartAvatarHash");
+-  const auto path = getMStringW(contact, "BartAvatarPath");
+-  if (stored == hash.c_str() && !path.IsEmpty() &&
+-      GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) continue;
+-  debugLogA("BART: contact %u advertises avatar type=%u hash=%s", uin, (unsigned)id.type, hash.c_str());
+-  QueueBartAvatar(uin, id.type, id.hash);
+- }
+-}
+-
+-void CKicqProto::QueueBartAvatar(uint32_t uin, uint16_t type, const bytes_t &hash)
+-{
+- if (!uin || hash.empty() || hash.size() > 64) return;
+- const std::string name = std::to_string(uin);
++  // A real cache file is required even when the stored hash matches.
++  QueueCachedBartAvatar(contact);
++ }
++}
++
++void CKicqProto::QueueBartAvatar(const std::string &name, uint16_t type, const bytes_t &hash)
++{
++ if (name.empty() || hash.empty() || hash.size() > 64) return;
+  bart::AssetId id; id.type = type; id.hash = hash;
+  bytes_t payload;
+  if (!bart::makeDownload(name, id, payload)) return;
+@@ -2201,7 +2250,7 @@
+   if (item.screenName == name && item.hash == hash && item.type == type) return;
+  m_bartPending.push_back({name, hash, type});
+  m_bartOutgoing.push_back(wire);
+- debugLogA("BART: queued image request for %u (type %u)", uin, (unsigned)type);
++ debugLogA("BART: queued image request for %s (type %u)", name.c_str(), (unsigned)type);
+ }
+ 
+ void CKicqProto::FlushBartRequests(HNETLIBCONN conn, uint16_t &seq)
+@@ -2334,7 +2383,7 @@
+  {
+   mir_cslock lock(m_csBart);
+   for (auto it = m_bartPending.begin(); it != m_bartPending.end(); ++it) {
+-   if (it->screenName == reply.screenName && it->hash == reply.id.hash && it->type == reply.id.type) {
++   if (it->screenName == oscarid::key(reply.screenName) && it->hash == reply.id.hash && it->type == reply.id.type) {
+     matched = true;
+     if (!imageOk && it->attempts < 2) {
+      ++it->attempts;
+@@ -2390,14 +2439,14 @@
+   return;
+  }
+  // Store per-contact cache location. The Avatar API must subsequently use this file.
+- const unsigned long uin = strtoul(reply.screenName.c_str(), nullptr, 10);
+- if (uin && std::to_string(uin) == reply.screenName) {
+-  MCONTACT contact = FindContact((uint32_t)uin);
++ const auto peer = oscarid::key(reply.screenName);
++ if (!peer.empty()) {
++  MCONTACT contact = FindContact(peer);
+   if (contact) {
+    // Ignore an older reply if presence already announced a different avatar.
+    const auto current = getMStringA(contact, "BartAdvertisedHash");
+    if (!current.IsEmpty() && current != name.c_str()) {
+-    debugLogA("BART: discarded obsolete avatar for %lu", uin);
++    debugLogA("BART: discarded obsolete avatar for %s", peer.c_str());
+     return;
+    }
+    db_set_ws(contact, m_szModuleName, "BartAvatarPath", path.c_str());
+@@ -2413,7 +2462,7 @@
+    // Synchronous ACK: Miranda AVS consumes the pointer during this call.
+    // A nullptr on SUCCESS means 'no avatar' and caused the empty UI.
+    ProtoBroadcastAck(contact, ACKTYPE_AVATAR, ACKRESULT_SUCCESS, (HANDLE)&info);
+-   debugLogA("BART: cached and announced contact %lu avatar", uin);
++   debugLogA("BART: cached and announced contact %s avatar", peer.c_str());
+   }
+  }
+ }
+@@ -2527,6 +2576,7 @@
+ 
+ void CKicqProto::StopBart()
+ {
++ mir_cslock lifecycle(m_csBartLifecycle);
+  InterlockedExchange(&m_bartStop, 1);
+  {
+   mir_cslock lock(m_csBart);
+--- a/windows-xp-x86/0.96.7/KICQ/src/bart_codec.h
++++ b/windows-xp-x86/0.96.7/KICQ/src/bart_codec.h
+@@ -7,6 +7,7 @@
+ #include <string>
+ #include <vector>
+ #include <limits>
++#include <utility>
+ 
+ namespace bart {
+ using Bytes = std::string;
+@@ -37,6 +38,47 @@
+  Bytes b; b.push_back(char(screenName.size())); b+=screenName; b.push_back('\x01');
+  if (!appendId(b,id)) return false;
+  payload.swap(b); return true;
++}
++// LOCATE 02/15: basic USERINFO plus capabilities, with a length-prefixed name.
++// No BART download can be constructed until a real asset ID is advertised.
++inline bool makeUserInfoQuery(const std::string &name, Bytes &payload) {
++ if (name.empty() || name.size()>255) return false;
++ Bytes b; put16(b,0); put16(b,4); b.push_back(char(name.size())); b+=name;
++ payload.swap(b); return true;
++}
++struct UserInfoBart {
++ std::string name;
++ std::vector<Bytes> metadata;
++ bool offline = false;
++};
++// USERINFO can be followed by unrelated LOCATE response TLVs. Only consume
++// the counted presence TLVs, and commit nothing if any counted TLV is truncated.
++inline bool parseUserInfoBart(const Bytes &b, UserInfoBart &out) {
++ size_t p=0; uint8_t n; uint16_t warning, count;
++ UserInfoBart r;
++ if (!get8(b,p,n) || !n || b.size()-p<n) return false;
++ r.name=b.substr(p,n); p+=n;
++ if (!get16(b,p,warning) || !get16(b,p,count)) return false;
++ bool zeroFlags=false, hasStatus=false, offlineStatus=false;
++ for (unsigned i=0;i<count;++i) {
++  uint16_t tag,len;
++  if (!get16(b,p,tag) || !get16(b,p,len) || b.size()-p<len) return false;
++  if (tag==0x001d) r.metadata.push_back(b.substr(p,len));
++  if (tag==1 && len==2) zeroFlags=(b[p]==0 && b[p+1]==0);
++  if (tag==6 && len==4) { hasStatus=true; offlineStatus=(uint8_t(b[p+2])==255 && uint8_t(b[p+3])==255); }
++  p+=len;
++ }
++ // Standard OSCAR offline BART notifications may arrive as 03/0B. Do not
++ // override an explicit ICQ online status on servers using zero user flags.
++ bool hasIcon=false;
++ for (const auto &raw:r.metadata) {
++  size_t at=0; AssetId id;
++  while (at<raw.size() && parseId(raw,at,id)) {
++   if (id.type==1 && !id.hash.empty()) { hasIcon=true; break; }
++  }
++ }
++ r.offline=offlineStatus || (zeroFlags && !hasStatus && hasIcon);
++ out=std::move(r); return true;
+ }
+ // BART__UPLOAD_QUERY (10/02): type + 16-bit length + image bytes.
+ inline bool makeUpload(uint16_t type, const Bytes &image, Bytes &payload) {
+--- a/windows-xp-x86/0.96.7/KICQ/src/oscar.cpp
++++ b/windows-xp-x86/0.96.7/KICQ/src/oscar.cpp
+@@ -354,7 +354,8 @@
+ OscarSnac reqBuddyRights()
+ {
+ 	OscarWriter w;
+-	w.u16(5).u16(2).u16(3);
++	// Preserve existing flags and opt in to BART metadata for offline buddies.
++	w.u16(5).u16(2).u16(3 | 0x0004);
+ 	return OscarSnac(3, 2, 2, w.data());
+ }
+ 
+--- a/windows-xp-x86/0.96.7/KICQ/src/proto.cpp
++++ b/windows-xp-x86/0.96.7/KICQ/src/proto.cpp
+@@ -651,6 +651,7 @@
+ 			}
+ 		}
+ 	}
++	if (m_bOnline) ScheduleBartRefresh(peer, true);
+ 	return hContact;
+ }
+ 
+@@ -1993,6 +1994,52 @@
+  return ok;
+ }
+ 
++// A cache entry is usable only when it is an actual non-empty file.
++static bool KicqAvatarFileReady(const wchar_t *path)
++{
++ if (!path || !*path) return false;
++ WIN32_FILE_ATTRIBUTE_DATA attributes = {};
++ if (!GetFileAttributesExW(path, GetFileExInfoStandard, &attributes)) return false;
++ return !(attributes.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
++  (attributes.nFileSizeHigh != 0 || attributes.nFileSizeLow != 0);
++}
++
++// Decode only protocol-provided hex hashes. A missing disk cache can be fetched
++// again even if the server does not send another presence update.
++static bool KicqAvatarDecodeHash(const char *hex, bytes_t &raw)
++{
++ if (!hex) return false;
++ const size_t length = strlen(hex);
++ if (!length || length > 128 || (length & 1)) return false;
++ raw.clear();
++ for (size_t i = 0; i < length; i += 2) {
++  auto digit = [](char value) -> int {
++   if (value >= '0' && value <= '9') return value - '0';
++   if (value >= 'a' && value <= 'f') return value - 'a' + 10;
++   if (value >= 'A' && value <= 'F') return value - 'A' + 10;
++   return -1;
++  };
++  const int hi = digit(hex[i]), lo = digit(hex[i + 1]);
++  if (hi < 0 || lo < 0) { raw.clear(); return false; }
++  raw.push_back(char((hi << 4) | lo));
++ }
++ return !raw.empty();
++}
++
++// Use the same cache validation from proactive discovery and AVS requests.
++void CKicqProto::QueueCachedBartAvatar(MCONTACT contact)
++{
++ if (!contact) return;
++ auto announced = getMStringA(contact, "BartAdvertisedHash");
++ const auto cached = getMStringA(contact, "BartAvatarHash");
++ const auto file = getMStringW(contact, "BartAvatarPath");
++ if (announced.IsEmpty()) announced = cached; // older XP profiles saved only the verified hash
++ if (announced == cached && KicqAvatarFileReady(file.c_str())) return;
++ bytes_t raw;
++ if (KicqAvatarDecodeHash(announced.c_str(), raw))
++  QueueBartAvatar(ContactId(contact), db_get_w(contact, m_szModuleName, "BartAdvertisedType", 1), raw);
++}
++
+ // Avatar Services (Miranda NG 0.96.x). Uses existing BART wire/session.
+ // Called by Miranda Avatar Service to obtain an actual cached contact image.
+ // An advertised hash alone is never reported as a successfully downloaded image.
+@@ -2001,7 +2048,9 @@
+  auto *info = reinterpret_cast<PROTO_AVATAR_INFORMATION *>(lParam);
+  if (!info || !info->hContact) return GAIR_NOAVATAR;
+  const auto file = getMStringW(info->hContact, "BartAvatarPath");
+- if (!file.IsEmpty() && GetFileAttributesW(file.c_str()) != INVALID_FILE_ATTRIBUTES) {
++ const auto advertisedHash = getMStringA(info->hContact, "BartAdvertisedHash");
++ const auto cachedHash = getMStringA(info->hContact, "BartAvatarHash");
++ if ((advertisedHash.IsEmpty() || advertisedHash == cachedHash) && KicqAvatarFileReady(file.c_str())) {
+   const wchar_t *ext = wcsrchr(file.c_str(), L'.');
+   info->format = PA_FORMAT_UNKNOWN;
+   if (ext) {
+@@ -2018,39 +2067,20 @@
+  // disappear between sessions. Re-request the last verified avatar hash,
+  // without forcing a contact-list/Extra Icons rebuild.
+  if (!m_bOnline) return GAIR_NOAVATAR;
+- const auto cachedHash = getMStringA(info->hContact, "BartAvatarHash");
+- const uint32_t avatarUin = getDword(info->hContact, "UIN");
+- if (avatarUin && cachedHash.GetLength() == 32) {
+-  bytes_t hash;
+-  hash.reserve(16);
+-  bool valid = true;
+-  for (int i = 0; i < 32; i += 2) {
+-   auto nibble = [](char c) -> int {
+-    if (c >= '0' && c <= '9') return c - '0';
+-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+-    return -1;
+-   };
+-   const int hi = nibble(cachedHash[i]);
+-   const int lo = nibble(cachedHash[i + 1]);
+-   if (hi < 0 || lo < 0) { valid = false; break; }
+-   hash.push_back(uint8_t((hi << 4) | lo));
+-  }
+-  if (valid) QueueBartAvatar(avatarUin, 1, hash);
+- }
+- // A queued request returns WAITFOR; on completion the BART worker broadcasts
+- // ACKTYPE_AVATAR for this contact, not a global Extra Icons refresh.
++ const auto peer = ContactId(info->hContact);
++ QueueCachedBartAvatar(info->hContact);
++ // Unknown hash: schedule discovery once per session, not on every AVS call.
++ ScheduleBartRefresh(peer);
+  mir_cslock lock(m_csBart);
+  for (const auto &pending : m_bartPending)
+-  if (FindContact((uint32_t)strtoul(pending.screenName.c_str(), nullptr, 10)) == info->hContact)
+-   return GAIR_WAITFOR;
++  if (pending.screenName == peer) return GAIR_WAITFOR;
+  return GAIR_NOAVATAR;
+ }
+ 
+ INT_PTR MIR_CDECL CKicqProto::OnAvatarCaps(WPARAM wParam, LPARAM lParam)
+ {
+  switch (wParam) {
+- case AF_ENABLED: return m_bOnline ? 1 : 0;
++ case AF_ENABLED: return 1;
+  case AF_MAXSIZE: if (lParam) { auto *size = reinterpret_cast<POINT *>(lParam); size->x = 128; size->y = 128; } return 0;
+  case AF_PROPORTION: return PIP_SQUARE;
+  case AF_MAXFILESIZE: return 7168;
+--- a/windows-xp-x86/0.96.7/KICQ/src/proto.h
++++ b/windows-xp-x86/0.96.7/KICQ/src/proto.h
+@@ -175,13 +175,21 @@
+ 	void HandleOwnIconSsiAck(int result, uint32_t reqId);
+ 	void HandleBartUploadReply(const bytes_t &payload);
+ 
+-	void QueueBartAvatar(uint32_t uin, uint16_t type, const bytes_t &hash);
++	void QueueBartAvatar(const std::string &name, uint16_t type, const bytes_t &hash);
++	void QueueBartAvatar(uint32_t uin, uint16_t type, const bytes_t &hash) { if (uin) QueueBartAvatar(std::to_string(uin), type, hash); }
++	// Session-local discovery queue; protected by m_csBart, drained by BOS thread.
++	std::set<std::string> m_bartRefreshPending, m_bartRefreshUrgent, m_bartRefreshDone;
++	time_t m_lastBartRefresh = 0;
++	mir_cs m_csBartLifecycle;
++	void ScheduleBartRefresh(const std::string &name, bool force = false);
++	void PumpBartRefresh(time_t now);
++	void QueueCachedBartAvatar(MCONTACT contact);
+ 	void FlushBartRequests(HNETLIBCONN conn, uint16_t &seq);
+ 	INT_PTR MIR_CDECL OnAvatarCaps(WPARAM, LPARAM);
+ 	INT_PTR MIR_CDECL OnGetAvatarInfo(WPARAM, LPARAM);
+ 	INT_PTR MIR_CDECL OnGetMyAvatar(WPARAM, LPARAM);
+ 	INT_PTR MIR_CDECL OnSetMyAvatar(WPARAM, LPARAM);
+-	void ObserveBartPresence(uint32_t uin, const bytes_t &raw);
++	void ObserveBartPresence(const std::string &name, const bytes_t &raw);
+ 	void HandleBartUserInfoUpdate(const bytes_t &body); // 01/0F, 02/06: avatar hash updates
+ 
+ 
+--- a/windows-xp-x86/0.96.7/KICQ/src/server.cpp
++++ b/windows-xp-x86/0.96.7/KICQ/src/server.cpp
+@@ -122,7 +122,17 @@
+ 	KicqXpTrace("ServerThread begin");
+ 	m_iLoginError = 0;
+ 	m_cookie.clear();
++	StopBart(); // previous BOS session may have left an exited BART worker
+ 	m_szUin = AccountId().c_str();
++	{
++		mir_cslock lock(m_csBart);
++		m_bartPending.clear();
++		m_bartOutgoing.clear();
++		m_bartRefreshPending.clear();
++		m_bartRefreshUrgent.clear();
++		m_bartRefreshDone.clear();
++		m_lastBartRefresh = 0;
++	}
+ 	{
+ 		mir_cslock lck(m_csRoster);
+ 		m_arUsers.destroy();
+@@ -304,6 +314,7 @@
+ void CKicqProto::CheckTimeouts()
+ {
+ 	time_t now = time(0);
++	if (m_bOnline) PumpBartRefresh(now);
+ 
+ 	if (m_bOnline && now - m_lastProbe >= KEEPALIVE_INTERVAL) {
+ 		// OSCAR transport keepalive is FLAP channel 5 (empty payload).
+@@ -556,6 +567,7 @@
+   m_hBartThread = nullptr;
+   debugLogA("BART: previous service worker finished; restarting");
+  }
++ mir_cslock lifecycle(m_csBartLifecycle);
+  if (!m_hBartThread && !m_bTerminated) {
+   InterlockedExchange(&m_bartStop, 0);
+   m_hBartThread = CreateThread(nullptr, 0, BartThreadEntry, this, 0, nullptr);
+@@ -640,6 +652,10 @@
+ 	else if (getByte(hContact, "Auth", 0) != 1)
+ 		setByte(hContact, "Auth", 1);
+ 
++	if (!bFromLogin && m_bOnline) {
++        if (bNew) { OscarWriter buddy; buddy.ascii8(name.c_str()); Send(OscarSnac(3, 4, 0, buddy.data())); }
++        ScheduleBartRefresh(name);
++    }
+ 	if (bTemporary) {
+         if (trace) KicqDiagTrace("ApplyRosterItem RETURN temporary");
+         return;
+@@ -822,6 +838,9 @@
+ 	if(getDword("UIN")) Send(OscarPackets::offlineMsgsRequest(atoi(m_szUin), m_seq));
+ 
+ 	m_bOnline = true;
++	// Include local contacts too, not just the online subset of the SSI roster.
++	// Discovery is deliberately queued, after the BOS client-ready sequence.
++	for (auto &contact : AccContacts()) ScheduleBartRefresh(ContactId(contact));
+ 	if (getByte("XStatusId", 0)) SendXStatus();
+ 	m_bProbeAnswered = true;
+ 	m_lastProbe = time(0);
+@@ -917,7 +936,6 @@
+ 			}
+ 			setWString(m_pendAdd.hContact, "SrvNick", m_pendAdd.name);
+  if(result==0)delSetting(m_pendAdd.hContact,"Auth");
+- if(!oscarid::uin(m_pendAdd.id)){OscarWriter buddy;buddy.ascii8(szUin);Send(OscarSnac(3,4,0,buddy.data()));}
+ 
+ 			if (result == 0x0E) {
+ 				// the contact requires authorization: add it flagged, then ask
+@@ -928,6 +946,10 @@
+ 				Send(OscarPackets::futureAuthGrant(szUin));
+ 				Send(OscarPackets::authRequest(szUin, TranslateT("Please authorize me")));
+ 			}
++			// Both numeric UIN and AIM SN need an explicit presence subscription.
++			OscarWriter buddy; buddy.ascii8(szUin);
++			Send(OscarSnac(3, 4, 0, buddy.data()));
++			ScheduleBartRefresh(m_pendAdd.id, true);
+ 			m_pendAdd.id.clear();
+ 		}
+ 		else {
+@@ -1099,10 +1121,16 @@
+ 	r.skip(2); // warning level
+ 	r.skip(2); // TLV count
+ 	OscarTlvList tlvs(r);
++ // Process offline BART metadata without marking the buddy online or
++ // modifying its fingerprint/X-status. AIM names use the same discovery path.
++ bart::UserInfoBart avatarInfo;
++ if (bart::parseUserInfoBart(data, avatarInfo)) {
++  if (avatarInfo.offline) { HandleUserOffline(data); return; }
++  for (const auto &raw : avatarInfo.metadata) ObserveBartPresence(name, raw);
++ }
+  if(!uin){MCONTACT c=0;{mir_cslock lock(m_csRoster);if(auto *u=FindUser(name)){u->bOnline=true;c=u->hContact;}}
+   if(c){const auto *flags=tlvs.find(1);setWord(c,"Status",flags && (flags->u16()&0x20)?ID_STATUS_AWAY:ID_STATUS_ONLINE);}return;}
+ 
+-	if (const auto *bartId = tlvs.find(0x1D)) if(uin) ObserveBartPresence(uin, bartId->data);
+ 
+     // Only trace changes for the target Jimm Multi UIN. A presence refresh can
+     // repeat hundreds of times; logging each repeat hid the relevant packets.
+@@ -1427,6 +1455,9 @@
+ 
+ void CKicqProto::HandleUserOffline(const bytes_t &data)
+ {
++ // Some servers attach full USERINFO to an offline notification; a bare
++ // screen name remains valid and does not erase the cached avatar.
++ HandleBartUserInfoUpdate(data);
+ 	OscarReader r(data);
+ 	const auto name = oscarid::key(r.ascii8());
+  if(name.empty()) return;
+@@ -2253,64 +2284,79 @@
+ // 02/06 may also include TLV 0x001D.  Do not alter status/X-status here.
+ void CKicqProto::HandleBartUserInfoUpdate(const bytes_t &body)
+ {
+- // userinfo = byte SN length + SN + word warning + word TLV count + TLVs
+- if (body.size() < 5) return;
+- const size_t nameLen = uint8_t(body[0]);
+- const size_t head = 1 + nameLen;
+- if (!nameLen || head + 4 > body.size()) return;
+- const bytes_t name = body.substr(1, nameLen);
+- if (name.find_first_not_of("0123456789") != bytes_t::npos) return;
+- const unsigned long parsed = strtoul(name.c_str(), nullptr, 10);
+- if (!parsed || parsed > 0xffffffffUL || std::to_string(parsed) != name) return;
+- size_t pos = head + 2; // warning level
+- const uint16_t count = (uint16_t(uint8_t(body[pos])) << 8) | uint8_t(body[pos + 1]);
+- pos += 2;
+- // Strict TLV framing: ignore truncated packets instead of interpreting
+- // arbitrary trailing bytes as an avatar ID.
+- for (unsigned i = 0; i < count; ++i) {
+-  if (body.size() - pos < 4) return;
+-  const unsigned type = (unsigned(uint8_t(body[pos])) << 8) | uint8_t(body[pos + 1]);
+-  const size_t length = (size_t(uint8_t(body[pos + 2])) << 8) | uint8_t(body[pos + 3]);
+-  pos += 4;
+-  if (body.size() - pos < length) return;
+-  if (type == 0x001D) {
+-   debugLogA("BART LIVE BETA2: userinfo avatar metadata for %lu (%u bytes)", parsed, (unsigned)length);
+-   ObserveBartPresence(uint32_t(parsed), body.substr(pos, length));
++ bart::UserInfoBart info;
++ if (!bart::parseUserInfoBart(body, info)) return;
++ const auto name = oscarid::key(info.name);
++ if (name.empty()) return;
++ for (const auto &raw : info.metadata) ObserveBartPresence(name, raw);
++}
++
++void CKicqProto::ScheduleBartRefresh(const std::string &name, bool force)
++{
++ if (name.empty() || name == AccountId() || !m_bOnline) return;
++ mir_cslock lock(m_csBart);
++ if (force) {
++  m_bartRefreshDone.erase(name);
++  m_bartRefreshPending.erase(name);
++  m_bartRefreshUrgent.insert(name);
++ } else if (!m_bartRefreshDone.count(name) && !m_bartRefreshUrgent.count(name))
++  m_bartRefreshPending.insert(name);
++}
++
++void CKicqProto::PumpBartRefresh(time_t now)
++{
++ std::vector<std::string> batch;
++ {
++  mir_cslock lock(m_csBart);
++  if (m_lastBartRefresh == now) return;
++  m_lastBartRefresh = now;
++  // Maximum four LOCATE requests per second, regardless of packet/UI activity.
++  while ((!m_bartRefreshUrgent.empty() || !m_bartRefreshPending.empty()) && batch.size() < 4) {
++   auto &queue = m_bartRefreshUrgent.empty() ? m_bartRefreshPending : m_bartRefreshUrgent;
++   auto it = queue.begin();
++   batch.push_back(*it);
++   m_bartRefreshDone.insert(*it);
++   queue.erase(it);
+   }
+-  pos += length;
++ }
++ for (const auto &name : batch) {
++  MCONTACT contact = FindContact(name);
++  if (!contact) continue;
++  // Recover an already advertised hash even if the server does not answer LOCATE.
++  QueueCachedBartAvatar(contact);
++  bytes_t query;
++  if (bart::makeUserInfoQuery(name, query)) {
++   Send(OscarSnac(2, 0x15, 0, query));
++   debugLogA("BART: requested avatar metadata for %s (LOCATE 02/15)", name.c_str());
++  }
+  }
+ }
+ 
+ // Requests stay queued until the BART connection can send them.
+-void CKicqProto::ObserveBartPresence(uint32_t uin, const bytes_t &raw)
+-{
+- if (!uin || raw.empty()) return;
+- MCONTACT contact = FindContact(uin);
++void CKicqProto::ObserveBartPresence(const std::string &name, const bytes_t &raw)
++{
++ if (name.empty() || raw.empty()) return;
++ MCONTACT contact = FindContact(name);
+  if (!contact) return;
+  size_t offset = 0;
+  while (offset < raw.size()) {
+   bart::AssetId id;
+   if (!bart::parseId(raw, offset, id)) {
+-   debugLogA("BART: invalid avatar metadata for %u", uin);
++   debugLogA("BART: invalid avatar metadata for %s", name.c_str());
+    return;
+   }
+   if (id.type != 1 || id.hash.empty() || id.hash.size() > 64) continue;
+   const std::string hash = bart::hexHash(id.hash);
+-  // The hash in the database denotes a *downloaded* image, not merely an
+-  // advertised one. Failed requests must be eligible for another attempt.
+-  const auto stored = getMStringA(contact, "BartAvatarHash");
+-  const auto path = getMStringW(contact, "BartAvatarPath");
+-  if (stored == hash.c_str() && !path.IsEmpty() &&
+-      GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) continue;
+-  debugLogA("BART: contact %u advertises avatar type=%u hash=%s", uin, (unsigned)id.type, hash.c_str());
+-  QueueBartAvatar(uin, id.type, id.hash);
+- }
+-}
+-
+-void CKicqProto::QueueBartAvatar(uint32_t uin, uint16_t type, const bytes_t &hash)
+-{
+- if (!uin || hash.empty() || hash.size() > 64) return;
+- const std::string name = std::to_string(uin);
++  db_set_w(contact, m_szModuleName, "BartAdvertisedType", id.type);
++  db_set_s(contact, m_szModuleName, "BartAdvertisedHash", hash.c_str());
++  // A real cache file is required even when the stored hash matches.
++  QueueCachedBartAvatar(contact);
++ }
++}
++
++void CKicqProto::QueueBartAvatar(const std::string &name, uint16_t type, const bytes_t &hash)
++{
++ if (name.empty() || hash.empty() || hash.size() > 64) return;
+  bart::AssetId id; id.type = type; id.hash = hash;
+  bytes_t payload;
+  if (!bart::makeDownload(name, id, payload)) return;
+@@ -2322,7 +2368,7 @@
+   if (item.screenName == name && item.hash == hash && item.type == type) return;
+  m_bartPending.push_back({name, hash, type});
+  m_bartOutgoing.push_back(wire);
+- debugLogA("BART: queued image request for %u (type %u)", uin, (unsigned)type);
++ debugLogA("BART: queued image request for %s (type %u)", name.c_str(), (unsigned)type);
+ }
+ 
+ void CKicqProto::FlushBartRequests(HNETLIBCONN conn, uint16_t &seq)
+@@ -2453,7 +2499,7 @@
+  {
+   mir_cslock lock(m_csBart);
+   for (auto it = m_bartPending.begin(); it != m_bartPending.end(); ++it) {
+-   if (it->screenName == reply.screenName && it->hash == reply.id.hash && it->type == reply.id.type) {
++   if (it->screenName == oscarid::key(reply.screenName) && it->hash == reply.id.hash && it->type == reply.id.type) {
+     m_bartPending.erase(it);
+     matched = true;
+     break;
+@@ -2499,10 +2545,12 @@
+   return;
+  }
+  // Store per-contact cache location. The Avatar API must subsequently use this file.
+- const unsigned long uin = strtoul(reply.screenName.c_str(), nullptr, 10);
+- if (uin && std::to_string(uin) == reply.screenName) {
+-  MCONTACT contact = FindContact((uint32_t)uin);
++ const auto peer = oscarid::key(reply.screenName);
++ if (!peer.empty()) {
++  MCONTACT contact = FindContact(peer);
+   if (contact) {
++   const auto current = getMStringA(contact, "BartAdvertisedHash");
++   if (!current.IsEmpty() && current != name.c_str()) return;
+    db_set_ws(contact, m_szModuleName, "BartAvatarPath", path.c_str());
+    db_set_s(contact, m_szModuleName, "BartAvatarHash", name.c_str());
+    db_set_ws(contact, "ContactPhoto", "File", path.c_str());
+@@ -2516,7 +2564,7 @@
+    // Synchronous ACK: Miranda AVS consumes the pointer during this call.
+    // A nullptr on SUCCESS means 'no avatar' and caused the empty UI.
+    ProtoBroadcastAck(contact, ACKTYPE_AVATAR, ACKRESULT_SUCCESS, (HANDLE)&info);
+-   debugLogA("BART: cached and announced contact %lu avatar", uin);
++   debugLogA("BART: cached and announced contact %s avatar", peer.c_str());
+   }
+  }
+ }
+@@ -2645,6 +2693,7 @@
+ 
+ void CKicqProto::StopBart()
+ {
++ mir_cslock lifecycle(m_csBartLifecycle);
+  InterlockedExchange(&m_bartStop, 1);
+  {
+   mir_cslock lock(m_csBart);
+--- a/windows-xp-x86/0.96.8/KICQ/src/bart_codec.h
++++ b/windows-xp-x86/0.96.8/KICQ/src/bart_codec.h
+@@ -7,6 +7,7 @@
+ #include <string>
+ #include <vector>
+ #include <limits>
++#include <utility>
+ 
+ namespace bart {
+ using Bytes = std::string;
+@@ -37,6 +38,47 @@
+  Bytes b; b.push_back(char(screenName.size())); b+=screenName; b.push_back('\x01');
+  if (!appendId(b,id)) return false;
+  payload.swap(b); return true;
++}
++// LOCATE 02/15: basic USERINFO plus capabilities, with a length-prefixed name.
++// No BART download can be constructed until a real asset ID is advertised.
++inline bool makeUserInfoQuery(const std::string &name, Bytes &payload) {
++ if (name.empty() || name.size()>255) return false;
++ Bytes b; put16(b,0); put16(b,4); b.push_back(char(name.size())); b+=name;
++ payload.swap(b); return true;
++}
++struct UserInfoBart {
++ std::string name;
++ std::vector<Bytes> metadata;
++ bool offline = false;
++};
++// USERINFO can be followed by unrelated LOCATE response TLVs. Only consume
++// the counted presence TLVs, and commit nothing if any counted TLV is truncated.
++inline bool parseUserInfoBart(const Bytes &b, UserInfoBart &out) {
++ size_t p=0; uint8_t n; uint16_t warning, count;
++ UserInfoBart r;
++ if (!get8(b,p,n) || !n || b.size()-p<n) return false;
++ r.name=b.substr(p,n); p+=n;
++ if (!get16(b,p,warning) || !get16(b,p,count)) return false;
++ bool zeroFlags=false, hasStatus=false, offlineStatus=false;
++ for (unsigned i=0;i<count;++i) {
++  uint16_t tag,len;
++  if (!get16(b,p,tag) || !get16(b,p,len) || b.size()-p<len) return false;
++  if (tag==0x001d) r.metadata.push_back(b.substr(p,len));
++  if (tag==1 && len==2) zeroFlags=(b[p]==0 && b[p+1]==0);
++  if (tag==6 && len==4) { hasStatus=true; offlineStatus=(uint8_t(b[p+2])==255 && uint8_t(b[p+3])==255); }
++  p+=len;
++ }
++ // Standard OSCAR offline BART notifications may arrive as 03/0B. Do not
++ // override an explicit ICQ online status on servers using zero user flags.
++ bool hasIcon=false;
++ for (const auto &raw:r.metadata) {
++  size_t at=0; AssetId id;
++  while (at<raw.size() && parseId(raw,at,id)) {
++   if (id.type==1 && !id.hash.empty()) { hasIcon=true; break; }
++  }
++ }
++ r.offline=offlineStatus || (zeroFlags && !hasStatus && hasIcon);
++ out=std::move(r); return true;
+ }
+ // BART__UPLOAD_QUERY (10/02): type + 16-bit length + image bytes.
+ inline bool makeUpload(uint16_t type, const Bytes &image, Bytes &payload) {
+--- a/windows-xp-x86/0.96.8/KICQ/src/oscar.cpp
++++ b/windows-xp-x86/0.96.8/KICQ/src/oscar.cpp
+@@ -354,7 +354,8 @@
+ OscarSnac reqBuddyRights()
+ {
+ 	OscarWriter w;
+-	w.u16(5).u16(2).u16(3);
++	// Preserve existing flags and opt in to BART metadata for offline buddies.
++	w.u16(5).u16(2).u16(3 | 0x0004);
+ 	return OscarSnac(3, 2, 2, w.data());
+ }
+ 
+--- a/windows-xp-x86/0.96.8/KICQ/src/proto.cpp
++++ b/windows-xp-x86/0.96.8/KICQ/src/proto.cpp
+@@ -646,6 +646,7 @@
+ 			}
+ 		}
+ 	}
++	if (m_bOnline) ScheduleBartRefresh(peer, true);
+ 	return hContact;
+ }
+ 
+@@ -1988,6 +1989,52 @@
+  return ok;
+ }
+ 
++// A cache entry is usable only when it is an actual non-empty file.
++static bool KicqAvatarFileReady(const wchar_t *path)
++{
++ if (!path || !*path) return false;
++ WIN32_FILE_ATTRIBUTE_DATA attributes = {};
++ if (!GetFileAttributesExW(path, GetFileExInfoStandard, &attributes)) return false;
++ return !(attributes.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
++  (attributes.nFileSizeHigh != 0 || attributes.nFileSizeLow != 0);
++}
++
++// Decode only protocol-provided hex hashes. A missing disk cache can be fetched
++// again even if the server does not send another presence update.
++static bool KicqAvatarDecodeHash(const char *hex, bytes_t &raw)
++{
++ if (!hex) return false;
++ const size_t length = strlen(hex);
++ if (!length || length > 128 || (length & 1)) return false;
++ raw.clear();
++ for (size_t i = 0; i < length; i += 2) {
++  auto digit = [](char value) -> int {
++   if (value >= '0' && value <= '9') return value - '0';
++   if (value >= 'a' && value <= 'f') return value - 'a' + 10;
++   if (value >= 'A' && value <= 'F') return value - 'A' + 10;
++   return -1;
++  };
++  const int hi = digit(hex[i]), lo = digit(hex[i + 1]);
++  if (hi < 0 || lo < 0) { raw.clear(); return false; }
++  raw.push_back(char((hi << 4) | lo));
++ }
++ return !raw.empty();
++}
++
++// Use the same cache validation from proactive discovery and AVS requests.
++void CKicqProto::QueueCachedBartAvatar(MCONTACT contact)
++{
++ if (!contact) return;
++ auto announced = getMStringA(contact, "BartAdvertisedHash");
++ const auto cached = getMStringA(contact, "BartAvatarHash");
++ const auto file = getMStringW(contact, "BartAvatarPath");
++ if (announced.IsEmpty()) announced = cached; // older XP profiles saved only the verified hash
++ if (announced == cached && KicqAvatarFileReady(file.c_str())) return;
++ bytes_t raw;
++ if (KicqAvatarDecodeHash(announced.c_str(), raw))
++  QueueBartAvatar(ContactId(contact), db_get_w(contact, m_szModuleName, "BartAdvertisedType", 1), raw);
++}
++
+ // Avatar Services (Miranda NG 0.96.x). Uses existing BART wire/session.
+ // Called by Miranda Avatar Service to obtain an actual cached contact image.
+ // An advertised hash alone is never reported as a successfully downloaded image.
+@@ -1996,7 +2043,9 @@
+  auto *info = reinterpret_cast<PROTO_AVATAR_INFORMATION *>(lParam);
+  if (!info || !info->hContact) return GAIR_NOAVATAR;
+  const auto file = getMStringW(info->hContact, "BartAvatarPath");
+- if (!file.IsEmpty() && GetFileAttributesW(file.c_str()) != INVALID_FILE_ATTRIBUTES) {
++ const auto advertisedHash = getMStringA(info->hContact, "BartAdvertisedHash");
++ const auto cachedHash = getMStringA(info->hContact, "BartAvatarHash");
++ if ((advertisedHash.IsEmpty() || advertisedHash == cachedHash) && KicqAvatarFileReady(file.c_str())) {
+   const wchar_t *ext = wcsrchr(file.c_str(), L'.');
+   info->format = PA_FORMAT_UNKNOWN;
+   if (ext) {
+@@ -2013,39 +2062,20 @@
+  // disappear between sessions. Re-request the last verified avatar hash,
+  // without forcing a contact-list/Extra Icons rebuild.
+  if (!m_bOnline) return GAIR_NOAVATAR;
+- const auto cachedHash = getMStringA(info->hContact, "BartAvatarHash");
+- const uint32_t avatarUin = getDword(info->hContact, "UIN");
+- if (avatarUin && cachedHash.GetLength() == 32) {
+-  bytes_t hash;
+-  hash.reserve(16);
+-  bool valid = true;
+-  for (int i = 0; i < 32; i += 2) {
+-   auto nibble = [](char c) -> int {
+-    if (c >= '0' && c <= '9') return c - '0';
+-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+-    return -1;
+-   };
+-   const int hi = nibble(cachedHash[i]);
+-   const int lo = nibble(cachedHash[i + 1]);
+-   if (hi < 0 || lo < 0) { valid = false; break; }
+-   hash.push_back(uint8_t((hi << 4) | lo));
+-  }
+-  if (valid) QueueBartAvatar(avatarUin, 1, hash);
+- }
+- // A queued request returns WAITFOR; on completion the BART worker broadcasts
+- // ACKTYPE_AVATAR for this contact, not a global Extra Icons refresh.
++ const auto peer = ContactId(info->hContact);
++ QueueCachedBartAvatar(info->hContact);
++ // Unknown hash: schedule discovery once per session, not on every AVS call.
++ ScheduleBartRefresh(peer);
+  mir_cslock lock(m_csBart);
+  for (const auto &pending : m_bartPending)
+-  if (FindContact((uint32_t)strtoul(pending.screenName.c_str(), nullptr, 10)) == info->hContact)
+-   return GAIR_WAITFOR;
++  if (pending.screenName == peer) return GAIR_WAITFOR;
+  return GAIR_NOAVATAR;
+ }
+ 
+ INT_PTR MIR_CDECL CKicqProto::OnAvatarCaps(WPARAM wParam, LPARAM lParam)
+ {
+  switch (wParam) {
+- case AF_ENABLED: return m_bOnline ? 1 : 0;
++ case AF_ENABLED: return 1;
+  case AF_MAXSIZE: if (lParam) { auto *size = reinterpret_cast<POINT *>(lParam); size->x = 128; size->y = 128; } return 0;
+  case AF_PROPORTION: return PIP_SQUARE;
+  case AF_MAXFILESIZE: return 7168;
+--- a/windows-xp-x86/0.96.8/KICQ/src/proto.h
++++ b/windows-xp-x86/0.96.8/KICQ/src/proto.h
+@@ -175,13 +175,21 @@
+ 	void HandleOwnIconSsiAck(int result, uint32_t reqId);
+ 	void HandleBartUploadReply(const bytes_t &payload);
+ 
+-	void QueueBartAvatar(uint32_t uin, uint16_t type, const bytes_t &hash);
++	void QueueBartAvatar(const std::string &name, uint16_t type, const bytes_t &hash);
++	void QueueBartAvatar(uint32_t uin, uint16_t type, const bytes_t &hash) { if (uin) QueueBartAvatar(std::to_string(uin), type, hash); }
++	// Session-local discovery queue; protected by m_csBart, drained by BOS thread.
++	std::set<std::string> m_bartRefreshPending, m_bartRefreshUrgent, m_bartRefreshDone;
++	time_t m_lastBartRefresh = 0;
++	mir_cs m_csBartLifecycle;
++	void ScheduleBartRefresh(const std::string &name, bool force = false);
++	void PumpBartRefresh(time_t now);
++	void QueueCachedBartAvatar(MCONTACT contact);
+ 	void FlushBartRequests(HNETLIBCONN conn, uint16_t &seq);
+ 	INT_PTR MIR_CDECL OnAvatarCaps(WPARAM, LPARAM);
+ 	INT_PTR MIR_CDECL OnGetAvatarInfo(WPARAM, LPARAM);
+ 	INT_PTR MIR_CDECL OnGetMyAvatar(WPARAM, LPARAM);
+ 	INT_PTR MIR_CDECL OnSetMyAvatar(WPARAM, LPARAM);
+-	void ObserveBartPresence(uint32_t uin, const bytes_t &raw);
++	void ObserveBartPresence(const std::string &name, const bytes_t &raw);
+ 	void HandleBartUserInfoUpdate(const bytes_t &body); // 01/0F, 02/06: avatar hash updates
+ 
+ 
+--- a/windows-xp-x86/0.96.8/KICQ/src/server.cpp
++++ b/windows-xp-x86/0.96.8/KICQ/src/server.cpp
+@@ -122,7 +122,17 @@
+ 	KicqXpTrace("ServerThread begin");
+ 	m_iLoginError = 0;
+ 	m_cookie.clear();
++	StopBart(); // previous BOS session may have left an exited BART worker
+ 	m_szUin = AccountId().c_str();
++	{
++		mir_cslock lock(m_csBart);
++		m_bartPending.clear();
++		m_bartOutgoing.clear();
++		m_bartRefreshPending.clear();
++		m_bartRefreshUrgent.clear();
++		m_bartRefreshDone.clear();
++		m_lastBartRefresh = 0;
++	}
+ 	{
+ 		mir_cslock lck(m_csRoster);
+ 		m_arUsers.destroy();
+@@ -304,6 +314,7 @@
+ void CKicqProto::CheckTimeouts()
+ {
+ 	time_t now = time(0);
++	if (m_bOnline) PumpBartRefresh(now);
+ 
+ 	if (m_bOnline && now - m_lastProbe >= KEEPALIVE_INTERVAL) {
+ 		// OSCAR transport keepalive is FLAP channel 5 (empty payload).
+@@ -556,6 +567,7 @@
+   m_hBartThread = nullptr;
+   debugLogA("BART: previous service worker finished; restarting");
+  }
++ mir_cslock lifecycle(m_csBartLifecycle);
+  if (!m_hBartThread && !m_bTerminated) {
+   InterlockedExchange(&m_bartStop, 0);
+   m_hBartThread = CreateThread(nullptr, 0, BartThreadEntry, this, 0, nullptr);
+@@ -640,6 +652,10 @@
+ 	else if (getByte(hContact, "Auth", 0) != 1)
+ 		setByte(hContact, "Auth", 1);
+ 
++	if (!bFromLogin && m_bOnline) {
++        if (bNew) { OscarWriter buddy; buddy.ascii8(name.c_str()); Send(OscarSnac(3, 4, 0, buddy.data())); }
++        ScheduleBartRefresh(name);
++    }
+ 	if (bTemporary) {
+         if (trace) KicqDiagTrace("ApplyRosterItem RETURN temporary");
+         return;
+@@ -822,6 +838,9 @@
+ 	if(getDword("UIN")) Send(OscarPackets::offlineMsgsRequest(atoi(m_szUin), m_seq));
+ 
+ 	m_bOnline = true;
++	// Include local contacts too, not just the online subset of the SSI roster.
++	// Discovery is deliberately queued, after the BOS client-ready sequence.
++	for (auto &contact : AccContacts()) ScheduleBartRefresh(ContactId(contact));
+ 	if (getByte("XStatusId", 0)) SendXStatus();
+ 	m_bProbeAnswered = true;
+ 	m_lastProbe = time(0);
+@@ -917,7 +936,6 @@
+ 			}
+ 			setWString(m_pendAdd.hContact, "SrvNick", m_pendAdd.name);
+  if(result==0)delSetting(m_pendAdd.hContact,"Auth");
+- if(!oscarid::uin(m_pendAdd.id)){OscarWriter buddy;buddy.ascii8(szUin);Send(OscarSnac(3,4,0,buddy.data()));}
+ 
+ 			if (result == 0x0E) {
+ 				// the contact requires authorization: add it flagged, then ask
+@@ -928,6 +946,10 @@
+ 				Send(OscarPackets::futureAuthGrant(szUin));
+ 				Send(OscarPackets::authRequest(szUin, TranslateT("Please authorize me")));
+ 			}
++			// Both numeric UIN and AIM SN need an explicit presence subscription.
++			OscarWriter buddy; buddy.ascii8(szUin);
++			Send(OscarSnac(3, 4, 0, buddy.data()));
++			ScheduleBartRefresh(m_pendAdd.id, true);
+ 			m_pendAdd.id.clear();
+ 		}
+ 		else {
+@@ -1099,10 +1121,16 @@
+ 	r.skip(2); // warning level
+ 	r.skip(2); // TLV count
+ 	OscarTlvList tlvs(r);
++ // Process offline BART metadata without marking the buddy online or
++ // modifying its fingerprint/X-status. AIM names use the same discovery path.
++ bart::UserInfoBart avatarInfo;
++ if (bart::parseUserInfoBart(data, avatarInfo)) {
++  if (avatarInfo.offline) { HandleUserOffline(data); return; }
++  for (const auto &raw : avatarInfo.metadata) ObserveBartPresence(name, raw);
++ }
+  if(!uin){MCONTACT c=0;{mir_cslock lock(m_csRoster);if(auto *u=FindUser(name)){u->bOnline=true;c=u->hContact;}}
+   if(c){const auto *flags=tlvs.find(1);setWord(c,"Status",flags && (flags->u16()&0x20)?ID_STATUS_AWAY:ID_STATUS_ONLINE);}return;}
+ 
+-	if (const auto *bartId = tlvs.find(0x1D)) if(uin) ObserveBartPresence(uin, bartId->data);
+ 
+     // Only trace changes for the target Jimm Multi UIN. A presence refresh can
+     // repeat hundreds of times; logging each repeat hid the relevant packets.
+@@ -1427,6 +1455,9 @@
+ 
+ void CKicqProto::HandleUserOffline(const bytes_t &data)
+ {
++ // Some servers attach full USERINFO to an offline notification; a bare
++ // screen name remains valid and does not erase the cached avatar.
++ HandleBartUserInfoUpdate(data);
+ 	OscarReader r(data);
+ 	const auto name = oscarid::key(r.ascii8());
+  if(name.empty()) return;
+@@ -2253,64 +2284,79 @@
+ // 02/06 may also include TLV 0x001D.  Do not alter status/X-status here.
+ void CKicqProto::HandleBartUserInfoUpdate(const bytes_t &body)
+ {
+- // userinfo = byte SN length + SN + word warning + word TLV count + TLVs
+- if (body.size() < 5) return;
+- const size_t nameLen = uint8_t(body[0]);
+- const size_t head = 1 + nameLen;
+- if (!nameLen || head + 4 > body.size()) return;
+- const bytes_t name = body.substr(1, nameLen);
+- if (name.find_first_not_of("0123456789") != bytes_t::npos) return;
+- const unsigned long parsed = strtoul(name.c_str(), nullptr, 10);
+- if (!parsed || parsed > 0xffffffffUL || std::to_string(parsed) != name) return;
+- size_t pos = head + 2; // warning level
+- const uint16_t count = (uint16_t(uint8_t(body[pos])) << 8) | uint8_t(body[pos + 1]);
+- pos += 2;
+- // Strict TLV framing: ignore truncated packets instead of interpreting
+- // arbitrary trailing bytes as an avatar ID.
+- for (unsigned i = 0; i < count; ++i) {
+-  if (body.size() - pos < 4) return;
+-  const unsigned type = (unsigned(uint8_t(body[pos])) << 8) | uint8_t(body[pos + 1]);
+-  const size_t length = (size_t(uint8_t(body[pos + 2])) << 8) | uint8_t(body[pos + 3]);
+-  pos += 4;
+-  if (body.size() - pos < length) return;
+-  if (type == 0x001D) {
+-   debugLogA("BART LIVE BETA2: userinfo avatar metadata for %lu (%u bytes)", parsed, (unsigned)length);
+-   ObserveBartPresence(uint32_t(parsed), body.substr(pos, length));
++ bart::UserInfoBart info;
++ if (!bart::parseUserInfoBart(body, info)) return;
++ const auto name = oscarid::key(info.name);
++ if (name.empty()) return;
++ for (const auto &raw : info.metadata) ObserveBartPresence(name, raw);
++}
++
++void CKicqProto::ScheduleBartRefresh(const std::string &name, bool force)
++{
++ if (name.empty() || name == AccountId() || !m_bOnline) return;
++ mir_cslock lock(m_csBart);
++ if (force) {
++  m_bartRefreshDone.erase(name);
++  m_bartRefreshPending.erase(name);
++  m_bartRefreshUrgent.insert(name);
++ } else if (!m_bartRefreshDone.count(name) && !m_bartRefreshUrgent.count(name))
++  m_bartRefreshPending.insert(name);
++}
++
++void CKicqProto::PumpBartRefresh(time_t now)
++{
++ std::vector<std::string> batch;
++ {
++  mir_cslock lock(m_csBart);
++  if (m_lastBartRefresh == now) return;
++  m_lastBartRefresh = now;
++  // Maximum four LOCATE requests per second, regardless of packet/UI activity.
++  while ((!m_bartRefreshUrgent.empty() || !m_bartRefreshPending.empty()) && batch.size() < 4) {
++   auto &queue = m_bartRefreshUrgent.empty() ? m_bartRefreshPending : m_bartRefreshUrgent;
++   auto it = queue.begin();
++   batch.push_back(*it);
++   m_bartRefreshDone.insert(*it);
++   queue.erase(it);
+   }
+-  pos += length;
++ }
++ for (const auto &name : batch) {
++  MCONTACT contact = FindContact(name);
++  if (!contact) continue;
++  // Recover an already advertised hash even if the server does not answer LOCATE.
++  QueueCachedBartAvatar(contact);
++  bytes_t query;
++  if (bart::makeUserInfoQuery(name, query)) {
++   Send(OscarSnac(2, 0x15, 0, query));
++   debugLogA("BART: requested avatar metadata for %s (LOCATE 02/15)", name.c_str());
++  }
+  }
+ }
+ 
+ // Requests stay queued until the BART connection can send them.
+-void CKicqProto::ObserveBartPresence(uint32_t uin, const bytes_t &raw)
+-{
+- if (!uin || raw.empty()) return;
+- MCONTACT contact = FindContact(uin);
++void CKicqProto::ObserveBartPresence(const std::string &name, const bytes_t &raw)
++{
++ if (name.empty() || raw.empty()) return;
++ MCONTACT contact = FindContact(name);
+  if (!contact) return;
+  size_t offset = 0;
+  while (offset < raw.size()) {
+   bart::AssetId id;
+   if (!bart::parseId(raw, offset, id)) {
+-   debugLogA("BART: invalid avatar metadata for %u", uin);
++   debugLogA("BART: invalid avatar metadata for %s", name.c_str());
+    return;
+   }
+   if (id.type != 1 || id.hash.empty() || id.hash.size() > 64) continue;
+   const std::string hash = bart::hexHash(id.hash);
+-  // The hash in the database denotes a *downloaded* image, not merely an
+-  // advertised one. Failed requests must be eligible for another attempt.
+-  const auto stored = getMStringA(contact, "BartAvatarHash");
+-  const auto path = getMStringW(contact, "BartAvatarPath");
+-  if (stored == hash.c_str() && !path.IsEmpty() &&
+-      GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) continue;
+-  debugLogA("BART: contact %u advertises avatar type=%u hash=%s", uin, (unsigned)id.type, hash.c_str());
+-  QueueBartAvatar(uin, id.type, id.hash);
+- }
+-}
+-
+-void CKicqProto::QueueBartAvatar(uint32_t uin, uint16_t type, const bytes_t &hash)
+-{
+- if (!uin || hash.empty() || hash.size() > 64) return;
+- const std::string name = std::to_string(uin);
++  db_set_w(contact, m_szModuleName, "BartAdvertisedType", id.type);
++  db_set_s(contact, m_szModuleName, "BartAdvertisedHash", hash.c_str());
++  // A real cache file is required even when the stored hash matches.
++  QueueCachedBartAvatar(contact);
++ }
++}
++
++void CKicqProto::QueueBartAvatar(const std::string &name, uint16_t type, const bytes_t &hash)
++{
++ if (name.empty() || hash.empty() || hash.size() > 64) return;
+  bart::AssetId id; id.type = type; id.hash = hash;
+  bytes_t payload;
+  if (!bart::makeDownload(name, id, payload)) return;
+@@ -2322,7 +2368,7 @@
+   if (item.screenName == name && item.hash == hash && item.type == type) return;
+  m_bartPending.push_back({name, hash, type});
+  m_bartOutgoing.push_back(wire);
+- debugLogA("BART: queued image request for %u (type %u)", uin, (unsigned)type);
++ debugLogA("BART: queued image request for %s (type %u)", name.c_str(), (unsigned)type);
+ }
+ 
+ void CKicqProto::FlushBartRequests(HNETLIBCONN conn, uint16_t &seq)
+@@ -2453,7 +2499,7 @@
+  {
+   mir_cslock lock(m_csBart);
+   for (auto it = m_bartPending.begin(); it != m_bartPending.end(); ++it) {
+-   if (it->screenName == reply.screenName && it->hash == reply.id.hash && it->type == reply.id.type) {
++   if (it->screenName == oscarid::key(reply.screenName) && it->hash == reply.id.hash && it->type == reply.id.type) {
+     m_bartPending.erase(it);
+     matched = true;
+     break;
+@@ -2499,10 +2545,12 @@
+   return;
+  }
+  // Store per-contact cache location. The Avatar API must subsequently use this file.
+- const unsigned long uin = strtoul(reply.screenName.c_str(), nullptr, 10);
+- if (uin && std::to_string(uin) == reply.screenName) {
+-  MCONTACT contact = FindContact((uint32_t)uin);
++ const auto peer = oscarid::key(reply.screenName);
++ if (!peer.empty()) {
++  MCONTACT contact = FindContact(peer);
+   if (contact) {
++   const auto current = getMStringA(contact, "BartAdvertisedHash");
++   if (!current.IsEmpty() && current != name.c_str()) return;
+    db_set_ws(contact, m_szModuleName, "BartAvatarPath", path.c_str());
+    db_set_s(contact, m_szModuleName, "BartAvatarHash", name.c_str());
+    db_set_ws(contact, "ContactPhoto", "File", path.c_str());
+@@ -2516,7 +2564,7 @@
+    // Synchronous ACK: Miranda AVS consumes the pointer during this call.
+    // A nullptr on SUCCESS means 'no avatar' and caused the empty UI.
+    ProtoBroadcastAck(contact, ACKTYPE_AVATAR, ACKRESULT_SUCCESS, (HANDLE)&info);
+-   debugLogA("BART: cached and announced contact %lu avatar", uin);
++   debugLogA("BART: cached and announced contact %s avatar", peer.c_str());
+   }
+  }
+ }
+@@ -2645,6 +2693,7 @@
+ 
+ void CKicqProto::StopBart()
+ {
++ mir_cslock lifecycle(m_csBartLifecycle);
+  InterlockedExchange(&m_bartStop, 1);
+  {
+   mir_cslock lock(m_csBart);

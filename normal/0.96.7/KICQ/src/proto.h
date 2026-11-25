@@ -1,4 +1,5 @@
-﻿/*
+#include "oscar_identity.h"
+/*
 Copyright (C) 2026 Miranda NG team
 
 This program is free software; you can redistribute it and/or
@@ -24,7 +25,7 @@ along with this program. If not, see <http://www.gnu.org/licenses/>.
 
 #define KICQ_DEFAULT_SERVER "195.66.114.37"
 #define KICQ_DEFAULT_PORT 5190
-#define KICQ_DEFAULT_FILE_PROXY "ars.mandarin.im"
+#define KICQ_DEFAULT_FILE_PROXY "" // No unrelated third-party ARS proxy by default; configure a compatible relay explicitly
 #define KICQ_DEFAULT_FILE_PROXY_PORT 5191
 
 // what the session knows about a server-side group
@@ -38,10 +39,11 @@ struct KicqGroup
 // per-contact state that lives only as long as the connection
 struct KicqUser
 {
-	KicqUser(uint32_t _uin, MCONTACT _hContact) :
-		uin(_uin), hContact(_hContact)
+	KicqUser(const std::string &id, MCONTACT _hContact) :
+		name(id), uin(oscarid::uin(id)), hContact(_hContact)
 	{}
 
+	std::string name;
 	uint32_t uin;
 	MCONTACT hContact;
 	int groupId = 0, ssiId = 0; // 0: not on the server-side list
@@ -52,7 +54,8 @@ struct KicqUser
 
 struct KicqPendingMsg
 {
-	uint32_t uin;
+	std::string name;
+	MCONTACT contact;
 	int seq;
 };
 
@@ -78,10 +81,16 @@ public:
         uint32_t redirectIp = 0;
         uint16_t redirectPort = 0;
         uint32_t uin = 0;
+        // OSCAR SNAC request id of the pending file invitation.
+        uint32_t offerRequestId = 0;
+        volatile LONG terminalAckSent = 0;
         SOCKET active = INVALID_SOCKET;
 		MCONTACT contact = 0;
 		std::wstring path, filename;
 		uint32_t size = 0;
+        DWORD lastUiTick = 0;
+        uint64_t lastUiBytes = 0;
+        uint64_t nextLogBytes = 8ULL * 1024ULL * 1024ULL;
 		std::array<unsigned char, 8> cookie{};
 		oft2::TcpListener listener;
 		volatile LONG cancelled = 0;
@@ -108,6 +117,7 @@ public:
 	mir_cs m_csFiles;
 	std::map<HANDLE, std::shared_ptr<OutgoingFile>> m_outgoingFiles;
 	static DWORD WINAPI OutgoingFileThread(LPVOID parameter);
+	bool StartDirectFileFallback(const std::shared_ptr<OutgoingFile> &file);
 	struct OutgoingThreadArgs { CKicqProto *proto; std::shared_ptr<OutgoingFile> file; };
 	void ShutdownOutgoingFiles();
 	bool FileProgress(OutgoingFile *file, uint64_t done);
@@ -165,17 +175,34 @@ private:
 	void HandleOwnIconSsiAck(int result, uint32_t reqId);
 	void HandleBartUploadReply(const bytes_t &payload);
 
-	void QueueBartAvatar(uint32_t uin, uint16_t type, const bytes_t &hash);
+	void QueueBartAvatar(const std::string &name, uint16_t type, const bytes_t &hash);
+	void QueueBartAvatar(uint32_t uin, uint16_t type, const bytes_t &hash) { if (uin) QueueBartAvatar(std::to_string(uin), type, hash); }
+	// Session-local discovery queue; protected by m_csBart, drained by BOS thread.
+	std::set<std::string> m_bartRefreshPending, m_bartRefreshUrgent, m_bartRefreshDone;
+	// One delayed retry for offline buddies lacking a known hash. Same BOS budget.
+ std::map<std::string, time_t> m_bartOfflineRetry;
+ time_t m_lastBartRefresh = 0;
+	mir_cs m_csBartLifecycle;
+	void ScheduleBartRefresh(const std::string &name, bool force = false);
+	void PumpBartRefresh(time_t now);
+	void QueueCachedBartAvatar(MCONTACT contact);
 	void FlushBartRequests(HNETLIBCONN conn, uint16_t &seq);
 	INT_PTR MIR_CDECL OnAvatarCaps(WPARAM, LPARAM);
 	INT_PTR MIR_CDECL OnGetAvatarInfo(WPARAM, LPARAM);
 	INT_PTR MIR_CDECL OnGetMyAvatar(WPARAM, LPARAM);
 	INT_PTR MIR_CDECL OnSetMyAvatar(WPARAM, LPARAM);
-	void ObserveBartPresence(uint32_t uin, const bytes_t &raw);
+	void ObserveBartPresence(const std::string &name, const bytes_t &raw);
+	void HandleBartUserInfoUpdate(const bytes_t &body); // 01/0F, 02/06: avatar hash updates
 
 
 	void HandleRoster(const bytes_t &data, int flags);
 	void FinishLogin();
+#if defined(_WIN32) && !defined(_WIN64)
+	// Network-thread only: one bounded resubscription after sign-on.
+	time_t m_x86PresenceRetryAt = 0;
+	void SendX86PresenceSubscriptions(bool missingOnly);
+#endif
+	void HandleBuddyPresence(const bytes_t &data, bool departed);
 	void HandleUserOnline(const bytes_t &data);
 	void HandleUserOffline(const bytes_t &data);
 	void HandleIncomingMessage(const bytes_t &data);
@@ -189,8 +216,12 @@ private:
 	void HandleYouWereAdded(const bytes_t &data);
 	void HandleSsiItem(const bytes_t &data, bool bDeleted);
 	void HandleSsiResult(const bytes_t &data, uint32_t reqId);
-	void DeliverMessage(uint32_t uin, const CMStringW &text, time_t when);
+	void DeliverMessage(const std::string &name, const CMStringW &text, time_t when);
 	void CheckTimeouts();
+	void __cdecl SearchScreenName(void *);
+	HGENMENU m_hRetryAuthMenu = nullptr;
+	INT_PTR __cdecl OnRetryAuth(WPARAM, LPARAM);
+	int __cdecl OnPreBuildContactMenu(WPARAM, LPARAM);
 
 	// roster
 	mir_cs m_csRoster;
@@ -198,20 +229,26 @@ private:
 	OBJLIST<KicqGroup> m_arGroups;
 	std::set<CMStringW> m_offlineSeen;
 
-	KicqUser* FindUser(uint32_t uin);
-	KicqUser* AddUser(uint32_t uin, MCONTACT hContact);
+	KicqUser* FindUser(const std::string &name);
+	KicqUser* FindUser(uint32_t uin) { return uin ? FindUser(std::to_string(uin)) : nullptr; }
+	KicqUser* AddUser(const std::string &name, MCONTACT hContact);
 	KicqGroup* FindGroup(int id);
 	KicqGroup* FindGroup(const wchar_t *name);
 	int NewSsiId();
-	MCONTACT FindContact(uint32_t uin);
-	MCONTACT CreateContact(uint32_t uin, bool bTemporary);
-	void ApplyRosterItem(uint32_t uin, int groupId, int ssiId, const OscarTlvList &tlvs, bool bFromLogin);
+	std::string ContactId(MCONTACT contact);
+	std::string AccountId();
+	MCONTACT FindContact(const std::string &name);
+	MCONTACT FindContact(uint32_t uin) { return uin ? FindContact(std::to_string(uin)) : 0; }
+	MCONTACT CreateContact(const std::string &name, bool bTemporary);
+	MCONTACT CreateContact(uint32_t uin, bool temporary) { return uin ? CreateContact(std::to_string(uin), temporary) : 0; }
+	void ApplyRosterItem(const std::string &name, int groupId, int ssiId, const OscarTlvList &tlvs, bool bFromLogin);
 	int ResolveGroupFor(MCONTACT hContact);
 
 	// one SSI edit at a time, like Jasmine: the result names only the request type
 	struct PendingSsi
 	{
 		uint32_t uin = 0;
+		std::string id;
 		CMStringW name;
 		int groupId = 0, ssiId = 0;
 		MCONTACT hContact = 0;

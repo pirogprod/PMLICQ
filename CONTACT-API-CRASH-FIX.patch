@@ -1,0 +1,122 @@
+--- a/normal/0.96.7/KICQ/CMakeLists.txt
++++ b/normal/0.96.7/KICQ/CMakeLists.txt
+@@ -1,4 +1,4 @@
+-# PMLICQ target: Miranda NG stable v0.96.7 (ebe074e).
++# PMLICQ target: Miranda NG stable 0.96.7 (including later stable builds).
+ # The plugin must be compiled INSIDE the matching Miranda NG source tree.
+ # Git-tag verification deliberately fails on an explicitly wrong tagged checkout.
+ find_package(Git QUIET)
+@@ -10,10 +10,10 @@
+   if(PMLICQ_TAG_STATUS EQUAL 0 AND NOT PMLICQ_TREE_TAG STREQUAL "v0.96.7")
+     message(FATAL_ERROR "PMLICQ: expected Miranda NG v0.96.7, found ${PMLICQ_TREE_TAG}")
+   elseif(NOT PMLICQ_TAG_STATUS EQUAL 0)
+-    message(WARNING "PMLICQ: Miranda NG checkout is not at an exact release tag; build against v0.96.7 (ebe074e)")
++    message(WARNING "PMLICQ: non-tagged checkout; use the exact revision of the installed Miranda 0.96.7 build (e.g. 495fea6 for #28846)")
+   endif()
+ else()
+-  message(STATUS "PMLICQ: unable to determine Miranda NG revision; make sure SDK/source is v0.96.7")
++  message(STATUS "PMLICQ: unable to determine Miranda NG revision; use the SDK/source matching the exact installed 0.96.7 build")
+ endif()
+ 
+ file(GLOB SOURCES "src/*.h" "src/*.cpp" "res/*.rc")
+--- a/normal/0.96.7/KICQ/README-PORT-0967-RU.md
++++ b/normal/0.96.7/KICQ/README-PORT-0967-RU.md
+@@ -7,11 +7,11 @@
+ 
+ Официальный тег: https://github.com/miranda-ng/miranda-ng/tree/v0.96.7
+ Официальный исходный архив: https://sourceforge.net/projects/miranda-ng.mirror/files/v0.96.7/
+-Ревизия релиза: `ebe074e`. НЕ используйте заголовки из ветки development (0.96.8).
++Ревизия первоначального релиза: `ebe074e`. Для более поздних сборок 0.96.7 берите точный commit установленной Miranda (например, `495fea6` для #28846), а не первоначальный тег. См. CONTACT-API-CRASH-FIX-RU.md в корне архива.
+ 
+ ## Сборка
+ 
+-1. Скачайте или клонируйте исходники **Miranda NG v0.96.7**, включая зависимости, необходимые для её сборки.
++1. Скачайте или клонируйте исходники **точной ревизии установленной Miranda NG 0.96.7**, включая зависимости, необходимые для её сборки.
+ 2. Разместите каталог `KICQ` из этого архива в `<Miranda-source>/plugins/KICQ` (не переименовывайте каталог без корректировки путей).
+ 3. Сгенерируйте решение штатным способом из исходников Miranda NG 0.96.7 и откройте его в Visual Studio.
+ 4. Соберите цель `KICQ` для той же архитектуры (Win32/x64), что и ваша установленная Miranda NG 0.96.7.
+--- a/normal/0.96.7/KICQ/src/proto.cpp
++++ b/normal/0.96.7/KICQ/src/proto.cpp
+@@ -270,12 +270,20 @@
+ 	if (hContact)
+ 		return hContact;
+ 
++	// The contact-creation ABI changed during the 0.96.7 stable cycle.
++	// Select it from the actual Miranda SDK, not the marketing version.
++#ifdef DBAC_NOTINLIST
++	hContact = db_add_contact(m_szModuleName, bTemporary ? DBAC_NOTINLIST : 0);
++	if (!hContact)
++		return 0;
++#else
+ 	hContact = db_add_contact();
+ 	if (!hContact)
+ 		return 0;
+ 	Proto_AddToContact(hContact, m_szModuleName);
+ 	if (bTemporary)
+ 		db_set_b(hContact, "CList", "NotOnList", 1);
++#endif
+ 	if(uin) setDword(hContact, "UIN", uin);
+  setString(hContact, "ScreenName", id.c_str());
+  if(!uin) setWString(hContact, "Nick", _A2T(id.c_str()).get());
+--- a/windows-xp-x86/0.96.7/KICQ/CMakeLists.txt
++++ b/windows-xp-x86/0.96.7/KICQ/CMakeLists.txt
+@@ -1,4 +1,4 @@
+-# PMLICQ target: Miranda NG stable v0.96.7 (ebe074e).
++# PMLICQ target: Miranda NG stable 0.96.7 (including later stable builds).
+ # The plugin must be compiled INSIDE the matching Miranda NG source tree.
+ # Git-tag verification deliberately fails on an explicitly wrong tagged checkout.
+ find_package(Git QUIET)
+@@ -10,10 +10,10 @@
+   if(PMLICQ_TAG_STATUS EQUAL 0 AND NOT PMLICQ_TREE_TAG STREQUAL "v0.96.7")
+     message(FATAL_ERROR "PMLICQ: expected Miranda NG v0.96.7, found ${PMLICQ_TREE_TAG}")
+   elseif(NOT PMLICQ_TAG_STATUS EQUAL 0)
+-    message(WARNING "PMLICQ: Miranda NG checkout is not at an exact release tag; build against v0.96.7 (ebe074e)")
++    message(WARNING "PMLICQ: non-tagged checkout; use the exact revision of the installed Miranda 0.96.7 build (e.g. 495fea6 for #28846)")
+   endif()
+ else()
+-  message(STATUS "PMLICQ: unable to determine Miranda NG revision; make sure SDK/source is v0.96.7")
++  message(STATUS "PMLICQ: unable to determine Miranda NG revision; use the SDK/source matching the exact installed 0.96.7 build")
+ endif()
+ 
+ file(GLOB SOURCES "src/*.h" "src/*.cpp" "res/*.rc")
+--- a/windows-xp-x86/0.96.7/KICQ/README-PORT-0967-RU.md
++++ b/windows-xp-x86/0.96.7/KICQ/README-PORT-0967-RU.md
+@@ -7,11 +7,11 @@
+ 
+ Официальный тег: https://github.com/miranda-ng/miranda-ng/tree/v0.96.7
+ Официальный исходный архив: https://sourceforge.net/projects/miranda-ng.mirror/files/v0.96.7/
+-Ревизия релиза: `ebe074e`. НЕ используйте заголовки из ветки development (0.96.8).
++Ревизия первоначального релиза: `ebe074e`. Для более поздних сборок 0.96.7 берите точный commit установленной Miranda (например, `495fea6` для #28846), а не первоначальный тег. См. CONTACT-API-CRASH-FIX-RU.md в корне архива.
+ 
+ ## Сборка
+ 
+-1. Скачайте или клонируйте исходники **Miranda NG v0.96.7**, включая зависимости, необходимые для её сборки.
++1. Скачайте или клонируйте исходники **точной ревизии установленной Miranda NG 0.96.7**, включая зависимости, необходимые для её сборки.
+ 2. Разместите каталог `KICQ` из этого архива в `<Miranda-source>/plugins/KICQ` (не переименовывайте каталог без корректировки путей).
+ 3. Сгенерируйте решение штатным способом из исходников Miranda NG 0.96.7 и откройте его в Visual Studio.
+ 4. Соберите цель `KICQ` для той же архитектуры (Win32/x64), что и ваша установленная Miranda NG 0.96.7.
+--- a/windows-xp-x86/0.96.7/KICQ/src/proto.cpp
++++ b/windows-xp-x86/0.96.7/KICQ/src/proto.cpp
+@@ -273,15 +273,22 @@
+     }
+ 
+ 	KicqDiagTrace("CreateContact BEFORE db_add_contact");
++	// Select the ABI from the SDK; later 0.96.7 builds require two arguments.
++#ifdef DBAC_NOTINLIST
++	hContact = db_add_contact(m_szModuleName, bTemporary ? DBAC_NOTINLIST : 0);
++#else
+ 	hContact = db_add_contact();
++#endif
+ 	KicqDiagTrace(hContact ? "CreateContact db_add_contact OK" : "ERROR CreateContact db_add_contact FAILED");
+ 	if (!hContact)
+ 		return 0;
++#ifndef DBAC_NOTINLIST
+ 	KicqDiagTrace("CreateContact BEFORE Proto_AddToContact");
+ 	Proto_AddToContact(hContact, m_szModuleName);
+ 	KicqDiagTrace("CreateContact AFTER Proto_AddToContact");
+ 	if (bTemporary)
+ 		db_set_b(hContact, "CList", "NotOnList", 1);
++#endif
+ 	const char *boundProto = Proto_GetBaseAccountName(hContact);
+     bool bound = boundProto && mir_strcmp(boundProto, m_szModuleName) == 0;
+     if (!bound) KicqDiagTrace("ERROR CreateContact ACCOUNT BINDING MISMATCH");

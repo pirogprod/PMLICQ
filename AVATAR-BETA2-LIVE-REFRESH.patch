@@ -1,0 +1,284 @@
+--- a/normal/0.96.7/KICQ/src/proto.h
++++ b/normal/0.96.7/KICQ/src/proto.h
+@@ -179,6 +179,7 @@
+ 	INT_PTR MIR_CDECL OnGetMyAvatar(WPARAM, LPARAM);
+ 	INT_PTR MIR_CDECL OnSetMyAvatar(WPARAM, LPARAM);
+ 	void ObserveBartPresence(uint32_t uin, const bytes_t &raw);
++	void HandleBartUserInfoUpdate(const bytes_t &body); // 01/0F, 02/06: avatar hash updates
+ 
+ 
+ 	void HandleRoster(const bytes_t &data, int flags);
+--- a/normal/0.96.7/KICQ/src/server.cpp
++++ b/normal/0.96.7/KICQ/src/server.cpp
+@@ -431,6 +431,7 @@
+ 	case 0x01:
+ 		switch (subtype) {
+ 		case 0x05: HandleBartRedirect(body); break;
++		case 0x0F: HandleBartUserInfoUpdate(body); break; // BOS userinfo refresh
+         case 0x21: { // Server requests own BART upload after SSI publication.
+          bart::AssetId id; size_t offset = 0;
+          if (bart::parseId(body, offset, id) && id.type == 1 && (id.flags & 0x40)) {
+@@ -447,6 +448,10 @@
+ 		case 0x18: Send(OscarPackets::ratesRequest()); break;
+ 		case 0x07: HandleRates(body); break;
+ 		}
++		break;
++
++	case 0x02:
++		if (subtype == 0x06) HandleBartUserInfoUpdate(body); // LOCATE reply
+ 		break;
+ 
+ 	case 0x03:
+@@ -2095,6 +2100,39 @@
+  return true;
+ }
+ 
++// Refresh BART metadata from the OSCAR userinfo block, not just BUDDY ARRIVED.
++// The server can notify an already-online buddy via OSERVICE 01/0F; LOCATE
++// 02/06 may also include TLV 0x001D.  Do not alter status/X-status here.
++void CKicqProto::HandleBartUserInfoUpdate(const bytes_t &body)
++{
++ // userinfo = byte SN length + SN + word warning + word TLV count + TLVs
++ if (body.size() < 5) return;
++ const size_t nameLen = uint8_t(body[0]);
++ const size_t head = 1 + nameLen;
++ if (!nameLen || head + 4 > body.size()) return;
++ const bytes_t name = body.substr(1, nameLen);
++ if (name.find_first_not_of("0123456789") != bytes_t::npos) return;
++ const unsigned long parsed = strtoul(name.c_str(), nullptr, 10);
++ if (!parsed || parsed > 0xffffffffUL || std::to_string(parsed) != name) return;
++ size_t pos = head + 2; // warning level
++ const uint16_t count = (uint16_t(uint8_t(body[pos])) << 8) | uint8_t(body[pos + 1]);
++ pos += 2;
++ // Strict TLV framing: ignore truncated packets instead of interpreting
++ // arbitrary trailing bytes as an avatar ID.
++ for (unsigned i = 0; i < count; ++i) {
++  if (body.size() - pos < 4) return;
++  const unsigned type = (unsigned(uint8_t(body[pos])) << 8) | uint8_t(body[pos + 1]);
++  const size_t length = (size_t(uint8_t(body[pos + 2])) << 8) | uint8_t(body[pos + 3]);
++  pos += 4;
++  if (body.size() - pos < length) return;
++  if (type == 0x001D) {
++   debugLogA("BART LIVE BETA2: userinfo avatar metadata for %lu (%u bytes)", parsed, (unsigned)length);
++   ObserveBartPresence(uint32_t(parsed), body.substr(pos, length));
++  }
++  pos += length;
++ }
++}
++
+ // Requests stay queued until the BART connection can send them.
+ void CKicqProto::ObserveBartPresence(uint32_t uin, const bytes_t &raw)
+ {
+--- a/normal/0.96.8/KICQ/src/proto.h
++++ b/normal/0.96.8/KICQ/src/proto.h
+@@ -179,6 +179,7 @@
+ 	INT_PTR MIR_CDECL OnGetMyAvatar(WPARAM, LPARAM);
+ 	INT_PTR MIR_CDECL OnSetMyAvatar(WPARAM, LPARAM);
+ 	void ObserveBartPresence(uint32_t uin, const bytes_t &raw);
++	void HandleBartUserInfoUpdate(const bytes_t &body); // 01/0F, 02/06: avatar hash updates
+ 
+ 
+ 	void HandleRoster(const bytes_t &data, int flags);
+--- a/normal/0.96.8/KICQ/src/server.cpp
++++ b/normal/0.96.8/KICQ/src/server.cpp
+@@ -431,6 +431,7 @@
+ 	case 0x01:
+ 		switch (subtype) {
+ 		case 0x05: HandleBartRedirect(body); break;
++		case 0x0F: HandleBartUserInfoUpdate(body); break; // BOS userinfo refresh
+         case 0x21: { // Server requests own BART upload after SSI publication.
+          bart::AssetId id; size_t offset = 0;
+          if (bart::parseId(body, offset, id) && id.type == 1 && (id.flags & 0x40)) {
+@@ -447,6 +448,10 @@
+ 		case 0x18: Send(OscarPackets::ratesRequest()); break;
+ 		case 0x07: HandleRates(body); break;
+ 		}
++		break;
++
++	case 0x02:
++		if (subtype == 0x06) HandleBartUserInfoUpdate(body); // LOCATE reply
+ 		break;
+ 
+ 	case 0x03:
+@@ -2095,6 +2100,39 @@
+  return true;
+ }
+ 
++// Refresh BART metadata from the OSCAR userinfo block, not just BUDDY ARRIVED.
++// The server can notify an already-online buddy via OSERVICE 01/0F; LOCATE
++// 02/06 may also include TLV 0x001D.  Do not alter status/X-status here.
++void CKicqProto::HandleBartUserInfoUpdate(const bytes_t &body)
++{
++ // userinfo = byte SN length + SN + word warning + word TLV count + TLVs
++ if (body.size() < 5) return;
++ const size_t nameLen = uint8_t(body[0]);
++ const size_t head = 1 + nameLen;
++ if (!nameLen || head + 4 > body.size()) return;
++ const bytes_t name = body.substr(1, nameLen);
++ if (name.find_first_not_of("0123456789") != bytes_t::npos) return;
++ const unsigned long parsed = strtoul(name.c_str(), nullptr, 10);
++ if (!parsed || parsed > 0xffffffffUL || std::to_string(parsed) != name) return;
++ size_t pos = head + 2; // warning level
++ const uint16_t count = (uint16_t(uint8_t(body[pos])) << 8) | uint8_t(body[pos + 1]);
++ pos += 2;
++ // Strict TLV framing: ignore truncated packets instead of interpreting
++ // arbitrary trailing bytes as an avatar ID.
++ for (unsigned i = 0; i < count; ++i) {
++  if (body.size() - pos < 4) return;
++  const unsigned type = (unsigned(uint8_t(body[pos])) << 8) | uint8_t(body[pos + 1]);
++  const size_t length = (size_t(uint8_t(body[pos + 2])) << 8) | uint8_t(body[pos + 3]);
++  pos += 4;
++  if (body.size() - pos < length) return;
++  if (type == 0x001D) {
++   debugLogA("BART LIVE BETA2: userinfo avatar metadata for %lu (%u bytes)", parsed, (unsigned)length);
++   ObserveBartPresence(uint32_t(parsed), body.substr(pos, length));
++  }
++  pos += length;
++ }
++}
++
+ // Requests stay queued until the BART connection can send them.
+ void CKicqProto::ObserveBartPresence(uint32_t uin, const bytes_t &raw)
+ {
+--- a/windows-xp-x86/0.96.7/KICQ/src/proto.h
++++ b/windows-xp-x86/0.96.7/KICQ/src/proto.h
+@@ -179,6 +179,7 @@
+ 	INT_PTR MIR_CDECL OnGetMyAvatar(WPARAM, LPARAM);
+ 	INT_PTR MIR_CDECL OnSetMyAvatar(WPARAM, LPARAM);
+ 	void ObserveBartPresence(uint32_t uin, const bytes_t &raw);
++	void HandleBartUserInfoUpdate(const bytes_t &body); // 01/0F, 02/06: avatar hash updates
+ 
+ 
+ 	void HandleRoster(const bytes_t &data, int flags);
+--- a/windows-xp-x86/0.96.7/KICQ/src/server.cpp
++++ b/windows-xp-x86/0.96.7/KICQ/src/server.cpp
+@@ -461,6 +461,7 @@
+ 	case 0x01:
+ 		switch (subtype) {
+ 		case 0x05: HandleBartRedirect(body); break;
++		case 0x0F: HandleBartUserInfoUpdate(body); break; // BOS userinfo refresh
+         case 0x21: { // Server requests own BART upload after SSI publication.
+          bart::AssetId id; size_t offset = 0;
+          if (bart::parseId(body, offset, id) && id.type == 1 && (id.flags & 0x40)) {
+@@ -477,6 +478,10 @@
+ 		case 0x18: Send(OscarPackets::ratesRequest()); break;
+ 		case 0x07: HandleRates(body); break;
+ 		}
++		break;
++
++	case 0x02:
++		if (subtype == 0x06) HandleBartUserInfoUpdate(body); // LOCATE reply
+ 		break;
+ 
+ 	case 0x03:
+@@ -2220,6 +2225,39 @@
+  return true;
+ }
+ 
++// Refresh BART metadata from the OSCAR userinfo block, not just BUDDY ARRIVED.
++// The server can notify an already-online buddy via OSERVICE 01/0F; LOCATE
++// 02/06 may also include TLV 0x001D.  Do not alter status/X-status here.
++void CKicqProto::HandleBartUserInfoUpdate(const bytes_t &body)
++{
++ // userinfo = byte SN length + SN + word warning + word TLV count + TLVs
++ if (body.size() < 5) return;
++ const size_t nameLen = uint8_t(body[0]);
++ const size_t head = 1 + nameLen;
++ if (!nameLen || head + 4 > body.size()) return;
++ const bytes_t name = body.substr(1, nameLen);
++ if (name.find_first_not_of("0123456789") != bytes_t::npos) return;
++ const unsigned long parsed = strtoul(name.c_str(), nullptr, 10);
++ if (!parsed || parsed > 0xffffffffUL || std::to_string(parsed) != name) return;
++ size_t pos = head + 2; // warning level
++ const uint16_t count = (uint16_t(uint8_t(body[pos])) << 8) | uint8_t(body[pos + 1]);
++ pos += 2;
++ // Strict TLV framing: ignore truncated packets instead of interpreting
++ // arbitrary trailing bytes as an avatar ID.
++ for (unsigned i = 0; i < count; ++i) {
++  if (body.size() - pos < 4) return;
++  const unsigned type = (unsigned(uint8_t(body[pos])) << 8) | uint8_t(body[pos + 1]);
++  const size_t length = (size_t(uint8_t(body[pos + 2])) << 8) | uint8_t(body[pos + 3]);
++  pos += 4;
++  if (body.size() - pos < length) return;
++  if (type == 0x001D) {
++   debugLogA("BART LIVE BETA2: userinfo avatar metadata for %lu (%u bytes)", parsed, (unsigned)length);
++   ObserveBartPresence(uint32_t(parsed), body.substr(pos, length));
++  }
++  pos += length;
++ }
++}
++
+ // Requests stay queued until the BART connection can send them.
+ void CKicqProto::ObserveBartPresence(uint32_t uin, const bytes_t &raw)
+ {
+--- a/windows-xp-x86/0.96.8/KICQ/src/proto.h
++++ b/windows-xp-x86/0.96.8/KICQ/src/proto.h
+@@ -179,6 +179,7 @@
+ 	INT_PTR MIR_CDECL OnGetMyAvatar(WPARAM, LPARAM);
+ 	INT_PTR MIR_CDECL OnSetMyAvatar(WPARAM, LPARAM);
+ 	void ObserveBartPresence(uint32_t uin, const bytes_t &raw);
++	void HandleBartUserInfoUpdate(const bytes_t &body); // 01/0F, 02/06: avatar hash updates
+ 
+ 
+ 	void HandleRoster(const bytes_t &data, int flags);
+--- a/windows-xp-x86/0.96.8/KICQ/src/server.cpp
++++ b/windows-xp-x86/0.96.8/KICQ/src/server.cpp
+@@ -461,6 +461,7 @@
+ 	case 0x01:
+ 		switch (subtype) {
+ 		case 0x05: HandleBartRedirect(body); break;
++		case 0x0F: HandleBartUserInfoUpdate(body); break; // BOS userinfo refresh
+         case 0x21: { // Server requests own BART upload after SSI publication.
+          bart::AssetId id; size_t offset = 0;
+          if (bart::parseId(body, offset, id) && id.type == 1 && (id.flags & 0x40)) {
+@@ -477,6 +478,10 @@
+ 		case 0x18: Send(OscarPackets::ratesRequest()); break;
+ 		case 0x07: HandleRates(body); break;
+ 		}
++		break;
++
++	case 0x02:
++		if (subtype == 0x06) HandleBartUserInfoUpdate(body); // LOCATE reply
+ 		break;
+ 
+ 	case 0x03:
+@@ -2220,6 +2225,39 @@
+  return true;
+ }
+ 
++// Refresh BART metadata from the OSCAR userinfo block, not just BUDDY ARRIVED.
++// The server can notify an already-online buddy via OSERVICE 01/0F; LOCATE
++// 02/06 may also include TLV 0x001D.  Do not alter status/X-status here.
++void CKicqProto::HandleBartUserInfoUpdate(const bytes_t &body)
++{
++ // userinfo = byte SN length + SN + word warning + word TLV count + TLVs
++ if (body.size() < 5) return;
++ const size_t nameLen = uint8_t(body[0]);
++ const size_t head = 1 + nameLen;
++ if (!nameLen || head + 4 > body.size()) return;
++ const bytes_t name = body.substr(1, nameLen);
++ if (name.find_first_not_of("0123456789") != bytes_t::npos) return;
++ const unsigned long parsed = strtoul(name.c_str(), nullptr, 10);
++ if (!parsed || parsed > 0xffffffffUL || std::to_string(parsed) != name) return;
++ size_t pos = head + 2; // warning level
++ const uint16_t count = (uint16_t(uint8_t(body[pos])) << 8) | uint8_t(body[pos + 1]);
++ pos += 2;
++ // Strict TLV framing: ignore truncated packets instead of interpreting
++ // arbitrary trailing bytes as an avatar ID.
++ for (unsigned i = 0; i < count; ++i) {
++  if (body.size() - pos < 4) return;
++  const unsigned type = (unsigned(uint8_t(body[pos])) << 8) | uint8_t(body[pos + 1]);
++  const size_t length = (size_t(uint8_t(body[pos + 2])) << 8) | uint8_t(body[pos + 3]);
++  pos += 4;
++  if (body.size() - pos < length) return;
++  if (type == 0x001D) {
++   debugLogA("BART LIVE BETA2: userinfo avatar metadata for %lu (%u bytes)", parsed, (unsigned)length);
++   ObserveBartPresence(uint32_t(parsed), body.substr(pos, length));
++  }
++  pos += length;
++ }
++}
++
+ // Requests stay queued until the BART connection can send them.
+ void CKicqProto::ObserveBartPresence(uint32_t uin, const bytes_t &raw)
+ {

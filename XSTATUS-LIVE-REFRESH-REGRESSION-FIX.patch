@@ -1,0 +1,160 @@
+--- a/normal/0.96.7/KICQ/src/server.cpp
++++ b/normal/0.96.7/KICQ/src/server.cpp
+@@ -1024,7 +1024,6 @@
+ 	MCONTACT hContact;
+ 	bool bFull;
+ 	bool xstatusChanged = false;
+-	bool clientIconChanged = false;
+ 	{
+ 		mir_cslock lck(m_csRoster);
+ 		auto *pUser = FindUser(uin);
+@@ -1159,7 +1158,6 @@
+ 				ptrA previous(db_get_sa(hContact, m_szModuleName, "MirVer"));
+ 				if (!previous || mir_strcmp(previous, szMirVer.c_str())) {
+ 					setString(hContact, "MirVer", szMirVer);
+-					clientIconChanged = true;
+ 				}
+ 				if (!getByte(hContact, "ClientDetectKnown", 0))
+ 					setByte(hContact, "ClientDetectKnown", 1);
+@@ -1171,8 +1169,7 @@
+ 					ptrA previous(db_get_sa(hContact, m_szModuleName, "MirVer"));
+ 					if (!previous || mir_strcmp(previous, unknown)) {
+ 						setString(hContact, "MirVer", unknown);
+-						clientIconChanged = true;
+-					}
++						}
+ 				}
+ 			}
+ 			if (caps) {
+@@ -1235,10 +1232,8 @@
+ 	const WORD newStatus = IcqToMirandaStatus(iStatus);
+ 	if (getWord(hContact, "Status", ID_STATUS_OFFLINE) != newStatus)
+ 		setWord(hContact, "Status", newStatus);
+-	// Both calls apply pre-registered icon handles to this contact only.
++	// Refresh X-status independently of client detection (MirVer).
+ 	// Never rebuild all ExtraIcons for a repeated presence notification.
+-	if (clientIconChanged)
+-
+ 	if (xstatusChanged)
+ 		KicqRefreshSingleXStatus(hContact);
+     // QIP can change the X-status title/description without changing its GUID.
+--- a/normal/0.96.8/KICQ/src/server.cpp
++++ b/normal/0.96.8/KICQ/src/server.cpp
+@@ -1024,7 +1024,6 @@
+ 	MCONTACT hContact;
+ 	bool bFull;
+ 	bool xstatusChanged = false;
+-	bool clientIconChanged = false;
+ 	{
+ 		mir_cslock lck(m_csRoster);
+ 		auto *pUser = FindUser(uin);
+@@ -1159,7 +1158,6 @@
+ 				ptrA previous(db_get_sa(hContact, m_szModuleName, "MirVer"));
+ 				if (!previous || mir_strcmp(previous, szMirVer.c_str())) {
+ 					setString(hContact, "MirVer", szMirVer);
+-					clientIconChanged = true;
+ 				}
+ 				if (!getByte(hContact, "ClientDetectKnown", 0))
+ 					setByte(hContact, "ClientDetectKnown", 1);
+@@ -1171,8 +1169,7 @@
+ 					ptrA previous(db_get_sa(hContact, m_szModuleName, "MirVer"));
+ 					if (!previous || mir_strcmp(previous, unknown)) {
+ 						setString(hContact, "MirVer", unknown);
+-						clientIconChanged = true;
+-					}
++						}
+ 				}
+ 			}
+ 			if (caps) {
+@@ -1235,10 +1232,8 @@
+ 	const WORD newStatus = IcqToMirandaStatus(iStatus);
+ 	if (getWord(hContact, "Status", ID_STATUS_OFFLINE) != newStatus)
+ 		setWord(hContact, "Status", newStatus);
+-	// Both calls apply pre-registered icon handles to this contact only.
++	// Refresh X-status independently of client detection (MirVer).
+ 	// Never rebuild all ExtraIcons for a repeated presence notification.
+-	if (clientIconChanged)
+-
+ 	if (xstatusChanged)
+ 		KicqRefreshSingleXStatus(hContact);
+     // QIP can change the X-status title/description without changing its GUID.
+--- a/windows-xp-x86/0.96.7/KICQ/src/server.cpp
++++ b/windows-xp-x86/0.96.7/KICQ/src/server.cpp
+@@ -1133,7 +1133,6 @@
+ 	MCONTACT hContact;
+ 	bool bFull;
+ 	bool xstatusChanged = false;
+-	bool clientIconChanged = false;
+ 	{
+ 		mir_cslock lck(m_csRoster);
+ 		auto *pUser = FindUser(uin);
+@@ -1270,7 +1269,6 @@
+ 				ptrA previous(db_get_sa(hContact, m_szModuleName, "MirVer"));
+ 				if (!previous || mir_strcmp(previous, szMirVer.c_str())) {
+ 					setString(hContact, "MirVer", szMirVer);
+-					clientIconChanged = true;
+ 				}
+ 				setByte(hContact, "ClientDetectKnown", 1);
+ 			}
+@@ -1281,8 +1279,7 @@
+ 					ptrA previous(db_get_sa(hContact, m_szModuleName, "MirVer"));
+ 					if (!previous || mir_strcmp(previous, unknown)) {
+ 						setString(hContact, "MirVer", unknown);
+-						clientIconChanged = true;
+-					}
++						}
+ 				}
+ 			}
+ 			if (caps) {
+@@ -1347,10 +1344,8 @@
+ 	const bool presenceChanged = getWord(hContact, "Status", ID_STATUS_OFFLINE) != newStatus;
+ 	if (presenceChanged)
+ 		setWord(hContact, "Status", newStatus);
+-	// Refresh only when the visible client name has actually changed.
++	// Update X-status independently of MirVer / Fingerprint.
+ 	// Keep ExtraIcons calls outside the roster critical section.
+-	if (clientIconChanged)
+-
+ 	// Apply the registered extra icon after releasing the roster lock.
+ 	// A short capability update must not clear an existing X-status.
+ 	if (xstatusChanged || presenceChanged)
+--- a/windows-xp-x86/0.96.8/KICQ/src/server.cpp
++++ b/windows-xp-x86/0.96.8/KICQ/src/server.cpp
+@@ -1133,7 +1133,6 @@
+ 	MCONTACT hContact;
+ 	bool bFull;
+ 	bool xstatusChanged = false;
+-	bool clientIconChanged = false;
+ 	{
+ 		mir_cslock lck(m_csRoster);
+ 		auto *pUser = FindUser(uin);
+@@ -1270,7 +1269,6 @@
+ 				ptrA previous(db_get_sa(hContact, m_szModuleName, "MirVer"));
+ 				if (!previous || mir_strcmp(previous, szMirVer.c_str())) {
+ 					setString(hContact, "MirVer", szMirVer);
+-					clientIconChanged = true;
+ 				}
+ 				setByte(hContact, "ClientDetectKnown", 1);
+ 			}
+@@ -1281,8 +1279,7 @@
+ 					ptrA previous(db_get_sa(hContact, m_szModuleName, "MirVer"));
+ 					if (!previous || mir_strcmp(previous, unknown)) {
+ 						setString(hContact, "MirVer", unknown);
+-						clientIconChanged = true;
+-					}
++						}
+ 				}
+ 			}
+ 			if (caps) {
+@@ -1347,10 +1344,8 @@
+ 	const bool presenceChanged = getWord(hContact, "Status", ID_STATUS_OFFLINE) != newStatus;
+ 	if (presenceChanged)
+ 		setWord(hContact, "Status", newStatus);
+-	// Refresh only when the visible client name has actually changed.
++	// Update X-status independently of MirVer / Fingerprint.
+ 	// Keep ExtraIcons calls outside the roster critical section.
+-	if (clientIconChanged)
+-
+ 	// Apply the registered extra icon after releasing the roster lock.
+ 	// A short capability update must not clear an existing X-status.
+ 	if (xstatusChanged || presenceChanged)

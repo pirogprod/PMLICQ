@@ -1,0 +1,62 @@
+[
+  {
+    "path": "normal/0.96.7/KICQ/src/proto.cpp",
+    "before_sha256": "18f0fdd9c0ec7d6dbbf0a2b8f03dc9144f99db4aeaa7fb5b41a5a155b944bd1f",
+    "after_sha256": "6d7b237bba66d74e010cee6d142503459f945a1dd34931c67958e189e32ebb01"
+  },
+  {
+    "path": "normal/0.96.7/KICQ/src/proto.h",
+    "before_sha256": "c1353fbe9bcfec798aa5e68204e36a336b144679c213224580843e5f916abd39",
+    "after_sha256": "7407f79596ca22bdfa0e73527d2d8c3534674c54e74ce202a4a2bc9cc1df15b0"
+  },
+  {
+    "path": "normal/0.96.7/KICQ/src/ars_proxy.h",
+    "before_sha256": "d5b4f171e967e8008ef5272d5021ded97267a8ab6e8329223faf9a9ecbdcd8b5",
+    "after_sha256": "99d99a892673c0e32107c51755ff2e68c1bc332faf70edb89901c35215e392bb"
+  },
+  {
+    "path": "normal/0.96.8/KICQ/src/proto.cpp",
+    "before_sha256": "2f4c9fb03c9941196cf5a94253ec766dd3b04527671bb6d8c5be73ad4f8a992b",
+    "after_sha256": "267ef5a412659101f8b6a428e01e136cad4db049ae62e8bc790f1055938c0b96"
+  },
+  {
+    "path": "normal/0.96.8/KICQ/src/proto.h",
+    "before_sha256": "c1353fbe9bcfec798aa5e68204e36a336b144679c213224580843e5f916abd39",
+    "after_sha256": "7407f79596ca22bdfa0e73527d2d8c3534674c54e74ce202a4a2bc9cc1df15b0"
+  },
+  {
+    "path": "normal/0.96.8/KICQ/src/ars_proxy.h",
+    "before_sha256": "d5b4f171e967e8008ef5272d5021ded97267a8ab6e8329223faf9a9ecbdcd8b5",
+    "after_sha256": "99d99a892673c0e32107c51755ff2e68c1bc332faf70edb89901c35215e392bb"
+  },
+  {
+    "path": "windows-xp-x86/0.96.7/KICQ/src/proto.cpp",
+    "before_sha256": "5a48624a3c9f03f0c2fbe101761f5ff2a20ff7145f544634517024701fd0fc65",
+    "after_sha256": "e841319e4b754e70386ce95fd61fee5f842a70c80bafd4373efdb99fa4805854"
+  },
+  {
+    "path": "windows-xp-x86/0.96.7/KICQ/src/proto.h",
+    "before_sha256": "d54ce2641f36abbf30937971ff908cd2e922a4a22271687342a4e03b70939391",
+    "after_sha256": "6c1b7d84bb5867d66cf97433210b1fc719ba04e2065cec3bc9686d22e975e781"
+  },
+  {
+    "path": "windows-xp-x86/0.96.7/KICQ/src/ars_proxy.h",
+    "before_sha256": "d5b4f171e967e8008ef5272d5021ded97267a8ab6e8329223faf9a9ecbdcd8b5",
+    "after_sha256": "99d99a892673c0e32107c51755ff2e68c1bc332faf70edb89901c35215e392bb"
+  },
+  {
+    "path": "windows-xp-x86/0.96.8/KICQ/src/proto.cpp",
+    "before_sha256": "4465255e73dfdc4e95b2480f3d77d7708dbb334cb1211e9dba50bf0de442f73b",
+    "after_sha256": "acedf3b9cb6f032617f329c3981c219d837d16c8684c8f727389480cb68b787b"
+  },
+  {
+    "path": "windows-xp-x86/0.96.8/KICQ/src/proto.h",
+    "before_sha256": "d54ce2641f36abbf30937971ff908cd2e922a4a22271687342a4e03b70939391",
+    "after_sha256": "6c1b7d84bb5867d66cf97433210b1fc719ba04e2065cec3bc9686d22e975e781"
+  },
+  {
+    "path": "windows-xp-x86/0.96.8/KICQ/src/ars_proxy.h",
+    "before_sha256": "d5b4f171e967e8008ef5272d5021ded97267a8ab6e8329223faf9a9ecbdcd8b5",
+    "after_sha256": "99d99a892673c0e32107c51755ff2e68c1bc332faf70edb89901c35215e392bb"
+  }
+]

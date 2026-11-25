@@ -1,0 +1,1010 @@
+--- /dev/null
++++ b/AVATAR-BETA4-OFFLINE-RU.md
+@@ -0,0 +1,43 @@
++# PMLICQ V9 — Avatar Beta 4 (на базе Crash Fix 3)
++
++Основа: `PMLICQ_V9_AVATAR_BETA3_CONTACT_API_CRASH_FIX3_SOURCE.zip`, который уже работал у пользователя с Miranda NG 0.96.7 #28846 x64, UIN и AIM SN. Все четыре ветки получили одинаковые исправления обнаружения аватаров. Версия обычной 0.96.7 повышена с 0.1.0.3 до 0.1.0.4, остальные номера оставлены прежними.
++
++## Изменения
++
++* BUDDY ARRIVED/DEPARTED (03/0B, 03/0C) могут содержать несколько последовательных USERINFO. Раньше в обработчик передавался весь пакет, но извлекался только первый контакт. Теперь при строго корректной структуре записи разделяются и каждая передаётся в существующий обработчик. Одиночные сообщения, устаревшие name-only DEPART и нестандартные/усечённые пакеты сохраняют прежний путь. Не создаются новые контакты из метаданных аватаров.
++* Сохранены флаги BUDDY RIGHTS `0x0007`, запрос LOCATE 02/15 после входа и при добавлении, приоритет новых контактов, восстановление известного хеша из кэша. Если офлайн-контакт по-прежнему не имеет ни известного, ни кэшированного хеша, через 5 секунд (или позже в большой очереди) допускается один дополнительный запрос. Для UIN — старый LOCATE 02/05 (тип 2, короткая информация), для AIM — повтор 02/15. Это совместимый по формату, но не гарантированный по серверной поддержке резервный путь. Повтор отменяется при получении хеша, переходе контакта онлайн или удалении контакта. Нет бесконечного опроса; максимум 4 запроса в одном секундном интервале суммарно, включая старую очередь. При новой сессии состояние очищается. При добавлении принудительная очередь сохраняется.
++* LOCATE 02/06 и 02/01 теперь логируются с количеством найденных ID аватаров или кодом серверной ошибки. Ответы на запросы метаданных по-прежнему не меняют статус, X-status или профиль.
++
++Не изменены: `proto.cpp` (включая переходник ABI Crash Fix 3, AVS, собственный аватар и добавление контакта), `oscar.cpp`, BART 10/06 и 10/07, запись картинок и ContactPhoto/File, уведомление ACKTYPE_AVATAR, BART worker, SSI-публикация собственного аватара, AIM/UIN, ARS/OFT2, X-status, Fingerprint, авторизация. Код существующих обработчиков одиночного присутствия сохранён побайтно. PMLMRIM не изменялся. Diff к рабочей версии: `AVATAR-BETA4-OFFLINE.patch`.
++
++## Проверки
++
++Выполнено 26 автономных запусков с GCC C++17: 4 новых теста пакетного парсера, 4 теста фактических функций очереди/диспетчера с заглушками Miranda, 4 прежних теста BART/LOCATE, 4 теста ICQ/AIM идентификаторов, 8 тестов API создания контактов, 1 тест X-status, 1 тест SSI собственного аватара. Проверено сравнение исходников неизменённых критичных функций во всех четырёх ветках. Полная Windows DLL, MSVC и реальный сервер не тестировались.
++
++Команды из корня архива (Linux, g++):
++
++```
++python tests/test_avatar_offline_beta4_queue.py
++for d in */*/KICQ/src; do
++  for t in tests/avatar_offline_beta4_test.cpp tests/avatar_offline_test.cpp tests/identity_test.cpp; do
++    g++ -std=c++17 -Wall -Wextra -Werror -I"$d" "$t" -o /tmp/kicq-test && /tmp/kicq-test || exit 1
++  done
++done
++python tests/test_contact_api.py
++python tests/test_live_mood.py
++g++ -std=c++17 -Wall -Wextra -Werror test_avatar_ssi.cpp -o /tmp/kicq-ssi && /tmp/kicq-ssi
++```
++
++## Сборка и проверка на сервере
++
++1. Сохранить рабочую DLL 0.1.0.3 и резервную копию профиля. Для #28846 x64 заменить каталог `plugins/KICQ` на `normal/0.96.7/KICQ` из данного архива. Clean -> Rebuild, Release x64, тот же SDK, на котором собирался Crash Fix 3. Установить DLL 0.1.0.4 при закрытой Miranda. Не менять контактный ABI/флаги сборки.
++2. На копии профиля проверить холодное получение аватара офлайн-контакта (который ещё не был онлайн с этим профилем, но на сервере действительно имеет картинку). Дождаться первичной очереди и дополнительного запроса. Отдельно проверить уже имеющийся кэш, онлайн-контакт, смену аватара онлайн, добавление нового онлайн/офлайн UIN и AIM SN, собственный аватар. Не удалять рабочий кэш и контакты из основного профиля ради теста.
++3. Если неизвестная офлайн-аватарка не получена, записать Netlib log получателя с момента входа до завершения очереди. Искомые строки:
++   * `BART: requested avatar metadata` / `BART: offline metadata retry`
++   * `BART: LOCATE 02/06 for ... icon IDs=...` / `BART: LOCATE error 02/01`
++   * `BART: received ... batched BUDDY records`
++   * `BART: queued image request` / `BART: cached and announced` / `BART: image request failed`
++
++Если оба запроса возвращают ошибку, нет ни одного ID аватара в ответах и нет уведомлений 03/0B или 03/0C с TLV 001D, неизвестный хеш клиенту неоткуда взять. Нельзя гарантировать холодную загрузку офлайн без поддержки сервера. Запрос BART 10/06 требует идентификатор аватара; не нужно подставлять фиктивные хеши или обращаться к недокументированным API. Приложенный ранее серверный пример `bart.rs` также требует действительный хеш. Его не изменяли. При такой диагностике понадобится серверный лог/код формирования USERINFO и presence, а не очередная переработка исправного скачивания BART. Перед отправкой логов удалить пароли, cookies и токены; не прикладывать профиль.
++
++Справка: https://devinsmith.net/backups/OSCAR/ (BUDDY flags и batched USERINFO); https://wiki.nina.chat/wiki/Protocols/OSCAR/SNAC/LOCATE_USER_INFO_QUERY2 ; https://wiki.nina.chat/wiki/Protocols/OSCAR/SNAC/LOCATE_USER_INFO_QUERY ; https://wiki.nina.chat/wiki/Protocols/OSCAR/SNAC/LOCATE_USER_INFO_REPLY .
+--- a/normal/0.96.7/KICQ/src/bart_codec.h
++++ b/normal/0.96.7/KICQ/src/bart_codec.h
+@@ -53,8 +53,8 @@
+ };
+ // USERINFO can be followed by unrelated LOCATE response TLVs. Only consume
+ // the counted presence TLVs, and commit nothing if any counted TLV is truncated.
+-inline bool parseUserInfoBart(const Bytes &b, UserInfoBart &out) {
+- size_t p=0; uint8_t n; uint16_t warning, count;
++inline bool parseUserInfoBartAt(const Bytes &b, size_t &offset, UserInfoBart &out) {
++ size_t p=offset; uint8_t n; uint16_t warning, count;
+  UserInfoBart r;
+  if (!get8(b,p,n) || !n || b.size()-p<n) return false;
+  r.name=b.substr(p,n); p+=n;
+@@ -78,7 +78,31 @@
+   }
+  }
+  r.offline=offlineStatus || (zeroFlags && !hasStatus && hasIcon);
+- out=std::move(r); return true;
++ offset=p; out=std::move(r); return true;
++}
++inline bool parseUserInfoBart(const Bytes &b, UserInfoBart &out) {
++ size_t offset=0; return parseUserInfoBartAt(b,offset,out);
++}
++// BUDDY ARRIVED/DEPARTED may contain multiple consecutive USERINFO blocks.
++// Only split an exactly framed packet; preserve the old single-block path
++// for legacy servers that append other fields or send a name-only DEPART.
++inline bool splitBuddyUserInfo(const Bytes &b, std::vector<Bytes> &out) {
++ std::vector<Bytes> blocks;
++ size_t p=0;
++ while (p<b.size()) {
++  const size_t start=p; UserInfoBart info;
++  if (!parseUserInfoBartAt(b,p,info)) return false;
++  blocks.push_back(b.substr(start,p-start));
++ }
++ if (blocks.empty()) return false;
++ out.swap(blocks); return true;
++}
++// Older ICQ servers implement 02/05 (16-bit request type 2 = short info),
++// not 02/15. Its reply is also 02/06. Neither request invents a BART ID.
++inline bool makeLegacyUserInfoQuery(const std::string &name, Bytes &payload) {
++ if (name.empty() || name.size()>255) return false;
++ Bytes b; put16(b,2); b.push_back(char(name.size())); b+=name;
++ payload.swap(b); return true;
+ }
+ // BART__UPLOAD_QUERY (10/02): type + 16-bit length + image bytes.
+ inline bool makeUpload(uint16_t type, const Bytes &image, Bytes &payload) {
+--- a/normal/0.96.7/KICQ/src/proto.h
++++ b/normal/0.96.7/KICQ/src/proto.h
+@@ -179,7 +179,9 @@
+ 	void QueueBartAvatar(uint32_t uin, uint16_t type, const bytes_t &hash) { if (uin) QueueBartAvatar(std::to_string(uin), type, hash); }
+ 	// Session-local discovery queue; protected by m_csBart, drained by BOS thread.
+ 	std::set<std::string> m_bartRefreshPending, m_bartRefreshUrgent, m_bartRefreshDone;
+-	time_t m_lastBartRefresh = 0;
++	// One delayed retry for offline buddies lacking a known hash. Same BOS budget.
++ std::map<std::string, time_t> m_bartOfflineRetry;
++ time_t m_lastBartRefresh = 0;
+ 	mir_cs m_csBartLifecycle;
+ 	void ScheduleBartRefresh(const std::string &name, bool force = false);
+ 	void PumpBartRefresh(time_t now);
+@@ -195,6 +197,7 @@
+ 
+ 	void HandleRoster(const bytes_t &data, int flags);
+ 	void FinishLogin();
++	void HandleBuddyPresence(const bytes_t &data, bool departed);
+ 	void HandleUserOnline(const bytes_t &data);
+ 	void HandleUserOffline(const bytes_t &data);
+ 	void HandleIncomingMessage(const bytes_t &data);
+--- a/normal/0.96.7/KICQ/src/server.cpp
++++ b/normal/0.96.7/KICQ/src/server.cpp
+@@ -103,6 +103,7 @@
+ 		m_bartRefreshPending.clear();
+ 		m_bartRefreshUrgent.clear();
+ 		m_bartRefreshDone.clear();
++		m_bartOfflineRetry.clear();
+ 		m_lastBartRefresh = 0;
+ 	}
+ 	{
+@@ -463,14 +464,28 @@
+ 		break;
+ 
+ 	case 0x02:
+-		if (subtype == 0x06) HandleBartUserInfoUpdate(body); // LOCATE reply
++		if (subtype == 0x06) {
++   bart::UserInfoBart info;
++   if (bart::parseUserInfoBart(body, info)) {
++    unsigned icons = 0;
++    for (const auto &raw : info.metadata) {
++     size_t pos = 0; bart::AssetId id;
++     while (pos < raw.size() && bart::parseId(raw, pos, id))
++      if (id.type == 1 && !id.hash.empty() && id.hash.size() <= 64) ++icons;
++    }
++    debugLogA("BART: LOCATE 02/06 for %s, icon IDs=%u", info.name.c_str(), icons);
++   } else debugLogA("BART: malformed LOCATE 02/06 (%u bytes)", (unsigned)body.size());
++   HandleBartUserInfoUpdate(body); // existing metadata handler
++  }
++		else if (subtype == 0x01 && body.size() >= 2) {
++			OscarReader error(body);
++			debugLogA("BART: LOCATE error 02/01 code=%u req=%u", (unsigned)error.u16(), (unsigned)reqId);
++		}
+ 		break;
+ 
+ 	case 0x03:
+-		if (subtype == 0x0B)
+-			HandleUserOnline(body);
+-		else if (subtype == 0x0C)
+-			HandleUserOffline(body);
++		if (subtype == 0x0B || subtype == 0x0C)
++			HandleBuddyPresence(body, subtype == 0x0C);
+ 		break;
+ 
+ 	case 0x04:
+@@ -1344,6 +1359,24 @@
+     // to clear a previously received genuine text (Xtraz or standard note).
+ }
+ 
++// Keep the existing single-contact handlers unchanged. Batched BUDDY
++// notifications previously passed every trailing block as if it were TLVs
++// of the first contact, silently losing the remaining avatar hashes.
++void CKicqProto::HandleBuddyPresence(const bytes_t &data, bool departed)
++{
++ std::vector<bytes_t> blocks;
++ if (bart::splitBuddyUserInfo(data, blocks) && blocks.size() > 1) {
++  debugLogA("BART: received %u batched BUDDY records", (unsigned)blocks.size());
++  for (const auto &block : blocks) {
++   if (departed) HandleUserOffline(block);
++   else HandleUserOnline(block);
++  }
++  return;
++ }
++ if (departed) HandleUserOffline(data);
++ else HandleUserOnline(data);
++}
++
+ void CKicqProto::HandleUserOffline(const bytes_t &data)
+ {
+  // Some servers attach full USERINFO to an offline notification; a bare
+@@ -2177,6 +2210,7 @@
+  if (name.empty() || name == AccountId() || !m_bOnline) return;
+  mir_cslock lock(m_csBart);
+  if (force) {
++  m_bartOfflineRetry.erase(name);
+   m_bartRefreshDone.erase(name);
+   m_bartRefreshPending.erase(name);
+   m_bartRefreshUrgent.insert(name);
+@@ -2186,18 +2220,23 @@
+ 
+ void CKicqProto::PumpBartRefresh(time_t now)
+ {
+- std::vector<std::string> batch;
++ std::vector<std::string> batch, retry;
+  {
+   mir_cslock lock(m_csBart);
+   if (m_lastBartRefresh == now) return;
+   m_lastBartRefresh = now;
+-  // Maximum four LOCATE requests per second, regardless of packet/UI activity.
++  // Preserve priority for new contacts and the existing four-per-second budget.
+   while ((!m_bartRefreshUrgent.empty() || !m_bartRefreshPending.empty()) && batch.size() < 4) {
+    auto &queue = m_bartRefreshUrgent.empty() ? m_bartRefreshPending : m_bartRefreshUrgent;
+    auto it = queue.begin();
+    batch.push_back(*it);
+    m_bartRefreshDone.insert(*it);
+    queue.erase(it);
++  }
++  for (auto it = m_bartOfflineRetry.begin(); it != m_bartOfflineRetry.end() && batch.size()+retry.size()<4;) {
++   if (it->second > now) { ++it; continue; }
++   retry.push_back(it->first);
++   it = m_bartOfflineRetry.erase(it); // once only, even when the server does not reply
+   }
+  }
+  for (const auto &name : batch) {
+@@ -2209,6 +2248,26 @@
+   if (bart::makeUserInfoQuery(name, query)) {
+    Send(OscarSnac(2, 0x15, 0, query));
+    debugLogA("BART: requested avatar metadata for %s (LOCATE 02/15)", name.c_str());
++   if (getWord(contact, "Status", ID_STATUS_OFFLINE) == ID_STATUS_OFFLINE &&
++       getMStringA(contact, "BartAdvertisedHash").IsEmpty() &&
++       getMStringA(contact, "BartAvatarHash").IsEmpty()) {
++    mir_cslock lock(m_csBart);
++    m_bartOfflineRetry[name] = now + 5;
++   }
++  }
++ }
++ for (const auto &name : retry) {
++  MCONTACT contact = FindContact(name);
++  if (!contact || getWord(contact, "Status", ID_STATUS_OFFLINE) != ID_STATUS_OFFLINE ||
++      !getMStringA(contact, "BartAdvertisedHash").IsEmpty() ||
++      !getMStringA(contact, "BartAvatarHash").IsEmpty()) continue;
++  // Numeric ICQ servers may only implement the old LOCATE query. AIM uses
++  // the modern query again. No synthetic hashes or extra BART traffic.
++  const bool legacy = oscarid::uin(name) != 0;
++  bytes_t query;
++  if (legacy ? bart::makeLegacyUserInfoQuery(name, query) : bart::makeUserInfoQuery(name, query)) {
++   Send(OscarSnac(2, legacy ? 0x05 : 0x15, 0, query));
++   debugLogA("BART: offline metadata retry for %s (LOCATE 02/%02x)", name.c_str(), legacy ? 5 : 0x15);
+   }
+  }
+ }
+@@ -2230,6 +2289,10 @@
+   const std::string hash = bart::hexHash(id.hash);
+   db_set_w(contact, m_szModuleName, "BartAdvertisedType", id.type);
+   db_set_s(contact, m_szModuleName, "BartAdvertisedHash", hash.c_str());
++  {
++   mir_cslock lock(m_csBart);
++   m_bartOfflineRetry.erase(name);
++  }
+   // A real cache file is required even when the stored hash matches.
+   QueueCachedBartAvatar(contact);
+  }
+--- a/normal/0.96.7/KICQ/src/version.h
++++ b/normal/0.96.7/KICQ/src/version.h
+@@ -1,7 +1,7 @@
+ #define __MAJOR_VERSION          0
+ #define __MINOR_VERSION          1
+ #define __RELEASE_NUM            0
+-#define __BUILD_NUM              3
++#define __BUILD_NUM              4
+ 
+ #include <stdver.h>
+ 
+--- a/normal/0.96.8/KICQ/src/bart_codec.h
++++ b/normal/0.96.8/KICQ/src/bart_codec.h
+@@ -53,8 +53,8 @@
+ };
+ // USERINFO can be followed by unrelated LOCATE response TLVs. Only consume
+ // the counted presence TLVs, and commit nothing if any counted TLV is truncated.
+-inline bool parseUserInfoBart(const Bytes &b, UserInfoBart &out) {
+- size_t p=0; uint8_t n; uint16_t warning, count;
++inline bool parseUserInfoBartAt(const Bytes &b, size_t &offset, UserInfoBart &out) {
++ size_t p=offset; uint8_t n; uint16_t warning, count;
+  UserInfoBart r;
+  if (!get8(b,p,n) || !n || b.size()-p<n) return false;
+  r.name=b.substr(p,n); p+=n;
+@@ -78,7 +78,31 @@
+   }
+  }
+  r.offline=offlineStatus || (zeroFlags && !hasStatus && hasIcon);
+- out=std::move(r); return true;
++ offset=p; out=std::move(r); return true;
++}
++inline bool parseUserInfoBart(const Bytes &b, UserInfoBart &out) {
++ size_t offset=0; return parseUserInfoBartAt(b,offset,out);
++}
++// BUDDY ARRIVED/DEPARTED may contain multiple consecutive USERINFO blocks.
++// Only split an exactly framed packet; preserve the old single-block path
++// for legacy servers that append other fields or send a name-only DEPART.
++inline bool splitBuddyUserInfo(const Bytes &b, std::vector<Bytes> &out) {
++ std::vector<Bytes> blocks;
++ size_t p=0;
++ while (p<b.size()) {
++  const size_t start=p; UserInfoBart info;
++  if (!parseUserInfoBartAt(b,p,info)) return false;
++  blocks.push_back(b.substr(start,p-start));
++ }
++ if (blocks.empty()) return false;
++ out.swap(blocks); return true;
++}
++// Older ICQ servers implement 02/05 (16-bit request type 2 = short info),
++// not 02/15. Its reply is also 02/06. Neither request invents a BART ID.
++inline bool makeLegacyUserInfoQuery(const std::string &name, Bytes &payload) {
++ if (name.empty() || name.size()>255) return false;
++ Bytes b; put16(b,2); b.push_back(char(name.size())); b+=name;
++ payload.swap(b); return true;
+ }
+ // BART__UPLOAD_QUERY (10/02): type + 16-bit length + image bytes.
+ inline bool makeUpload(uint16_t type, const Bytes &image, Bytes &payload) {
+--- a/normal/0.96.8/KICQ/src/proto.h
++++ b/normal/0.96.8/KICQ/src/proto.h
+@@ -179,7 +179,9 @@
+ 	void QueueBartAvatar(uint32_t uin, uint16_t type, const bytes_t &hash) { if (uin) QueueBartAvatar(std::to_string(uin), type, hash); }
+ 	// Session-local discovery queue; protected by m_csBart, drained by BOS thread.
+ 	std::set<std::string> m_bartRefreshPending, m_bartRefreshUrgent, m_bartRefreshDone;
+-	time_t m_lastBartRefresh = 0;
++	// One delayed retry for offline buddies lacking a known hash. Same BOS budget.
++ std::map<std::string, time_t> m_bartOfflineRetry;
++ time_t m_lastBartRefresh = 0;
+ 	mir_cs m_csBartLifecycle;
+ 	void ScheduleBartRefresh(const std::string &name, bool force = false);
+ 	void PumpBartRefresh(time_t now);
+@@ -195,6 +197,7 @@
+ 
+ 	void HandleRoster(const bytes_t &data, int flags);
+ 	void FinishLogin();
++	void HandleBuddyPresence(const bytes_t &data, bool departed);
+ 	void HandleUserOnline(const bytes_t &data);
+ 	void HandleUserOffline(const bytes_t &data);
+ 	void HandleIncomingMessage(const bytes_t &data);
+--- a/normal/0.96.8/KICQ/src/server.cpp
++++ b/normal/0.96.8/KICQ/src/server.cpp
+@@ -103,6 +103,7 @@
+ 		m_bartRefreshPending.clear();
+ 		m_bartRefreshUrgent.clear();
+ 		m_bartRefreshDone.clear();
++		m_bartOfflineRetry.clear();
+ 		m_lastBartRefresh = 0;
+ 	}
+ 	{
+@@ -463,14 +464,28 @@
+ 		break;
+ 
+ 	case 0x02:
+-		if (subtype == 0x06) HandleBartUserInfoUpdate(body); // LOCATE reply
++		if (subtype == 0x06) {
++   bart::UserInfoBart info;
++   if (bart::parseUserInfoBart(body, info)) {
++    unsigned icons = 0;
++    for (const auto &raw : info.metadata) {
++     size_t pos = 0; bart::AssetId id;
++     while (pos < raw.size() && bart::parseId(raw, pos, id))
++      if (id.type == 1 && !id.hash.empty() && id.hash.size() <= 64) ++icons;
++    }
++    debugLogA("BART: LOCATE 02/06 for %s, icon IDs=%u", info.name.c_str(), icons);
++   } else debugLogA("BART: malformed LOCATE 02/06 (%u bytes)", (unsigned)body.size());
++   HandleBartUserInfoUpdate(body); // existing metadata handler
++  }
++		else if (subtype == 0x01 && body.size() >= 2) {
++			OscarReader error(body);
++			debugLogA("BART: LOCATE error 02/01 code=%u req=%u", (unsigned)error.u16(), (unsigned)reqId);
++		}
+ 		break;
+ 
+ 	case 0x03:
+-		if (subtype == 0x0B)
+-			HandleUserOnline(body);
+-		else if (subtype == 0x0C)
+-			HandleUserOffline(body);
++		if (subtype == 0x0B || subtype == 0x0C)
++			HandleBuddyPresence(body, subtype == 0x0C);
+ 		break;
+ 
+ 	case 0x04:
+@@ -1344,6 +1359,24 @@
+     // to clear a previously received genuine text (Xtraz or standard note).
+ }
+ 
++// Keep the existing single-contact handlers unchanged. Batched BUDDY
++// notifications previously passed every trailing block as if it were TLVs
++// of the first contact, silently losing the remaining avatar hashes.
++void CKicqProto::HandleBuddyPresence(const bytes_t &data, bool departed)
++{
++ std::vector<bytes_t> blocks;
++ if (bart::splitBuddyUserInfo(data, blocks) && blocks.size() > 1) {
++  debugLogA("BART: received %u batched BUDDY records", (unsigned)blocks.size());
++  for (const auto &block : blocks) {
++   if (departed) HandleUserOffline(block);
++   else HandleUserOnline(block);
++  }
++  return;
++ }
++ if (departed) HandleUserOffline(data);
++ else HandleUserOnline(data);
++}
++
+ void CKicqProto::HandleUserOffline(const bytes_t &data)
+ {
+  // Some servers attach full USERINFO to an offline notification; a bare
+@@ -2178,6 +2211,7 @@
+  if (name.empty() || name == AccountId() || !m_bOnline) return;
+  mir_cslock lock(m_csBart);
+  if (force) {
++  m_bartOfflineRetry.erase(name);
+   m_bartRefreshDone.erase(name);
+   m_bartRefreshPending.erase(name);
+   m_bartRefreshUrgent.insert(name);
+@@ -2187,18 +2221,23 @@
+ 
+ void CKicqProto::PumpBartRefresh(time_t now)
+ {
+- std::vector<std::string> batch;
++ std::vector<std::string> batch, retry;
+  {
+   mir_cslock lock(m_csBart);
+   if (m_lastBartRefresh == now) return;
+   m_lastBartRefresh = now;
+-  // Maximum four LOCATE requests per second, regardless of packet/UI activity.
++  // Preserve priority for new contacts and the existing four-per-second budget.
+   while ((!m_bartRefreshUrgent.empty() || !m_bartRefreshPending.empty()) && batch.size() < 4) {
+    auto &queue = m_bartRefreshUrgent.empty() ? m_bartRefreshPending : m_bartRefreshUrgent;
+    auto it = queue.begin();
+    batch.push_back(*it);
+    m_bartRefreshDone.insert(*it);
+    queue.erase(it);
++  }
++  for (auto it = m_bartOfflineRetry.begin(); it != m_bartOfflineRetry.end() && batch.size()+retry.size()<4;) {
++   if (it->second > now) { ++it; continue; }
++   retry.push_back(it->first);
++   it = m_bartOfflineRetry.erase(it); // once only, even when the server does not reply
+   }
+  }
+  for (const auto &name : batch) {
+@@ -2210,6 +2249,26 @@
+   if (bart::makeUserInfoQuery(name, query)) {
+    Send(OscarSnac(2, 0x15, 0, query));
+    debugLogA("BART: requested avatar metadata for %s (LOCATE 02/15)", name.c_str());
++   if (getWord(contact, "Status", ID_STATUS_OFFLINE) == ID_STATUS_OFFLINE &&
++       getMStringA(contact, "BartAdvertisedHash").IsEmpty() &&
++       getMStringA(contact, "BartAvatarHash").IsEmpty()) {
++    mir_cslock lock(m_csBart);
++    m_bartOfflineRetry[name] = now + 5;
++   }
++  }
++ }
++ for (const auto &name : retry) {
++  MCONTACT contact = FindContact(name);
++  if (!contact || getWord(contact, "Status", ID_STATUS_OFFLINE) != ID_STATUS_OFFLINE ||
++      !getMStringA(contact, "BartAdvertisedHash").IsEmpty() ||
++      !getMStringA(contact, "BartAvatarHash").IsEmpty()) continue;
++  // Numeric ICQ servers may only implement the old LOCATE query. AIM uses
++  // the modern query again. No synthetic hashes or extra BART traffic.
++  const bool legacy = oscarid::uin(name) != 0;
++  bytes_t query;
++  if (legacy ? bart::makeLegacyUserInfoQuery(name, query) : bart::makeUserInfoQuery(name, query)) {
++   Send(OscarSnac(2, legacy ? 0x05 : 0x15, 0, query));
++   debugLogA("BART: offline metadata retry for %s (LOCATE 02/%02x)", name.c_str(), legacy ? 5 : 0x15);
+   }
+  }
+ }
+@@ -2231,6 +2290,10 @@
+   const std::string hash = bart::hexHash(id.hash);
+   db_set_w(contact, m_szModuleName, "BartAdvertisedType", id.type);
+   db_set_s(contact, m_szModuleName, "BartAdvertisedHash", hash.c_str());
++  {
++   mir_cslock lock(m_csBart);
++   m_bartOfflineRetry.erase(name);
++  }
+   // A real cache file is required even when the stored hash matches.
+   QueueCachedBartAvatar(contact);
+  }
+--- /dev/null
++++ b/tests/avatar_offline_beta4_test.cpp
+@@ -0,0 +1,28 @@
++#include "bart_codec.h"
++#include "oscar_identity.h"
++#include <cassert>
++#include <iostream>
++using namespace bart;
++static Bytes tlv(uint16_t tag,const Bytes &v) { Bytes b;put16(b,tag);put16(b,uint16_t(v.size()));return b+v; }
++static Bytes info(const std::string &name,const std::vector<Bytes> &fields) {
++ Bytes b(1,char(name.size()));b+=name;put16(b,0);put16(b,uint16_t(fields.size()));for(auto &v:fields)b+=v;return b;
++}
++int main(){
++ Bytes raw1,raw2; AssetId id; id.flags=1; id.hash=Bytes(16,'a'); assert(appendId(raw1,id)); id.hash=Bytes(16,'b'); assert(appendId(raw2,id));
++ const auto zero=tlv(1,Bytes(2,'\0'));
++ const auto off=info("712003",{zero,tlv(0x1d,raw1)});
++ const auto online=info("33312",{zero,tlv(6,Bytes(4,'\0')),tlv(0x1d,raw2)});
++ const auto aim=info("AIM Buddy",{zero,tlv(0x1d,raw2)});
++ std::vector<Bytes> blocks; assert(splitBuddyUserInfo(off+online+aim,blocks)); assert((blocks==std::vector<Bytes>{off,online,aim}));
++ UserInfoBart r; assert(parseUserInfoBart(blocks[0],r)&&r.offline&&r.metadata[0]==raw1);
++ assert(parseUserInfoBart(blocks[1],r)&&!r.offline&&r.metadata[0]==raw2);
++ assert(parseUserInfoBart(blocks[2],r)&&r.offline&&oscarid::key(r.name)=="aimbuddy");
++ for(size_t n=1;n<aim.size();++n){ std::vector<Bytes> out={"unchanged"}; assert(!splitBuddyUserInfo(off+aim.substr(0,n),out));assert(out[0]=="unchanged"&&out.size()==1); }
++ assert(splitBuddyUserInfo(online,blocks)&&blocks.size()==1&&blocks[0]==online);
++ assert(!splitBuddyUserInfo(Bytes("\6" "712003",7),blocks)); // legacy bare DEPART stays with old handler
++ size_t at=off.size(); assert(parseUserInfoBartAt(off+online,at,r)&&at==off.size()+online.size()&&r.name=="33312");
++ at=off.size(); r.name="unchanged"; assert(!parseUserInfoBartAt(off+online.substr(0,online.size()-1),at,r)&&at==off.size()&&r.name=="unchanged");
++ Bytes q;assert(makeLegacyUserInfoQuery("712003",q)&&q==Bytes("\0\2\6" "712003",9)); assert(!makeLegacyUserInfoQuery("",q));
++ assert(makeUserInfoQuery("aimbuddy",q)&&q==Bytes("\0\0\0\4\10" "aimbuddy",13));
++ std::cout<<"Beta 4: batched offline/online/AIM USERINFO, malformed boundaries, legacy LOCATE passed\n";
++}
+--- /dev/null
++++ b/tests/test_avatar_offline_beta4_queue.py
+@@ -0,0 +1,87 @@
++"""Build actual discovery/dispatch methods with fake Miranda contacts and network.
++No Windows, DLL or real OSCAR server is involved.
++"""
++import os, subprocess, tempfile
++from pathlib import Path
++ROOT=Path(__file__).resolve().parents[1]
++MOCK=r'''
++#include <cassert>
++#include <ctime>
++#include <map>
++#include <set>
++#include <string>
++#include <vector>
++#include <utility>
++#include "bart_codec.h"
++#include "oscar_identity.h"
++using bytes_t=std::string; using MCONTACT=unsigned;
++constexpr int ID_STATUS_OFFLINE=1, ID_STATUS_ONLINE=2;
++struct mir_cs{}; struct mir_cslock { explicit mir_cslock(mir_cs&) {} };
++struct MockString { std::string value; bool IsEmpty() const { return value.empty(); } };
++struct OscarSnac { unsigned family, subtype, req; bytes_t body; OscarSnac(unsigned f,unsigned s,unsigned r,const bytes_t& b):family(f),subtype(s),req(r),body(b){} };
++struct CKicqProto {
++ bool m_bOnline=true; mir_cs m_csBart; time_t m_lastBartRefresh=0;
++ std::set<std::string> m_bartRefreshPending,m_bartRefreshUrgent,m_bartRefreshDone;
++ std::map<std::string,time_t> m_bartOfflineRetry;
++ struct Buddy { MCONTACT handle; int status; std::string advertised,cached; };
++ std::map<std::string,Buddy> contacts;
++ std::vector<OscarSnac> sent;
++ std::vector<MCONTACT> restored;
++ std::vector<std::pair<bytes_t,bool>> presence;
++ std::string AccountId(){return "123";}
++ MCONTACT FindContact(const std::string &name){auto it=contacts.find(name);return it==contacts.end()?0:it->second.handle;}
++ Buddy& byHandle(MCONTACT c){for(auto& x:contacts) if(x.second.handle==c)return x.second;assert(false);return contacts.begin()->second;}
++ int getWord(MCONTACT c,const char*,int){return byHandle(c).status;}
++ MockString getMStringA(MCONTACT c,const char* key){auto& b=byHandle(c);return {std::string(key)=="BartAdvertisedHash"?b.advertised:b.cached};}
++ void Send(const OscarSnac& p){sent.push_back(p);}
++ void QueueCachedBartAvatar(MCONTACT c){restored.push_back(c);}
++ void debugLogA(const char*,...){}
++ void HandleUserOnline(const bytes_t& b){presence.emplace_back(b,false);}
++ void HandleUserOffline(const bytes_t& b){presence.emplace_back(b,true);}
++ void HandleBuddyPresence(const bytes_t&,bool);
++ void ScheduleBartRefresh(const std::string&,bool=false);
++ void PumpBartRefresh(time_t);
++};
++'''
++TEST=r'''
++int main(){
++ CKicqProto p;
++ p.contacts={{"111",{1,1,"",""}},{"222",{2,2,"",""}},{"333",{3,1,"hash",""}},{"444",{4,1,"","cached"}},{"aimbuddy",{5,1,"",""}},{"555",{6,1,"",""}}};
++ for(auto &c:p.contacts)p.ScheduleBartRefresh(c.first);
++ p.ScheduleBartRefresh("aimbuddy",true);p.ScheduleBartRefresh("123");p.ScheduleBartRefresh("");
++ p.PumpBartRefresh(100); assert(p.sent.size()==4&&p.restored.size()==4);assert(p.sent[0].body.substr(5)=="aimbuddy");
++ p.PumpBartRefresh(100);assert(p.sent.size()==4);
++ p.PumpBartRefresh(101);assert(p.sent.size()==6&&p.restored.size()==6);
++ assert(p.m_bartOfflineRetry.size()==3); // 111, 555, AIM; online and cached excluded
++ p.contacts["111"].advertised="newhash"; // metadata has arrived before the delayed retry
++ p.PumpBartRefresh(104);assert(p.sent.size()==6);
++ p.PumpBartRefresh(105);assert(p.sent.size()==7&&p.sent.back().subtype==0x15&&p.sent.back().body.substr(5)=="aimbuddy");
++ p.PumpBartRefresh(106);assert(p.sent.size()==8&&p.sent.back().subtype==0x05&&p.sent.back().body.substr(3)=="555");
++ p.PumpBartRefresh(999);assert(p.sent.size()==8&&p.m_bartOfflineRetry.empty());
++ p.ScheduleBartRefresh("555");p.PumpBartRefresh(1000);assert(p.sent.size()==8);
++ p.ScheduleBartRefresh("555",true);p.PumpBartRefresh(1001);assert(p.sent.size()==9);p.contacts["555"].status=2;p.PumpBartRefresh(1006);assert(p.sent.size()==9);
++ p.ScheduleBartRefresh("111",true);p.PumpBartRefresh(1007);assert(p.sent.size()==10); // add stays urgent even with known hash
++ p.ScheduleBartRefresh("deleted",true);p.PumpBartRefresh(1008);assert(p.sent.size()==10);
++ // The existing handlers get exactly the original bytes for single and legacy packets.
++ bytes_t a="\x03" "111";a+=bytes_t(4,0);bytes_t b="\x03" "222";b+=bytes_t(4,0);
++ p.HandleBuddyPresence(a+b,false);assert(p.presence.size()==2&&p.presence[0].first==a&&p.presence[1].first==b&&!p.presence[1].second);
++ p.HandleBuddyPresence(a+b,true);assert(p.presence.size()==4&&p.presence[2].second&&p.presence[3].second);
++ p.HandleBuddyPresence(a,false);assert(p.presence.size()==5&&p.presence.back().first==a);
++ p.HandleBuddyPresence(b.substr(0,4),true);assert(p.presence.size()==6&&p.presence.back().first==b.substr(0,4));
++}
++'''
++
++def extract(source, name):
++ start=source.index('void CKicqProto::'+name+'(')
++ at=source.index('{',start); depth=1; end=at+1
++ while depth:
++  depth+=(source[end]=='{')-(source[end]=='}');end+=1
++ return source[start:end]
++
++for src in sorted(ROOT.glob('*/*/KICQ/src')):
++ s=(src/'server.cpp').read_text(); bodies='\n'.join(extract(s,n) for n in ('ScheduleBartRefresh','PumpBartRefresh','HandleBuddyPresence'))
++ with tempfile.TemporaryDirectory() as d:
++  cpp=Path(d)/'test.cpp'; exe=Path(d)/'test';cpp.write_text(MOCK+bodies+TEST)
++  subprocess.run([os.environ.get('CXX','g++'),'-std=c++17','-Wall','-Wextra','-Werror','-I',str(src),str(cpp),'-o',str(exe)],check=True)
++  subprocess.run([str(exe)],check=True)
++  print('PASS discovery/dispatch:',src.relative_to(ROOT))
+--- a/windows-xp-x86/0.96.7/KICQ/src/bart_codec.h
++++ b/windows-xp-x86/0.96.7/KICQ/src/bart_codec.h
+@@ -53,8 +53,8 @@
+ };
+ // USERINFO can be followed by unrelated LOCATE response TLVs. Only consume
+ // the counted presence TLVs, and commit nothing if any counted TLV is truncated.
+-inline bool parseUserInfoBart(const Bytes &b, UserInfoBart &out) {
+- size_t p=0; uint8_t n; uint16_t warning, count;
++inline bool parseUserInfoBartAt(const Bytes &b, size_t &offset, UserInfoBart &out) {
++ size_t p=offset; uint8_t n; uint16_t warning, count;
+  UserInfoBart r;
+  if (!get8(b,p,n) || !n || b.size()-p<n) return false;
+  r.name=b.substr(p,n); p+=n;
+@@ -78,7 +78,31 @@
+   }
+  }
+  r.offline=offlineStatus || (zeroFlags && !hasStatus && hasIcon);
+- out=std::move(r); return true;
++ offset=p; out=std::move(r); return true;
++}
++inline bool parseUserInfoBart(const Bytes &b, UserInfoBart &out) {
++ size_t offset=0; return parseUserInfoBartAt(b,offset,out);
++}
++// BUDDY ARRIVED/DEPARTED may contain multiple consecutive USERINFO blocks.
++// Only split an exactly framed packet; preserve the old single-block path
++// for legacy servers that append other fields or send a name-only DEPART.
++inline bool splitBuddyUserInfo(const Bytes &b, std::vector<Bytes> &out) {
++ std::vector<Bytes> blocks;
++ size_t p=0;
++ while (p<b.size()) {
++  const size_t start=p; UserInfoBart info;
++  if (!parseUserInfoBartAt(b,p,info)) return false;
++  blocks.push_back(b.substr(start,p-start));
++ }
++ if (blocks.empty()) return false;
++ out.swap(blocks); return true;
++}
++// Older ICQ servers implement 02/05 (16-bit request type 2 = short info),
++// not 02/15. Its reply is also 02/06. Neither request invents a BART ID.
++inline bool makeLegacyUserInfoQuery(const std::string &name, Bytes &payload) {
++ if (name.empty() || name.size()>255) return false;
++ Bytes b; put16(b,2); b.push_back(char(name.size())); b+=name;
++ payload.swap(b); return true;
+ }
+ // BART__UPLOAD_QUERY (10/02): type + 16-bit length + image bytes.
+ inline bool makeUpload(uint16_t type, const Bytes &image, Bytes &payload) {
+--- a/windows-xp-x86/0.96.7/KICQ/src/proto.h
++++ b/windows-xp-x86/0.96.7/KICQ/src/proto.h
+@@ -179,7 +179,9 @@
+ 	void QueueBartAvatar(uint32_t uin, uint16_t type, const bytes_t &hash) { if (uin) QueueBartAvatar(std::to_string(uin), type, hash); }
+ 	// Session-local discovery queue; protected by m_csBart, drained by BOS thread.
+ 	std::set<std::string> m_bartRefreshPending, m_bartRefreshUrgent, m_bartRefreshDone;
+-	time_t m_lastBartRefresh = 0;
++	// One delayed retry for offline buddies lacking a known hash. Same BOS budget.
++ std::map<std::string, time_t> m_bartOfflineRetry;
++ time_t m_lastBartRefresh = 0;
+ 	mir_cs m_csBartLifecycle;
+ 	void ScheduleBartRefresh(const std::string &name, bool force = false);
+ 	void PumpBartRefresh(time_t now);
+@@ -195,6 +197,7 @@
+ 
+ 	void HandleRoster(const bytes_t &data, int flags);
+ 	void FinishLogin();
++	void HandleBuddyPresence(const bytes_t &data, bool departed);
+ 	void HandleUserOnline(const bytes_t &data);
+ 	void HandleUserOffline(const bytes_t &data);
+ 	void HandleIncomingMessage(const bytes_t &data);
+--- a/windows-xp-x86/0.96.7/KICQ/src/server.cpp
++++ b/windows-xp-x86/0.96.7/KICQ/src/server.cpp
+@@ -131,6 +131,7 @@
+ 		m_bartRefreshPending.clear();
+ 		m_bartRefreshUrgent.clear();
+ 		m_bartRefreshDone.clear();
++		m_bartOfflineRetry.clear();
+ 		m_lastBartRefresh = 0;
+ 	}
+ 	{
+@@ -493,14 +494,28 @@
+ 		break;
+ 
+ 	case 0x02:
+-		if (subtype == 0x06) HandleBartUserInfoUpdate(body); // LOCATE reply
++		if (subtype == 0x06) {
++   bart::UserInfoBart info;
++   if (bart::parseUserInfoBart(body, info)) {
++    unsigned icons = 0;
++    for (const auto &raw : info.metadata) {
++     size_t pos = 0; bart::AssetId id;
++     while (pos < raw.size() && bart::parseId(raw, pos, id))
++      if (id.type == 1 && !id.hash.empty() && id.hash.size() <= 64) ++icons;
++    }
++    debugLogA("BART: LOCATE 02/06 for %s, icon IDs=%u", info.name.c_str(), icons);
++   } else debugLogA("BART: malformed LOCATE 02/06 (%u bytes)", (unsigned)body.size());
++   HandleBartUserInfoUpdate(body); // existing metadata handler
++  }
++		else if (subtype == 0x01 && body.size() >= 2) {
++			OscarReader error(body);
++			debugLogA("BART: LOCATE error 02/01 code=%u req=%u", (unsigned)error.u16(), (unsigned)reqId);
++		}
+ 		break;
+ 
+ 	case 0x03:
+-		if (subtype == 0x0B)
+-			HandleUserOnline(body);
+-		else if (subtype == 0x0C)
+-			HandleUserOffline(body);
++		if (subtype == 0x0B || subtype == 0x0C)
++			HandleBuddyPresence(body, subtype == 0x0C);
+ 		break;
+ 
+ 	case 0x04:
+@@ -1453,6 +1468,24 @@
+     // to clear a previously received genuine text (Xtraz or standard note).
+ }
+ 
++// Keep the existing single-contact handlers unchanged. Batched BUDDY
++// notifications previously passed every trailing block as if it were TLVs
++// of the first contact, silently losing the remaining avatar hashes.
++void CKicqProto::HandleBuddyPresence(const bytes_t &data, bool departed)
++{
++ std::vector<bytes_t> blocks;
++ if (bart::splitBuddyUserInfo(data, blocks) && blocks.size() > 1) {
++  debugLogA("BART: received %u batched BUDDY records", (unsigned)blocks.size());
++  for (const auto &block : blocks) {
++   if (departed) HandleUserOffline(block);
++   else HandleUserOnline(block);
++  }
++  return;
++ }
++ if (departed) HandleUserOffline(data);
++ else HandleUserOnline(data);
++}
++
+ void CKicqProto::HandleUserOffline(const bytes_t &data)
+ {
+  // Some servers attach full USERINFO to an offline notification; a bare
+@@ -2296,6 +2329,7 @@
+  if (name.empty() || name == AccountId() || !m_bOnline) return;
+  mir_cslock lock(m_csBart);
+  if (force) {
++  m_bartOfflineRetry.erase(name);
+   m_bartRefreshDone.erase(name);
+   m_bartRefreshPending.erase(name);
+   m_bartRefreshUrgent.insert(name);
+@@ -2305,18 +2339,23 @@
+ 
+ void CKicqProto::PumpBartRefresh(time_t now)
+ {
+- std::vector<std::string> batch;
++ std::vector<std::string> batch, retry;
+  {
+   mir_cslock lock(m_csBart);
+   if (m_lastBartRefresh == now) return;
+   m_lastBartRefresh = now;
+-  // Maximum four LOCATE requests per second, regardless of packet/UI activity.
++  // Preserve priority for new contacts and the existing four-per-second budget.
+   while ((!m_bartRefreshUrgent.empty() || !m_bartRefreshPending.empty()) && batch.size() < 4) {
+    auto &queue = m_bartRefreshUrgent.empty() ? m_bartRefreshPending : m_bartRefreshUrgent;
+    auto it = queue.begin();
+    batch.push_back(*it);
+    m_bartRefreshDone.insert(*it);
+    queue.erase(it);
++  }
++  for (auto it = m_bartOfflineRetry.begin(); it != m_bartOfflineRetry.end() && batch.size()+retry.size()<4;) {
++   if (it->second > now) { ++it; continue; }
++   retry.push_back(it->first);
++   it = m_bartOfflineRetry.erase(it); // once only, even when the server does not reply
+   }
+  }
+  for (const auto &name : batch) {
+@@ -2328,6 +2367,26 @@
+   if (bart::makeUserInfoQuery(name, query)) {
+    Send(OscarSnac(2, 0x15, 0, query));
+    debugLogA("BART: requested avatar metadata for %s (LOCATE 02/15)", name.c_str());
++   if (getWord(contact, "Status", ID_STATUS_OFFLINE) == ID_STATUS_OFFLINE &&
++       getMStringA(contact, "BartAdvertisedHash").IsEmpty() &&
++       getMStringA(contact, "BartAvatarHash").IsEmpty()) {
++    mir_cslock lock(m_csBart);
++    m_bartOfflineRetry[name] = now + 5;
++   }
++  }
++ }
++ for (const auto &name : retry) {
++  MCONTACT contact = FindContact(name);
++  if (!contact || getWord(contact, "Status", ID_STATUS_OFFLINE) != ID_STATUS_OFFLINE ||
++      !getMStringA(contact, "BartAdvertisedHash").IsEmpty() ||
++      !getMStringA(contact, "BartAvatarHash").IsEmpty()) continue;
++  // Numeric ICQ servers may only implement the old LOCATE query. AIM uses
++  // the modern query again. No synthetic hashes or extra BART traffic.
++  const bool legacy = oscarid::uin(name) != 0;
++  bytes_t query;
++  if (legacy ? bart::makeLegacyUserInfoQuery(name, query) : bart::makeUserInfoQuery(name, query)) {
++   Send(OscarSnac(2, legacy ? 0x05 : 0x15, 0, query));
++   debugLogA("BART: offline metadata retry for %s (LOCATE 02/%02x)", name.c_str(), legacy ? 5 : 0x15);
+   }
+  }
+ }
+@@ -2349,6 +2408,10 @@
+   const std::string hash = bart::hexHash(id.hash);
+   db_set_w(contact, m_szModuleName, "BartAdvertisedType", id.type);
+   db_set_s(contact, m_szModuleName, "BartAdvertisedHash", hash.c_str());
++  {
++   mir_cslock lock(m_csBart);
++   m_bartOfflineRetry.erase(name);
++  }
+   // A real cache file is required even when the stored hash matches.
+   QueueCachedBartAvatar(contact);
+  }
+--- a/windows-xp-x86/0.96.8/KICQ/src/bart_codec.h
++++ b/windows-xp-x86/0.96.8/KICQ/src/bart_codec.h
+@@ -53,8 +53,8 @@
+ };
+ // USERINFO can be followed by unrelated LOCATE response TLVs. Only consume
+ // the counted presence TLVs, and commit nothing if any counted TLV is truncated.
+-inline bool parseUserInfoBart(const Bytes &b, UserInfoBart &out) {
+- size_t p=0; uint8_t n; uint16_t warning, count;
++inline bool parseUserInfoBartAt(const Bytes &b, size_t &offset, UserInfoBart &out) {
++ size_t p=offset; uint8_t n; uint16_t warning, count;
+  UserInfoBart r;
+  if (!get8(b,p,n) || !n || b.size()-p<n) return false;
+  r.name=b.substr(p,n); p+=n;
+@@ -78,7 +78,31 @@
+   }
+  }
+  r.offline=offlineStatus || (zeroFlags && !hasStatus && hasIcon);
+- out=std::move(r); return true;
++ offset=p; out=std::move(r); return true;
++}
++inline bool parseUserInfoBart(const Bytes &b, UserInfoBart &out) {
++ size_t offset=0; return parseUserInfoBartAt(b,offset,out);
++}
++// BUDDY ARRIVED/DEPARTED may contain multiple consecutive USERINFO blocks.
++// Only split an exactly framed packet; preserve the old single-block path
++// for legacy servers that append other fields or send a name-only DEPART.
++inline bool splitBuddyUserInfo(const Bytes &b, std::vector<Bytes> &out) {
++ std::vector<Bytes> blocks;
++ size_t p=0;
++ while (p<b.size()) {
++  const size_t start=p; UserInfoBart info;
++  if (!parseUserInfoBartAt(b,p,info)) return false;
++  blocks.push_back(b.substr(start,p-start));
++ }
++ if (blocks.empty()) return false;
++ out.swap(blocks); return true;
++}
++// Older ICQ servers implement 02/05 (16-bit request type 2 = short info),
++// not 02/15. Its reply is also 02/06. Neither request invents a BART ID.
++inline bool makeLegacyUserInfoQuery(const std::string &name, Bytes &payload) {
++ if (name.empty() || name.size()>255) return false;
++ Bytes b; put16(b,2); b.push_back(char(name.size())); b+=name;
++ payload.swap(b); return true;
+ }
+ // BART__UPLOAD_QUERY (10/02): type + 16-bit length + image bytes.
+ inline bool makeUpload(uint16_t type, const Bytes &image, Bytes &payload) {
+--- a/windows-xp-x86/0.96.8/KICQ/src/proto.h
++++ b/windows-xp-x86/0.96.8/KICQ/src/proto.h
+@@ -179,7 +179,9 @@
+ 	void QueueBartAvatar(uint32_t uin, uint16_t type, const bytes_t &hash) { if (uin) QueueBartAvatar(std::to_string(uin), type, hash); }
+ 	// Session-local discovery queue; protected by m_csBart, drained by BOS thread.
+ 	std::set<std::string> m_bartRefreshPending, m_bartRefreshUrgent, m_bartRefreshDone;
+-	time_t m_lastBartRefresh = 0;
++	// One delayed retry for offline buddies lacking a known hash. Same BOS budget.
++ std::map<std::string, time_t> m_bartOfflineRetry;
++ time_t m_lastBartRefresh = 0;
+ 	mir_cs m_csBartLifecycle;
+ 	void ScheduleBartRefresh(const std::string &name, bool force = false);
+ 	void PumpBartRefresh(time_t now);
+@@ -195,6 +197,7 @@
+ 
+ 	void HandleRoster(const bytes_t &data, int flags);
+ 	void FinishLogin();
++	void HandleBuddyPresence(const bytes_t &data, bool departed);
+ 	void HandleUserOnline(const bytes_t &data);
+ 	void HandleUserOffline(const bytes_t &data);
+ 	void HandleIncomingMessage(const bytes_t &data);
+--- a/windows-xp-x86/0.96.8/KICQ/src/server.cpp
++++ b/windows-xp-x86/0.96.8/KICQ/src/server.cpp
+@@ -131,6 +131,7 @@
+ 		m_bartRefreshPending.clear();
+ 		m_bartRefreshUrgent.clear();
+ 		m_bartRefreshDone.clear();
++		m_bartOfflineRetry.clear();
+ 		m_lastBartRefresh = 0;
+ 	}
+ 	{
+@@ -493,14 +494,28 @@
+ 		break;
+ 
+ 	case 0x02:
+-		if (subtype == 0x06) HandleBartUserInfoUpdate(body); // LOCATE reply
++		if (subtype == 0x06) {
++   bart::UserInfoBart info;
++   if (bart::parseUserInfoBart(body, info)) {
++    unsigned icons = 0;
++    for (const auto &raw : info.metadata) {
++     size_t pos = 0; bart::AssetId id;
++     while (pos < raw.size() && bart::parseId(raw, pos, id))
++      if (id.type == 1 && !id.hash.empty() && id.hash.size() <= 64) ++icons;
++    }
++    debugLogA("BART: LOCATE 02/06 for %s, icon IDs=%u", info.name.c_str(), icons);
++   } else debugLogA("BART: malformed LOCATE 02/06 (%u bytes)", (unsigned)body.size());
++   HandleBartUserInfoUpdate(body); // existing metadata handler
++  }
++		else if (subtype == 0x01 && body.size() >= 2) {
++			OscarReader error(body);
++			debugLogA("BART: LOCATE error 02/01 code=%u req=%u", (unsigned)error.u16(), (unsigned)reqId);
++		}
+ 		break;
+ 
+ 	case 0x03:
+-		if (subtype == 0x0B)
+-			HandleUserOnline(body);
+-		else if (subtype == 0x0C)
+-			HandleUserOffline(body);
++		if (subtype == 0x0B || subtype == 0x0C)
++			HandleBuddyPresence(body, subtype == 0x0C);
+ 		break;
+ 
+ 	case 0x04:
+@@ -1453,6 +1468,24 @@
+     // to clear a previously received genuine text (Xtraz or standard note).
+ }
+ 
++// Keep the existing single-contact handlers unchanged. Batched BUDDY
++// notifications previously passed every trailing block as if it were TLVs
++// of the first contact, silently losing the remaining avatar hashes.
++void CKicqProto::HandleBuddyPresence(const bytes_t &data, bool departed)
++{
++ std::vector<bytes_t> blocks;
++ if (bart::splitBuddyUserInfo(data, blocks) && blocks.size() > 1) {
++  debugLogA("BART: received %u batched BUDDY records", (unsigned)blocks.size());
++  for (const auto &block : blocks) {
++   if (departed) HandleUserOffline(block);
++   else HandleUserOnline(block);
++  }
++  return;
++ }
++ if (departed) HandleUserOffline(data);
++ else HandleUserOnline(data);
++}
++
+ void CKicqProto::HandleUserOffline(const bytes_t &data)
+ {
+  // Some servers attach full USERINFO to an offline notification; a bare
+@@ -2296,6 +2329,7 @@
+  if (name.empty() || name == AccountId() || !m_bOnline) return;
+  mir_cslock lock(m_csBart);
+  if (force) {
++  m_bartOfflineRetry.erase(name);
+   m_bartRefreshDone.erase(name);
+   m_bartRefreshPending.erase(name);
+   m_bartRefreshUrgent.insert(name);
+@@ -2305,18 +2339,23 @@
+ 
+ void CKicqProto::PumpBartRefresh(time_t now)
+ {
+- std::vector<std::string> batch;
++ std::vector<std::string> batch, retry;
+  {
+   mir_cslock lock(m_csBart);
+   if (m_lastBartRefresh == now) return;
+   m_lastBartRefresh = now;
+-  // Maximum four LOCATE requests per second, regardless of packet/UI activity.
++  // Preserve priority for new contacts and the existing four-per-second budget.
+   while ((!m_bartRefreshUrgent.empty() || !m_bartRefreshPending.empty()) && batch.size() < 4) {
+    auto &queue = m_bartRefreshUrgent.empty() ? m_bartRefreshPending : m_bartRefreshUrgent;
+    auto it = queue.begin();
+    batch.push_back(*it);
+    m_bartRefreshDone.insert(*it);
+    queue.erase(it);
++  }
++  for (auto it = m_bartOfflineRetry.begin(); it != m_bartOfflineRetry.end() && batch.size()+retry.size()<4;) {
++   if (it->second > now) { ++it; continue; }
++   retry.push_back(it->first);
++   it = m_bartOfflineRetry.erase(it); // once only, even when the server does not reply
+   }
+  }
+  for (const auto &name : batch) {
+@@ -2328,6 +2367,26 @@
+   if (bart::makeUserInfoQuery(name, query)) {
+    Send(OscarSnac(2, 0x15, 0, query));
+    debugLogA("BART: requested avatar metadata for %s (LOCATE 02/15)", name.c_str());
++   if (getWord(contact, "Status", ID_STATUS_OFFLINE) == ID_STATUS_OFFLINE &&
++       getMStringA(contact, "BartAdvertisedHash").IsEmpty() &&
++       getMStringA(contact, "BartAvatarHash").IsEmpty()) {
++    mir_cslock lock(m_csBart);
++    m_bartOfflineRetry[name] = now + 5;
++   }
++  }
++ }
++ for (const auto &name : retry) {
++  MCONTACT contact = FindContact(name);
++  if (!contact || getWord(contact, "Status", ID_STATUS_OFFLINE) != ID_STATUS_OFFLINE ||
++      !getMStringA(contact, "BartAdvertisedHash").IsEmpty() ||
++      !getMStringA(contact, "BartAvatarHash").IsEmpty()) continue;
++  // Numeric ICQ servers may only implement the old LOCATE query. AIM uses
++  // the modern query again. No synthetic hashes or extra BART traffic.
++  const bool legacy = oscarid::uin(name) != 0;
++  bytes_t query;
++  if (legacy ? bart::makeLegacyUserInfoQuery(name, query) : bart::makeUserInfoQuery(name, query)) {
++   Send(OscarSnac(2, legacy ? 0x05 : 0x15, 0, query));
++   debugLogA("BART: offline metadata retry for %s (LOCATE 02/%02x)", name.c_str(), legacy ? 5 : 0x15);
+   }
+  }
+ }
+@@ -2349,6 +2408,10 @@
+   const std::string hash = bart::hexHash(id.hash);
+   db_set_w(contact, m_szModuleName, "BartAdvertisedType", id.type);
+   db_set_s(contact, m_szModuleName, "BartAdvertisedHash", hash.c_str());
++  {
++   mir_cslock lock(m_csBart);
++   m_bartOfflineRetry.erase(name);
++  }
+   // A real cache file is required even when the stored hash matches.
+   QueueCachedBartAvatar(contact);
+  }

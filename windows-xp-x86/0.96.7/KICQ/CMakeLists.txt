@@ -1,4 +1,4 @@
-# PMLICQ target: Miranda NG stable v0.96.7 (ebe074e).
+# PMLICQ target: Miranda NG stable 0.96.7 (including later stable builds).
 # The plugin must be compiled INSIDE the matching Miranda NG source tree.
 # Git-tag verification deliberately fails on an explicitly wrong tagged checkout.
 find_package(Git QUIET)
@@ -10,10 +10,10 @@ if(GIT_FOUND AND EXISTS "${CMAKE_SOURCE_DIR}/.git")
   if(PMLICQ_TAG_STATUS EQUAL 0 AND NOT PMLICQ_TREE_TAG STREQUAL "v0.96.7")
     message(FATAL_ERROR "PMLICQ: expected Miranda NG v0.96.7, found ${PMLICQ_TREE_TAG}")
   elseif(NOT PMLICQ_TAG_STATUS EQUAL 0)
-    message(WARNING "PMLICQ: Miranda NG checkout is not at an exact release tag; build against v0.96.7 (ebe074e)")
+    message(WARNING "PMLICQ: non-tagged checkout; use the exact revision of the installed Miranda 0.96.7 build (e.g. 495fea6 for #28846)")
   endif()
 else()
-  message(STATUS "PMLICQ: unable to determine Miranda NG revision; make sure SDK/source is v0.96.7")
+  message(STATUS "PMLICQ: unable to determine Miranda NG revision; use the SDK/source matching the exact installed 0.96.7 build")
 endif()
 
 file(GLOB SOURCES "src/*.h" "src/*.cpp" "res/*.rc")

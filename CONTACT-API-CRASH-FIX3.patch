@@ -1,0 +1,346 @@
+--- a/README.md
++++ b/README.md
+@@ -49,7 +49,7 @@
+ ## Как собрать
+ 
+ 1. Установите Visual Studio 2019 с поддержкой C++ и нужные компоненты сборки Miranda NG.
+-2. Подготовьте исходное дерево точной ревизии установленной Miranda NG. Для 0.96.7 #28846 используйте `495fea6`, а не тег `v0.96.7`. Ветка `normal/0.96.7` теперь по умолчанию запрещает старый ABI; см. `CONTACT-API-CRASH-FIX2-RU.md`.
++2. Подготовьте исходное дерево точной ревизии установленной Miranda NG. Для 0.96.7 #28846 используйте `495fea6`, а не тег `v0.96.7`. Ветка `normal/0.96.7` также компилируется со старым SDK: для установленной сборки #28846 она использует проверяемый при запуске переходник API контактов. См. `CONTACT-API-CRASH-FIX3-RU.md`.
+ 3. Откройте проект `KICQ.vcxproj` из соответствующей папки (`normal/` или `windows-xp-x86/`). Проверьте пути к зависимостям SDK Miranda.
+ 4. Для **Win32 и Windows XP** выберите **Release | Win32**, `v141_xp`, CRT `/MD` и сохранённые проектом настройки `/Od`.
+ 5. Для **x64** используйте **Release | x64** и соответствующую 64-битную Miranda.
+--- a/normal/0.96.7/KICQ/CMakeLists.txt
++++ b/normal/0.96.7/KICQ/CMakeLists.txt
+@@ -16,20 +16,10 @@
+   message(STATUS "PMLICQ: unable to determine Miranda NG revision; use the SDK/source matching the exact installed 0.96.7 build")
+ endif()
+ 
+-# Default to the modern contact ABI, including the user's #28846 build.
+-# Legacy builds must opt in explicitly and use the matching legacy runtime.
+-option(PMLICQ_ALLOW_LEGACY_CONTACT_API "Allow old contact ABI (NOT compatible with #28846)" OFF)
+-set(PMLICQ_DB_HEADER "${CMAKE_SOURCE_DIR}/include/m_database.h")
+-if(NOT EXISTS "${PMLICQ_DB_HEADER}")
+-  message(FATAL_ERROR "PMLICQ: Miranda SDK m_database.h not found")
+-endif()
+-file(STRINGS "${PMLICQ_DB_HEADER}" PMLICQ_DBAC_DECL REGEX "^[ \t]*#[ \t]*define[ \t]+DBAC_NOTINLIST[ \t]+")
+-if(PMLICQ_DBAC_DECL)
+-  message(STATUS "PMLICQ contact ABI: new (module, flags)")
+-elseif(PMLICQ_ALLOW_LEGACY_CONTACT_API)
+-  message(WARNING "PMLICQ contact ABI: LEGACY; resulting DLL must NOT be used on #28846")
+-else()
+-  message(FATAL_ERROR "PMLICQ_CONTACT_ABI_MISMATCH: use Miranda revision 495fea6 for build #28846. Old SDK is not accepted by default.")
++# Native API with a modern SDK; an old SDK uses the runtime-checked #28846 bridge.
++option(PMLICQ_ALLOW_LEGACY_CONTACT_API "Enable legacy API for a matching old runtime only" OFF)
++if(PMLICQ_ALLOW_LEGACY_CONTACT_API)
++  message(WARNING "PMLICQ: explicit legacy fallback enabled; use only with a matching legacy runtime or #28846")
+ endif()
+ 
+ file(GLOB SOURCES "src/*.h" "src/*.cpp" "res/*.rc")
+--- a/normal/0.96.7/KICQ/README-PORT-0967-RU.md
++++ b/normal/0.96.7/KICQ/README-PORT-0967-RU.md
+@@ -7,7 +7,7 @@
+ 
+ Официальный тег: https://github.com/miranda-ng/miranda-ng/tree/v0.96.7
+ Официальный исходный архив: https://sourceforge.net/projects/miranda-ng.mirror/files/v0.96.7/
+-Ревизия первоначального релиза: `ebe074e`. Для более поздних сборок 0.96.7 берите точный commit установленной Miranda (например, `495fea6` для #28846), а не первоначальный тег. См. CONTACT-API-CRASH-FIX2-RU.md в корне архива. Старый ABI теперь запрещён по умолчанию.
++Ревизия первоначального релиза: `ebe074e`. Для более поздних сборок 0.96.7 берите точный commit установленной Miranda (например, `495fea6` для #28846), а не первоначальный тег. См. CONTACT-API-CRASH-FIX3-RU.md в корне архива. Старые заголовки теперь допустимы для сборки переходника API под #28846; неизвестный runtime со старым SDK по умолчанию не вызывает db_add_contact.
+ 
+ ## Сборка
+ 
+--- a/normal/0.96.7/KICQ/src/proto.cpp
++++ b/normal/0.96.7/KICQ/src/proto.cpp
+@@ -270,28 +270,58 @@
+ 	if (hContact)
+ 		return hContact;
+ 
+-	// 0.96.7 #28846 requires the two-argument contact API. Never silently
+-	// produce a legacy ABI DLL when the SDK is too old for that target.
++	// The C export kept its name when its signature changed. With an old SDK
++	// only resolve the modern export after checking the running core's build.
+ #if defined(DBAC_NOTINLIST)
+ #if defined(_MSC_VER)
+-#pragma message("PMLICQ contact ABI: new (db_add_contact(module, flags))")
++#pragma message("PMLICQ contact ABI: native (module, flags)")
+ #endif
+ 	hContact = db_add_contact(m_szModuleName, bTemporary ? DBAC_NOTINLIST : 0);
++#else
++#if defined(_MSC_VER)
++#pragma message("PMLICQ contact ABI: old SDK, runtime bridge for #28846")
++#endif
++	MFileVersion runtimeVersion = {};
++	Miranda_GetFileVersion(&runtimeVersion);
++	if (runtimeVersion[0] == 0 && runtimeVersion[1] == 96 &&
++		runtimeVersion[2] == 7 && runtimeVersion[3] == 28846) {
++		// Verified in 495fea6: mir_core.def exports db_add_contact by name,
++		// and m_database.h defines DBAC_NOTINLIST as 0x0001.
++		using AddContact28846 = MCONTACT (MIR_CDECL *)(const char *, int);
++		HMODULE core = GetModuleHandleW(L"mir_core.mir");
++		if (!core) {
++			debugLogA("PMLICQ contact ABI: mir_core.mir not loaded");
++			return 0;
++		}
++#if defined(_MSC_VER)
++#pragma warning(suppress:4191) // GetProcAddress: exact signature verified for #28846.
++#endif
++		auto addContact = reinterpret_cast<AddContact28846>(GetProcAddress(core, "db_add_contact"));
++		if (!addContact) {
++			debugLogA("PMLICQ contact ABI: db_add_contact export missing");
++			return 0;
++		}
++		hContact = addContact(m_szModuleName, bTemporary ? 0x0001 : 0);
++	}
++#if defined(PMLICQ_ALLOW_LEGACY_CONTACT_API)
++	else {
++		// Explicit legacy build only; never reached on #28846.
++		hContact = db_add_contact();
++		if (!hContact)
++			return 0;
++		Proto_AddToContact(hContact, m_szModuleName);
++		if (bTemporary)
++			db_set_b(hContact, "CList", "NotOnList", 1);
++	}
++#else
++	else {
++		debugLogA("PMLICQ contact ABI: unknown runtime %u.%u.%u.%u with old SDK; use matching SDK", (unsigned)runtimeVersion[0], (unsigned)runtimeVersion[1], (unsigned)runtimeVersion[2], (unsigned)runtimeVersion[3]);
++		return 0;
++	}
++#endif
++#endif
+ 	if (!hContact)
+ 		return 0;
+-#elif defined(PMLICQ_ALLOW_LEGACY_CONTACT_API)
+-#if defined(_MSC_VER)
+-#pragma message("PMLICQ contact ABI: LEGACY -- not compatible with #28846")
+-#endif
+-	hContact = db_add_contact();
+-	if (!hContact)
+-		return 0;
+-	Proto_AddToContact(hContact, m_szModuleName);
+-	if (bTemporary)
+-		db_set_b(hContact, "CList", "NotOnList", 1);
+-#else
+-#error PMLICQ_CONTACT_ABI_MISMATCH: Miranda SDK lacks DBAC_NOTINLIST. Use revision 495fea6 for build 28846.
+-#endif
+ 	if(uin) setDword(hContact, "UIN", uin);
+  setString(hContact, "ScreenName", id.c_str());
+  if(!uin) setWString(hContact, "Nick", _A2T(id.c_str()).get());
+--- a/normal/0.96.7/KICQ/src/server.cpp
++++ b/normal/0.96.7/KICQ/src/server.cpp
+@@ -951,7 +951,7 @@
+  while (r.remaining() >= 4) {
+   const unsigned kind = r.u16();
+   r.u8(); // flags
+-  const unsigned length = r.u8();
++  const int length = r.u8();
+   if (length > r.remaining()) return -2; // malformed; do not touch the icon
+   const bytes_t value = r.bytes(length);
+   if (kind != 0x000E) continue;
+@@ -1313,7 +1313,7 @@
+         while (nr.remaining() >= 4) {
+             const unsigned item = nr.u16();
+             const unsigned flags = nr.u8();
+-            const unsigned length = nr.u8();
++            const int length = nr.u8();
+             if (length > nr.remaining())
+                 break;
+             bytes_t raw = nr.bytes(length);
+@@ -1494,9 +1494,9 @@
+ 				}
+ 			}
+ 			debugLogA("ARS DIAG3: valid CAP_FILE rendezvous received, type=%u, proxy=%d, file-info=%d, relay-port=%u", (unsigned)validated.type, validated.proxy, validated.hasOffer, (unsigned)validated.port);
+-			if (auto *info = fileTlvs.find(0x2711)) {
++			if (auto *fileInfo = fileTlvs.find(0x2711)) {
+ 				oft2::FileOffer offer;
+-				if (oft2::parse_file_info((const unsigned char *)info->data.data(), info->data.size(), offer)) {
++				if (oft2::parse_file_info((const unsigned char *)fileInfo->data.data(), fileInfo->data.size(), offer)) {
+ 					mir_snprintf(line, "OFT2 offer: uin=%u, files=%u, bytes=%u, name=%s",
+ 						uin, (unsigned)offer.count, (unsigned)offer.size, offer.name.c_str());
+ 					KicqWriteXtrazDebug(line);
+@@ -1914,7 +1914,6 @@
+ 	r.skip(10);
+ 	const auto name = oscarid::key(r.ascii8());
+  if(name.empty()) return;
+- uint32_t uin = oscarid::uin(name);
+ 	int type = r.u16();
+ 
+ 	if (MCONTACT hContact = FindContact(name))
+--- a/normal/0.96.7/KICQ/src/version.h
++++ b/normal/0.96.7/KICQ/src/version.h
+@@ -1,7 +1,7 @@
+ #define __MAJOR_VERSION          0
+ #define __MINOR_VERSION          1
+ #define __RELEASE_NUM            0
+-#define __BUILD_NUM              2
++#define __BUILD_NUM              3
+ 
+ #include <stdver.h>
+ 
+--- a/tests/test_contact_api.py
++++ b/tests/test_contact_api.py
+@@ -17,21 +17,34 @@
+ using MCONTACT = unsigned;
+ using LONG = long;
+ static int adds, binds, flag, writes, nickWrites, statusWrites;
+-static bool fail, existing;
++static bool fail, existing, missingCore, missingExport;
++[[maybe_unused]] static unsigned build = 28846;
++static int lookups, diagnostics;
+ static std::string bound, screen;
+ static uint32_t storedUin;
+-#ifdef NEW_API
+-#define DBAC_NOTINLIST 1
+-MCONTACT db_add_contact(const char *module, int flags) {
++static MCONTACT modern_add(const char *module, int flags) {
+     ++adds; assert(std::string(module) == "PMLICQ_2");
+     if (fail) return 0;
+     bound = module; flag = flags; return 42;
+ }
++#ifdef NEW_API
++#define DBAC_NOTINLIST 1
++MCONTACT db_add_contact(const char *module, int flags) { return modern_add(module, flags); }
+ #else
+-MCONTACT db_add_contact() { ++adds; return fail ? 0 : 42; }
++MCONTACT db_add_contact() { assert(build != 28846); ++adds; return fail ? 0 : 42; }
+ void Proto_AddToContact(MCONTACT c, const char *module) { assert(c == 42); ++binds; bound = module; }
+ void db_set_b(MCONTACT c, const char *module, const char *setting, int value) {
+     assert(c == 42 && std::string(module) == "CList" && std::string(setting) == "NotOnList"); flag = value;
++}
++#define MIR_CDECL
++using MFileVersion = uint16_t[4];
++using HMODULE = void *;
++using FARPROC = void (*)();
++void Miranda_GetFileVersion(MFileVersion *v) { (*v)[0]=0; (*v)[1]=96; (*v)[2]=7; (*v)[3]=build; }
++HMODULE GetModuleHandleW(const wchar_t *name) { assert(std::wstring(name)==L"mir_core.mir"); return missingCore ? nullptr : reinterpret_cast<HMODULE>(1); }
++FARPROC GetProcAddress(HMODULE h, const char *name) {
++    assert(h && std::string(name)=="db_add_contact" && build==28846); ++lookups;
++    return missingExport ? nullptr : reinterpret_cast<FARPROC>(&modern_add);
+ }
+ #endif
+ void KicqDiagTrace(const char *) {}
+@@ -44,6 +57,7 @@
+ public:
+     const char *m_szModuleName = "PMLICQ_2";
+     MCONTACT CreateContact(const std::string &, bool);
++    void debugLogA(const char *, ...) { ++diagnostics; }
+     MCONTACT FindContact(const std::string &) { return existing ? 17 : 0; }
+     void setDword(MCONTACT c, const char *k, uint32_t v) { assert(c == 42 && std::string(k) == "UIN"); storedUin = v; ++writes; }
+     void setString(MCONTACT c, const char *k, const char *v) { assert(c == 42 && std::string(k) == "ScreenName"); screen=v; ++writes; }
+@@ -52,16 +66,22 @@
+ };
+ '''
+ CASES = r'''
+-static void reset() { adds=binds=flag=writes=nickWrites=statusWrites=0; fail=existing=false; bound.clear(); screen.clear(); storedUin=0; }
++static void reset() { adds=binds=flag=writes=nickWrites=statusWrites=0; fail=existing=missingCore=missingExport=false; lookups=diagnostics=0; bound.clear(); screen.clear(); storedUin=0; }
+ int main() {
+     CKicqProto p;
++#if !defined(NEW_API) && !defined(BRIDGE_TEST)
++    build=27000;
++#endif
+     for (bool temporary : {false, true}) {
+         for (bool aim : {false, true}) {
+             reset();
+             assert(p.CreateContact(aim ? "Aim User" : "712003", temporary) == 42);
+             assert(adds == 1 && bound == "PMLICQ_2" && flag == int(temporary));
+-#ifdef NEW_API
++#if defined(NEW_API) || defined(BRIDGE_TEST)
+             assert(binds == 0);
++#ifdef BRIDGE_TEST
++            assert(lookups == 1);
++#endif
+ #else
+             assert(binds == 1);
+ #endif
+@@ -73,6 +93,16 @@
+     reset(); existing=true; assert(p.CreateContact("712003", false)==17); assert(!adds && !writes && !statusWrites);
+     reset(); fail=true; assert(p.CreateContact("712003", true)==0); assert(adds==1 && !binds && !writes && !statusWrites && bound.empty());
+     reset(); assert(p.CreateContact("", true)==0); assert(!adds && !writes && !statusWrites);
++#ifdef BRIDGE_TEST
++    reset(); missingCore=true; assert(p.CreateContact("712003",true)==0); assert(!adds && !writes && !lookups && diagnostics==1);
++    reset(); missingExport=true; assert(p.CreateContact("712003",true)==0); assert(!adds && !writes && lookups==1 && diagnostics==1);
++    reset(); build=28845;
++#ifndef PMLICQ_ALLOW_LEGACY_CONTACT_API
++    assert(p.CreateContact("712003",true)==0); assert(!adds && !writes && !lookups && diagnostics==1);
++#else
++    assert(p.CreateContact("712003",true)==42); assert(adds==1 && binds==1 && flag==1 && !lookups);
++#endif
++#endif
+ }
+ '''
+ 
+@@ -89,15 +119,14 @@
+                 for new in ([False, True] if version == '0.96.7' else [True]):
+                     cpp = tmp/'test.cpp'; exe = tmp/'test'
+                     cpp.write_text(MOCK+body+CASES, encoding='utf-8')
+-                    cmd = [os.environ.get('CXX','g++'),'-std=c++17','-Wall','-Wextra','-I',str(src)]
++                    cmd = [os.environ.get('CXX','g++'),'-std=c++17','-Wall','-Wextra','-Werror','-I',str(src)]
+                     if new: cmd += ['-DNEW_API']
+                     if not new and flavor == 'normal':
+-                        # A stale SDK must now fail to compile by default.
+-                        bad = subprocess.run(cmd+[str(cpp),'-o',str(exe)],capture_output=True,text=True)
+-                        assert bad.returncode != 0 and 'PMLICQ_CONTACT_ABI_MISMATCH' in bad.stderr, bad.stderr
+-                        print('normal/0.96.7: old SDK rejected by default',flush=True)
+-                        # The explicit legacy opt-in remains available for legacy runtimes only.
+-                        cmd += ['-DPMLICQ_ALLOW_LEGACY_CONTACT_API']
++                        for extra, label in [(['-DBRIDGE_TEST'], 'old SDK -> #28846'), (['-DBRIDGE_TEST','-DPMLICQ_ALLOW_LEGACY_CONTACT_API'], 'bridge takes priority over opt-in'), (['-DPMLICQ_ALLOW_LEGACY_CONTACT_API'], 'explicit legacy runtime')]:
++                            subprocess.run(cmd+extra+[str(cpp),'-o',str(exe)],check=True)
++                            subprocess.run([str(exe)],check=True)
++                            print(f'{flavor}/{version}: {label} passed',flush=True)
++                        continue
+                     subprocess.run(cmd+[str(cpp),'-o',str(exe)],check=True)
+                     subprocess.run([str(exe)],check=True)
+                     print(f'{flavor}/{version}: {"new" if new else "old"} API passed',flush=True)
+--- a/tests/test_live_mood.py
++++ b/tests/test_live_mood.py
+@@ -14,10 +14,10 @@
+  bytes_t d; size_t pos=0;
+ public:
+  explicit OscarReader(const bytes_t& raw):d(raw){}
+- size_t remaining() const { return d.size()-pos; }
++ int remaining() const { return int(d.size()-pos); }
+  int u8(){return remaining() ? (uint8_t)d[pos++] : 0;}
+  int u16(){return (u8()<<8)|u8();}
+- bytes_t bytes(size_t n){n=std::min(n,remaining());auto r=d.substr(pos,n);pos+=n;return r;}
++ bytes_t bytes(size_t n){n=std::min(n,size_t(remaining()));auto r=d.substr(pos,n);pos+=n;return r;}
+ };
+ '''
+ test=r'''
+--- /dev/null
++++ b/CONTACT-API-CRASH-FIX3-RU.md
+@@ -0,0 +1,37 @@
++# PMLICQ 0.1.0.3 — исправление C1189 и переходник API контактов
++
++Для обычной ветки 0.96.7. Основа: предыдущий Crash Fix 2, все сетевые функции и остальные три ветки сохранены. PMLMRIM не изменялся.
++
++## Причина
++
++В v0.96.7 `db_add_contact(void)`, а в ревизии 495fea6 (`#28846`) `db_add_contact(const char *szModule, int flags = 0)`. В обоих случаях экспорт имеет то же имя; старый вызов в новом ядре приводит к чтению мусора как адреса имени протокола. В Fix 2 добавлена блокировка старого SDK, поэтому компилятор показал C1189, а не создал DLL.
++
++В Fix 3 убрана блокировка компиляции. При современном SDK используется обычный типизированный вызов. При старых заголовках проверяется фактическая версия mir_app через Miranda_GetFileVersion; только для 0.96.7.28846 берётся именованный экспорт `db_add_contact` из уже загруженного `mir_core.mir` через GetProcAddress и вызывается с `m_szModuleName` и флагом 0x0001 для временного контакта. Экспорт и значение флага проверены по официальному исходному коду этой ревизии. Никакой замены файлов ядра, ручного изменения SDK или подмены глобальных макросов. Если экспорт не найден либо версия неизвестна, по умолчанию создание нового контакта безопасно возвращает 0 с записью в Netlib log; старый вызов автоматически не применяется.
++
++Для намеренной сборки под старый runtime с точно соответствующим старым SDK сохранена явная опция PMLICQ_ALLOW_LEGACY_CONTACT_API (по умолчанию OFF), но для #28846 она не отменяет переходник. Не включайте её для неизвестного или нового runtime. Переходник рассчитан на конкретный известный билд; не является универсальной ABI-совместимостью всех API Miranda. По возможности всё равно используйте SDK точной ревизии установленного ядра.
++
++Дополнительно исправлены четыре предупреждения со скриншота: сравнения длины с remaining() в server.cpp (C4018, два места), затенение info в диагностике OFT2 (C4456), неиспользуемый UIN в HandleTyping (C4189). Поведение парсеров и передачи файлов не менялось.
++
++## Сборка под установленную 0.96.7 #28846 x64
++
++1. Замените каталог plugins/KICQ на normal/0.96.7/KICQ из нового архива. Можно использовать прежнее дерево сборки; в идеале — SDK ревизии 495fea6.
++2. Clean → Rebuild, Release | x64. Не определяйте DBAC_NOTINLIST или PMLICQ_ALLOW_LEGACY_CONTACT_API вручную. CMake: legacy OFF.
++3. В Output компилятора ищите `PMLICQ contact ABI: old SDK, runtime bridge for #28846` либо `PMLICQ contact ABI: native (module, flags)` (в зависимости от заголовков). Ошибки C1189 из Fix 2 в актуальном коде больше нет.
++4. Полностью закройте Miranda, сохраните профиль и предыдущую DLL, установите новую PMLICQ.dll (версия 0.1.0.3). Сохраните PDB этой же сборки. Сначала проверьте на копии профиля: подключение, импорт серверного списка, добавление нового UIN/SN и временного контакта.
++5. Если проблема повторяется, приложите DLL/PDB, Crash Report, лог сборки и Netlib log. Не отправляйте профиль или пароли.
++
++## Проверки
++
++- tests/test_contact_api.py: 8 компиляций и запусков с заглушками (старый SDK + #28846, отказ при неизвестном runtime/отсутствии ядра/экспорта, приоритет переходника над legacy opt-in, native и legacy пути во всех вариантах). GCC -Wall -Wextra -Werror.
++- tests/test_live_mood.py: 1 запуск, в том числе битые длины.
++- tests/identity_test.cpp и tests/avatar_offline_test.cpp: по 4 запуска.
++
++MSVC/Windows DLL и реальный запуск Miranda не проверены в данной среде. Это исходники экспериментального исправления, не подтверждённый бинарный релиз. Старые README и патчи оставлены как история; при расхождениях использовать эту инструкцию.
++
++Источники:
++- https://github.com/miranda-ng/miranda-ng/blob/v0.96.7/include/m_database.h
++- https://github.com/miranda-ng/miranda-ng/blob/495fea6/include/m_database.h
++- https://github.com/miranda-ng/miranda-ng/blob/495fea6/src/mir_core/src/db.cpp
++- https://github.com/miranda-ng/miranda-ng/blob/495fea6/src/mir_core/src/mir_core.def
++- https://github.com/miranda-ng/miranda-ng/blob/495fea6/src/mir_app/src/miranda.cpp
++- https://github.com/miranda-ng/miranda-ng/blob/495fea6/src/mir_app/res/version.rc

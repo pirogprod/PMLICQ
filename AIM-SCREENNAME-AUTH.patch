@@ -1,0 +1,4531 @@
+--- a/normal/0.96.7/KICQ/res/resource.rc
++++ b/normal/0.96.7/KICQ/res/resource.rc
+@@ -28,8 +28,8 @@
+ EXSTYLE WS_EX_CONTROLPARENT
+ FONT 8, "MS Shell Dlg", 0, 0, 0x1
+ BEGIN
+-    LTEXT           "UIN:",IDC_STATIC,0,7,60,8
+-    EDITTEXT        IDC_UIN,62,5,123,12,ES_AUTOHSCROLL | ES_NUMBER
++    LTEXT           "UIN / SN:",IDC_STATIC,0,7,60,8
++    EDITTEXT        IDC_UIN,62,5,123,12,ES_AUTOHSCROLL
+     LTEXT           "Password:",IDC_STATIC,0,23,60,8
+     EDITTEXT        IDC_PASSWORD,62,21,123,12,ES_PASSWORD | ES_AUTOHSCROLL
+     LTEXT           "Server:",IDC_STATIC,0,39,60,8
+@@ -52,8 +52,8 @@
+ FONT 8, "MS Shell Dlg", 0, 0, 0x1
+ BEGIN
+     GROUPBOX        "Account",IDC_STATIC,7,7,291,62
+-    LTEXT           "UIN:",IDC_STATIC,15,22,80,8
+-    EDITTEXT        IDC_UIN,100,20,120,12,ES_AUTOHSCROLL | ES_NUMBER
++    LTEXT           "UIN / SN:",IDC_STATIC,15,22,80,8
++    EDITTEXT        IDC_UIN,100,20,120,12,ES_AUTOHSCROLL
+     LTEXT           "Password:",IDC_STATIC,15,40,80,8
+     EDITTEXT        IDC_PASSWORD,100,38,120,12,ES_PASSWORD | ES_AUTOHSCROLL
+     GROUPBOX        "Connection",IDC_STATIC,7,73,291,103
+--- a/normal/0.96.7/KICQ/src/main.cpp
++++ b/normal/0.96.7/KICQ/src/main.cpp
+@@ -36,7 +36,7 @@
+ CMPlugin::CMPlugin() :
+ 	ACCPROTOPLUGIN<CKicqProto>("PMLICQ", pluginInfoEx)
+ {
+-	SetUniqueId("UIN");
++	SetUniqueId("ScreenName");
+ }
+ 
+ /////////////////////////////////////////////////////////////////////////////////////////
+--- a/normal/0.96.7/KICQ/src/options.cpp
++++ b/normal/0.96.7/KICQ/src/options.cpp
+@@ -35,7 +35,8 @@
+         edtFileProxyPort(this, IDC_FILEPROXY_PORT),
+ 		cmbClientId(this, IDC_CLIENT_ID), m_account(ppro)
+ 	{
+-		CreateLink(edtUin, "UIN", DBVT_DWORD, 0);
++		// LoginId is applied explicitly to preserve the legacy DWORD UIN.
++		CreateLink(edtUin, "LoginId", L"");
+ 		CreateLink(edtPassword, "Password", L"");
+ 		CreateLink(edtServer, ppro->m_wszServer);
+ 		CreateLink(edtPort, ppro->m_iPort);
+@@ -48,7 +49,9 @@
+ 	{
+ 		// the XOR login of that ICQ era only uses the first 8 characters
+ 		edtPassword.SendMsg(EM_LIMITTEXT, 8, 0);
+-		edtUin.SendMsg(EM_LIMITTEXT, 10, 0);
++		edtUin.SendMsg(EM_LIMITTEXT, 97, 0);
++ auto login=m_account->AccountId();
++ SetDlgItemTextW(m_hwnd,IDC_UIN,_A2T(login.c_str()).get());
+ 		static const wchar_t* const choices[] = {
+ 			L"PMLICQ (default)", L"Miranda NG (actual EXE version)", L"Miranda IM",
+ 			L"QIP 2005", L"QIP 2010", L"QIP Infium", L"QIP 2012",
+@@ -62,7 +65,13 @@
+ 
+ 	bool OnApply() override
+ 	{
+-		if (!CKicqDlgBase::OnApply()) return false;
++		wchar_t raw[98]={}; GetDlgItemTextW(m_hwnd,IDC_UIN,raw,_countof(raw));
++ const auto id=oscarid::key(T2Utf(raw).get());
++ if(id.empty() && raw[0]) return false;
++ if (!CKicqDlgBase::OnApply()) return false;
++ m_account->setDword("UIN",oscarid::uin(id));
++ m_account->setString("LoginId",id.c_str());
++ m_account->setString("ScreenName",id.c_str());
+ 		const LPARAM preset = cmbClientId.GetCurData();
+ 		if (preset < 0 || preset > 10) return false;
+ 		m_account->setByte("ClientIdPreset", BYTE(preset));
+--- /dev/null
++++ b/normal/0.96.7/KICQ/src/oscar_identity.h
+@@ -0,0 +1,26 @@
++#pragma once
++#include <string>
++#include <cstdint>
++// OSCAR names are case-insensitive and ignore ASCII spaces. Numeric UINs
++// remain numeric for ICQ-only services; never parse a prefix of an AIM name.
++namespace oscarid {
++inline uint32_t uin(const std::string &s) {
++ if (s.empty()) return 0;
++ uint64_t n=0;
++ for (char c:s) { if(c<'0'||c>'9') return 0; n=n*10+(c-'0'); if(n>0xffffffffULL) return 0; }
++ return static_cast<uint32_t>(n);
++}
++inline std::string key(const std::string &s) {
++ std::string k;
++ for (unsigned char c:s) {
++  if(c==' ') continue;
++  if(c>='A'&&c<='Z') c+=32;
++  if(!((c>='a'&&c<='z')||(c>='0'&&c<='9')||c=='@'||c=='.'||c=='_'||c=='-')) return {};
++  k+=char(c);
++ }
++ if(k.empty()||k.size()>97) return {};
++ bool numeric=true; for(char c:k) if(c<'0'||c>'9') numeric=false;
++ if(numeric) { auto n=uin(k); return n?std::to_string(n):std::string(); }
++ return k;
++}
++}
+--- a/normal/0.96.7/KICQ/src/proto.cpp
++++ b/normal/0.96.7/KICQ/src/proto.cpp
+@@ -123,7 +123,7 @@
+ 
+ static int CompareUsers(const KicqUser *p1, const KicqUser *p2)
+ {
+-	return (p1->uin < p2->uin) ? -1 : (p1->uin > p2->uin) ? 1 : 0;
++	return p1->name.compare(p2->name);
+ }
+ 
+ CKicqProto::CKicqProto(const char *szModuleName, const wchar_t *wszUserName) :
+@@ -147,6 +147,8 @@
+ 
+ 	HookProtoEvent(ME_OPT_INITIALISE, &CKicqProto::OnOptionsInit);
+ 	CreateProtoService("/XStatusEditor", &CKicqProto::OnMenuXStatus);
++ CreateProtoService("/RetryAuth", &CKicqProto::OnRetryAuth);
++ HookProtoEvent(ME_CLIST_PREBUILDCONTACTMENU,&CKicqProto::OnPreBuildContactMenu);
+ 	CreateProtoService(PS_GETAVATARCAPS, &CKicqProto::OnAvatarCaps);
+ 	CreateProtoService(PS_GETAVATARINFO, &CKicqProto::OnGetAvatarInfo);
+ 	CreateProtoService(PS_GETMYAVATAR, &CKicqProto::OnGetMyAvatar);
+@@ -158,6 +160,7 @@
+ 
+ CKicqProto::~CKicqProto()
+ {
++ if(m_hRetryAuthMenu) Menu_RemoveItem(m_hRetryAuthMenu);
+  StopBart();
+  ShutdownOutgoingFiles();
+ }
+@@ -181,6 +184,15 @@
+ 			if (g_kicqExtraIcon) ExtraIcon_SetIcon(g_kicqExtraIcon, h, INVALID_HANDLE_VALUE);
+ 		}
+ 	}
++ for (auto &contact : AccContacts()) {
++  auto id=ContactId(contact); if(!id.empty()) setString(contact,"ScreenName",id.c_str());
++ }
++ {auto id=AccountId();if(!id.empty()){setString("ScreenName",id.c_str());setString("LoginId",id.c_str());}}
++ if(!m_hRetryAuthMenu) {
++  CMenuItem mi(&g_plugin); mi.name.a=LPGEN("Request authorization again"); mi.position=200200;
++  CMStringA service(FORMAT,"%s/RetryAuth",m_szModuleName); mi.pszService=service.GetBuffer();
++  m_hRetryAuthMenu=Menu_AddContactMenuItem(&mi);
++ }
+ 	EnsureXStatusMenu();
+  bool registered = false;
+  for (const auto &name : g_kicqIconModules)
+@@ -227,17 +239,34 @@
+ /////////////////////////////////////////////////////////////////////////////////////////
+ // contacts
+ 
+-MCONTACT CKicqProto::FindContact(uint32_t uin)
+-{
+-	for (auto &hContact : AccContacts())
+-		if (getDword(hContact, "UIN") == uin)
+-			return hContact;
+-	return 0;
+-}
+-
+-MCONTACT CKicqProto::CreateContact(uint32_t uin, bool bTemporary)
+-{
+-	MCONTACT hContact = FindContact(uin);
++std::string CKicqProto::ContactId(MCONTACT contact)
++{
++ const uint32_t uin = getDword(contact, "UIN");
++ if (uin) return std::to_string(uin);
++ return oscarid::key(getMStringA(contact, "ScreenName").c_str());
++}
++std::string CKicqProto::AccountId()
++{
++ const uint32_t uin = getDword("UIN");
++ if (uin) return std::to_string(uin);
++ return oscarid::key(getMStringA("LoginId").c_str());
++}
++MCONTACT CKicqProto::FindContact(const std::string &name)
++{
++ const auto id = oscarid::key(name);
++ if(id.empty()) return 0;
++ const auto uin=oscarid::uin(id);
++ for (auto &hContact : AccContacts())
++  if (uin ? getDword(hContact,"UIN")==uin : ContactId(hContact)==id) return hContact;
++ return 0;
++}
++
++MCONTACT CKicqProto::CreateContact(const std::string &name, bool bTemporary)
++{
++ const auto id = oscarid::key(name);
++ if(id.empty()) return 0;
++ const auto uin = oscarid::uin(id);
++	MCONTACT hContact = FindContact(id);
+ 	if (hContact)
+ 		return hContact;
+ 
+@@ -247,23 +276,25 @@
+ 	Proto_AddToContact(hContact, m_szModuleName);
+ 	if (bTemporary)
+ 		db_set_b(hContact, "CList", "NotOnList", 1);
+-	setDword(hContact, "UIN", uin);
++	if(uin) setDword(hContact, "UIN", uin);
++ setString(hContact, "ScreenName", id.c_str());
++ if(!uin) setWString(hContact, "Nick", _A2T(id.c_str()).get());
+ 	setWord(hContact, "Status", ID_STATUS_OFFLINE);
+ 	return hContact;
+ }
+ 
+-KicqUser* CKicqProto::FindUser(uint32_t uin)
+-{
+-	KicqUser tmp(uin, 0);
++KicqUser* CKicqProto::FindUser(const std::string &name)
++{
++	KicqUser tmp(oscarid::key(name), 0);
+ 	return m_arUsers.find(&tmp);
+ }
+ 
+-KicqUser* CKicqProto::AddUser(uint32_t uin, MCONTACT hContact)
+-{
+-	if (auto *pUser = FindUser(uin))
++KicqUser* CKicqProto::AddUser(const std::string &name, MCONTACT hContact)
++{
++	if (auto *pUser = FindUser(name))
+ 		return pUser;
+ 
+-	auto *pUser = new KicqUser(uin, hContact);
++	auto *pUser = new KicqUser(oscarid::key(name), hContact);
+ 	m_arUsers.insert(pUser);
+ 	return pUser;
+ }
+@@ -394,7 +425,7 @@
+ 	if (IsStatusConnecting(m_iStatus))
+ 		return 0;
+ 
+-	if (getDword("UIN") == 0 || getMStringA("Password").IsEmpty()) {
++	if (AccountId().empty() || getMStringA("Password").IsEmpty()) {
+ 		ProtoBroadcastAck(0, ACKTYPE_LOGIN, ACKRESULT_FAILED, nullptr, LOGINERR_BADUSERID);
+ 		return 0;
+ 	}
+@@ -443,7 +474,7 @@
+ {
+ 	switch (type) {
+ 	case PFLAGNUM_1:
+-		return PF1_FILE | PF1_IM | PF1_SERVERCLIST | PF1_AUTHREQ | PF1_BASICSEARCH | PF1_ADDSEARCHRES | PF1_MODEMSGRECV | PF1_MODEMSGSEND | PF1_NUMERICUSERID;
++		return PF1_FILE | PF1_IM | PF1_SERVERCLIST | PF1_AUTHREQ | PF1_BASICSEARCH | PF1_ADDSEARCHRES | PF1_MODEMSGRECV | PF1_MODEMSGSEND;
+ 
+ 	case PFLAGNUM_2:
+ 		return PF2_ONLINE | PF2_SHORTAWAY | PF2_LONGAWAY | PF2_LIGHTDND | PF2_HEAVYDND | PF2_FREECHAT | PF2_INVISIBLE;
+@@ -455,7 +486,7 @@
+ 		return PF4_SUPPORTTYPING | PF4_IMSENDOFFLINE | PF4_AVATARS;
+ 
+ 	case PFLAG_UNIQUEIDTEXT:
+-		return (INT_PTR)TranslateT("UIN");
++		return (INT_PTR)TranslateT("UIN / Screen Name");
+ 
+ 	case PFLAG_MAXLENOFMESSAGE:
+ 		return 2048;
+@@ -468,9 +499,10 @@
+ 
+ int CKicqProto::SendMsg(MCONTACT hContact, MEVENT, const char *pszSrc)
+ {
+-	uint32_t uin = getDword(hContact, "UIN");
++	const auto peer = ContactId(hContact);
++ uint32_t uin = oscarid::uin(peer);
+ 	int seq = InterlockedIncrement((long *)&m_msgSeq);
+-	if (!m_bOnline || uin == 0) {
++	if (!m_bOnline || peer.empty()) {
+ 		ProtoBroadcastAsync(hContact, ACKTYPE_MESSAGE, ACKRESULT_FAILED, (HANDLE)seq, (LPARAM)TranslateT("You are offline"));
+ 		return seq;
+ 	}
+@@ -478,8 +510,7 @@
+ 	CMStringW text(Utf2T(pszSrc).get());
+ 	text.Replace(L"\n", L"\r\n");
+ 
+-	char szUin[20];
+-	_itoa(uin, szUin, 10);
++	const char *szUin = peer.c_str();
+ 
+ 	bytes_t cookie(8, 0);
+ 	uint64_t id = GetTickCount64() ^ (uint64_t(rand()) << 32);
+@@ -489,7 +520,7 @@
+ 	bool bRelay = false, bUtf8 = false, bOnline = false;
+ 	{
+ 		mir_cslock lck(m_csRoster);
+-		if (auto *pUser = FindUser(uin)) {
++		if (auto *pUser = FindUser(peer)) {
+ 			bOnline = pUser->bOnline;
+ 			bUtf8 = pUser->bUtf8;
+ 			bRelay = pUser->ssiId != 0 && pUser->bAuthorized && pUser->bOnline && pUser->bServerRelay;
+@@ -502,12 +533,12 @@
+ 		reqId = m_nextMsgReq++;
+ 		if (m_nextMsgReq > 0x7FFFFFF0)
+ 			m_nextMsgReq = 0x1000;
+-		m_pendingMsgs[reqId] = { uin, seq };
++		m_pendingMsgs[reqId] = { peer, hContact, seq };
+ 	}
+ 
+-	if (bRelay)
++	if (uin && getDword("UIN") && bRelay)
+ 		Send(OscarPackets::messageChannel2(szUin, text, bUtf8, cookie, reqId));
+-	else if (!bOnline) {
++	else if (uin && getDword("UIN") && !bOnline) {
+ 		// kicq.ru's offline store keeps only bytes 0x01-0x7F and stops at the first 0x00:
+ 		// ASCII text survives as charset 0, anything else only as UCS-2 where only characters
+ 		// >= U+0100 get through. Spaces become EN SPACE (U+2002) so that whole Cyrillic
+@@ -532,12 +563,12 @@
+ 
+ int CKicqProto::UserIsTyping(MCONTACT hContact, int type)
+ {
+-	uint32_t uin = getDword(hContact, "UIN");
+-	if (!m_bOnline || uin == 0 || m_iStatus == ID_STATUS_INVISIBLE)
++	const auto peer = ContactId(hContact);
++ uint32_t uin = oscarid::uin(peer);
++	if (!m_bOnline || peer.empty() || m_iStatus == ID_STATUS_INVISIBLE)
+ 		return 0;
+ 
+-	char szUin[20];
+-	_itoa(uin, szUin, 10);
++	const char *szUin = peer.c_str();
+ 	Send(OscarPackets::typingNotify(szUin, type == PROTOTYPE_SELFTYPING_ON ? 2 : 0));
+ 	return 0;
+ }
+@@ -547,9 +578,9 @@
+ 
+ void CKicqProto::SsiAddContact(MCONTACT hContact, int groupId)
+ {
+-	uint32_t uin = getDword(hContact, "UIN");
+-	char szUin[20];
+-	_itoa(uin, szUin, 10);
++	const auto peer = ContactId(hContact);
++ uint32_t uin = oscarid::uin(peer);
++	const char *szUin = peer.c_str();
+ 
+ 	CMStringW wszNick(db_get_wsm(hContact, "CList", "MyHandle"));
+ 	if (wszNick.IsEmpty())
+@@ -557,7 +588,8 @@
+ 	if (wszNick.IsEmpty())
+ 		wszNick = _A2T(szUin).get();
+ 
+-	m_pendAdd.uin = uin;
++	if(peer.empty()) return;
++ m_pendAdd.id = peer;
+ 	m_pendAdd.name = wszNick;
+ 	m_pendAdd.groupId = groupId;
+ 	m_pendAdd.hContact = hContact;
+@@ -573,12 +605,14 @@
+ 
+ MCONTACT CKicqProto::AddToList(int flags, PROTOSEARCHRESULT *psr)
+ {
+-	uint32_t uin = (psr->flags & PSR_UNICODE) ? _wtoi(psr->id.w) : atoi(psr->id.a);
+-	if (uin == 0)
++	if(!psr || ((psr->flags & PSR_UNICODE) ? psr->id.w==nullptr : psr->id.a==nullptr))return 0;
++ const auto peer = oscarid::key((psr->flags & PSR_UNICODE) ? T2Utf(psr->id.w).get() : psr->id.a);
++	if (peer.empty())
+ 		return 0;
+ 
+ 	bool bTemporary = (flags & PALF_TEMPORARY) != 0;
+-	MCONTACT hContact = CreateContact(uin, bTemporary);
++	MCONTACT hContact = CreateContact(peer, bTemporary);
++ if(!hContact) return 0;
+ 	if (psr->nick.w && (psr->flags & PSR_UNICODE))
+ 		setWString(hContact, "Nick", psr->nick.w);
+ 
+@@ -621,7 +655,7 @@
+ 	if (hContact == 0)
+ 		return 0;
+ 
+-	CMStringW wszUin(FORMAT, L"%u", getDword(hContact, "UIN"));
++	CMStringW wszUin(_A2T(ContactId(hContact).c_str()).get());
+ 	PROTOSEARCHRESULT psr = {};
+ 	psr.cbSize = sizeof(psr);
+ 	psr.flags = PSR_UNICODE;
+@@ -634,11 +668,12 @@
+ 	if (!(flags & CDF_DEL_CONTACT) || !m_bOnline)
+ 		return true;
+ 
+-	uint32_t uin = getDword(hContact, "UIN");
++	const auto peer = ContactId(hContact);
++ uint32_t uin = oscarid::uin(peer);
+ 	int groupId = 0, ssiId = 0;
+ 	{
+ 		mir_cslock lck(m_csRoster);
+-		if (auto *pUser = FindUser(uin)) {
++		if (auto *pUser = FindUser(peer)) {
+ 			groupId = pUser->groupId;
+ 			ssiId = pUser->ssiId;
+ 			m_arUsers.remove(pUser);
+@@ -646,8 +681,7 @@
+ 	}
+ 
+ 	if (ssiId != 0) {
+-		char szUin[20];
+-		_itoa(uin, szUin, 10);
++		const char *szUin = peer.c_str();
+ 		m_pendDel.uin = uin;
+ 		Send(OscarPackets::ssiEditStart());
+ 		Send(OscarPackets::deleteContact(szUin, groupId, ssiId));
+@@ -690,16 +724,17 @@
+ 	if (mir_strcmp(Proto_GetBaseAccountName(hContact), m_szModuleName))
+ 		return 0;
+ 
+-	uint32_t uin = getDword(hContact, "UIN");
++	const auto peer = ContactId(hContact);
++ uint32_t uin = oscarid::uin(peer);
+ 	CMStringW wszNick(db_get_wsm(hContact, "CList", "MyHandle"));
+ 	if (wszNick.IsEmpty())
+-		wszNick.Format(L"%u", uin);
++		wszNick = _A2T(peer.c_str()).get();
+ 
+ 	int groupId = 0, ssiId = 0;
+ 	bool bAuthorized = true;
+ 	{
+ 		mir_cslock lck(m_csRoster);
+-		auto *pUser = FindUser(uin);
++		auto *pUser = FindUser(peer);
+ 		if (pUser == nullptr || pUser->ssiId == 0)
+ 			return 0;
+ 		groupId = pUser->groupId;
+@@ -710,9 +745,8 @@
+ 	if (getMStringW(hContact, "SrvNick") == wszNick)
+ 		return 0; // the change came from the server
+ 
+-	char szUin[20];
+-	_itoa(uin, szUin, 10);
+-	m_pendRename.uin = uin;
++	const char *szUin = peer.c_str();
++	m_pendRename.id = peer;
+ 	m_pendRename.name = wszNick;
+ 	Send(OscarPackets::ssiEditStart());
+ 	Send(OscarPackets::renameContact(szUin, wszNick, groupId, ssiId, !bAuthorized));
+@@ -729,11 +763,12 @@
+ 	if (mir_strcmp(Proto_GetBaseAccountName(hContact), m_szModuleName))
+ 		return 0;
+ 
+-	uint32_t uin = getDword(hContact, "UIN");
++	const auto peer = ContactId(hContact);
++ uint32_t uin = oscarid::uin(peer);
+ 	int oldGroup = 0, ssiId = 0, newGroup = 0;
+ 	{
+ 		mir_cslock lck(m_csRoster);
+-		auto *pUser = FindUser(uin);
++		auto *pUser = FindUser(peer);
+ 		if (pUser == nullptr || pUser->ssiId == 0)
+ 			return 0;
+ 
+@@ -748,8 +783,7 @@
+ 	}
+ 
+ 	// OSCAR has no "move": the item is deleted from the old group and added to the new one
+-	char szUin[20];
+-	_itoa(uin, szUin, 10);
++	const char *szUin = peer.c_str();
+ 	m_pendDel.uin = 0;
+ 	Send(OscarPackets::ssiEditStart());
+ 	Send(OscarPackets::deleteContact(szUin, oldGroup, ssiId));
+@@ -768,14 +802,16 @@
+ 
+ int CKicqProto::AuthRequest(MCONTACT hContact, const wchar_t *szMessage)
+ {
+-	uint32_t uin = getDword(hContact, "UIN");
+-	if (!m_bOnline || uin == 0)
++	const auto peer = ContactId(hContact);
++ uint32_t uin = oscarid::uin(peer);
++	if (!m_bOnline || peer.empty())
+ 		return 1;
+ 
+-	char szUin[20];
+-	_itoa(uin, szUin, 10);
++	const char *szUin = peer.c_str();
+ 	Send(OscarPackets::futureAuthGrant(szUin));
+-	Send(OscarPackets::authRequest(szUin, mir_wstrlen(szMessage) ? szMessage : TranslateT("Please authorize me")));
++	Send(OscarPackets::authRequest(szUin, szMessage && mir_wstrlen(szMessage) ? szMessage : TranslateT("Please authorize me")));
++ setByte(hContact,"Auth",1);
++ {mir_cslock lck(m_csRoster);if(auto *pUser=FindUser(peer))pUser->bAuthorized=false;}
+ 	return 0;
+ }
+ 
+@@ -790,26 +826,26 @@
+ int CKicqProto::Authorize(MEVENT hDbEvent)
+ {
+ 	MCONTACT hContact = AuthEventContact(m_szModuleName, hDbEvent);
+-	uint32_t uin = hContact ? getDword(hContact, "UIN") : 0;
+-	if (!m_bOnline || uin == 0)
++	const auto peer = hContact ? ContactId(hContact) : std::string();
++	if (!m_bOnline || peer.empty())
+ 		return 1;
+ 
+-	char szUin[20];
+-	_itoa(uin, szUin, 10);
++	const char *szUin = peer.c_str();
+ 	Send(OscarPackets::authReply(szUin, true));
++ delSetting(hContact,"Grant");
+ 	return 0;
+ }
+ 
+ int CKicqProto::AuthDeny(MEVENT hDbEvent, const wchar_t *)
+ {
+ 	MCONTACT hContact = AuthEventContact(m_szModuleName, hDbEvent);
+-	uint32_t uin = hContact ? getDword(hContact, "UIN") : 0;
+-	if (!m_bOnline || uin == 0)
++	const auto peer = hContact ? ContactId(hContact) : std::string();
++	if (!m_bOnline || peer.empty())
+ 		return 1;
+ 
+-	char szUin[20];
+-	_itoa(uin, szUin, 10);
++	const char *szUin = peer.c_str();
+ 	Send(OscarPackets::authReply(szUin, false));
++ delSetting(hContact,"Grant");
+ 	return 0;
+ }
+ 
+@@ -947,23 +983,36 @@
+ int CKicqProto::GetInfo(MCONTACT hContact, int)
+ {
+ 	uint32_t uin = hContact ? getDword(hContact, "UIN") : getDword("UIN");
+-	if (!m_bOnline || uin == 0)
++	if (!m_bOnline || uin == 0 || !getDword("UIN"))
+ 		return 1;
+ 
+ 	RequestUserInfo(uin, hContact, nullptr);
+ 	return 0;
+ }
+ 
++struct KicqScreenSearch { std::string id; HANDLE handle; };
++void __cdecl CKicqProto::SearchScreenName(void *param)
++{
++ std::unique_ptr<KicqScreenSearch> search(static_cast<KicqScreenSearch*>(param));
++ // Direct add by exact OSCAR name; no claim that the account exists.
++ Sleep(100);
++ CMStringW id(_A2T(search->id.c_str()).get());
++ PROTOSEARCHRESULT psr = {}; psr.cbSize=sizeof(psr); psr.flags=PSR_UNICODE;
++ psr.id.w=id.GetBuffer(); psr.nick.w=id.GetBuffer();
++ ProtoBroadcastAck(0,ACKTYPE_SEARCH,ACKRESULT_DATA,search->handle,(LPARAM)&psr);
++ ProtoBroadcastAck(0,ACKTYPE_SEARCH,ACKRESULT_SUCCESS,search->handle,0);
++}
+ HANDLE CKicqProto::SearchBasic(const wchar_t *id)
+ {
+-	uint32_t uin = _wtoi(id);
+-	if (!m_bOnline || uin == 0)
+-		return nullptr;
+-
+-	static long searchId = 0;
+-	HANDLE hSearch = (HANDLE)(INT_PTR)InterlockedIncrement(&searchId);
+-	RequestUserInfo(uin, 0, hSearch);
+-	return hSearch;
++ if (!m_bOnline || !id) return nullptr;
++ const auto peer=oscarid::key(T2Utf(id).get());
++ if(peer.empty()) return nullptr;
++ const uint32_t uin=oscarid::uin(peer);
++ static long searchId=0;
++ HANDLE hSearch=(HANDLE)(INT_PTR)InterlockedIncrement(&searchId);
++ if(uin && getDword("UIN")) RequestUserInfo(uin,0,hSearch);
++ else ForkThread(&CKicqProto::SearchScreenName,new KicqScreenSearch{peer,hSearch});
++ return hSearch;
+ }
+ 
+ // X-status selector with bilingual names and local title/description editor.
+@@ -2076,3 +2125,16 @@
+  // Accepted locally. The server's SSI result, then BART's upload result decide success.
+  return 0;
+ }
++
++INT_PTR __cdecl CKicqProto::OnRetryAuth(WPARAM w, LPARAM)
++{
++ MCONTACT c=(MCONTACT)w;
++ if(!c || mir_strcmp(Proto_GetBaseAccountName(c),m_szModuleName) || !getByte(c,"Auth",0)) return 1;
++ return AuthRequest(c,TranslateT("Please authorize me"));
++}
++int __cdecl CKicqProto::OnPreBuildContactMenu(WPARAM w, LPARAM)
++{
++ MCONTACT c=(MCONTACT)w;
++ if(m_hRetryAuthMenu) Menu_ShowItem(m_hRetryAuthMenu,c && m_bOnline && !mir_strcmp(Proto_GetBaseAccountName(c),m_szModuleName) && getByte(c,"Auth",0));
++ return 0;
++}
+--- a/normal/0.96.7/KICQ/src/proto.h
++++ b/normal/0.96.7/KICQ/src/proto.h
+@@ -1,3 +1,4 @@
++#include "oscar_identity.h"
+ /*
+ Copyright (C) 2026 Miranda NG team
+ 
+@@ -38,10 +39,11 @@
+ // per-contact state that lives only as long as the connection
+ struct KicqUser
+ {
+-	KicqUser(uint32_t _uin, MCONTACT _hContact) :
+-		uin(_uin), hContact(_hContact)
++	KicqUser(const std::string &id, MCONTACT _hContact) :
++		name(id), uin(oscarid::uin(id)), hContact(_hContact)
+ 	{}
+ 
++	std::string name;
+ 	uint32_t uin;
+ 	MCONTACT hContact;
+ 	int groupId = 0, ssiId = 0; // 0: not on the server-side list
+@@ -52,7 +54,8 @@
+ 
+ struct KicqPendingMsg
+ {
+-	uint32_t uin;
++	std::string name;
++	MCONTACT contact;
+ 	int seq;
+ };
+ 
+@@ -197,8 +200,12 @@
+ 	void HandleYouWereAdded(const bytes_t &data);
+ 	void HandleSsiItem(const bytes_t &data, bool bDeleted);
+ 	void HandleSsiResult(const bytes_t &data, uint32_t reqId);
+-	void DeliverMessage(uint32_t uin, const CMStringW &text, time_t when);
++	void DeliverMessage(const std::string &name, const CMStringW &text, time_t when);
+ 	void CheckTimeouts();
++	void __cdecl SearchScreenName(void *);
++	HGENMENU m_hRetryAuthMenu = nullptr;
++	INT_PTR __cdecl OnRetryAuth(WPARAM, LPARAM);
++	int __cdecl OnPreBuildContactMenu(WPARAM, LPARAM);
+ 
+ 	// roster
+ 	mir_cs m_csRoster;
+@@ -206,20 +213,26 @@
+ 	OBJLIST<KicqGroup> m_arGroups;
+ 	std::set<CMStringW> m_offlineSeen;
+ 
+-	KicqUser* FindUser(uint32_t uin);
+-	KicqUser* AddUser(uint32_t uin, MCONTACT hContact);
++	KicqUser* FindUser(const std::string &name);
++	KicqUser* FindUser(uint32_t uin) { return uin ? FindUser(std::to_string(uin)) : nullptr; }
++	KicqUser* AddUser(const std::string &name, MCONTACT hContact);
+ 	KicqGroup* FindGroup(int id);
+ 	KicqGroup* FindGroup(const wchar_t *name);
+ 	int NewSsiId();
+-	MCONTACT FindContact(uint32_t uin);
+-	MCONTACT CreateContact(uint32_t uin, bool bTemporary);
+-	void ApplyRosterItem(uint32_t uin, int groupId, int ssiId, const OscarTlvList &tlvs, bool bFromLogin);
++	std::string ContactId(MCONTACT contact);
++	std::string AccountId();
++	MCONTACT FindContact(const std::string &name);
++	MCONTACT FindContact(uint32_t uin) { return uin ? FindContact(std::to_string(uin)) : 0; }
++	MCONTACT CreateContact(const std::string &name, bool bTemporary);
++	MCONTACT CreateContact(uint32_t uin, bool temporary) { return uin ? CreateContact(std::to_string(uin), temporary) : 0; }
++	void ApplyRosterItem(const std::string &name, int groupId, int ssiId, const OscarTlvList &tlvs, bool bFromLogin);
+ 	int ResolveGroupFor(MCONTACT hContact);
+ 
+ 	// one SSI edit at a time, like Jasmine: the result names only the request type
+ 	struct PendingSsi
+ 	{
+ 		uint32_t uin = 0;
++		std::string id;
+ 		CMStringW name;
+ 		int groupId = 0, ssiId = 0;
+ 		MCONTACT hContact = 0;
+--- a/normal/0.96.7/KICQ/src/server.cpp
++++ b/normal/0.96.7/KICQ/src/server.cpp
+@@ -94,10 +94,11 @@
+ {
+ 	m_iLoginError = 0;
+ 	m_cookie.clear();
+-	m_szUin.Format("%u", getDword("UIN"));
++	m_szUin = AccountId().c_str();
+ 	{
+ 		mir_cslock lck(m_csRoster);
+ 		m_arUsers.destroy();
++  m_pendAdd.id.clear();m_pendRename.id.clear();
+ 		m_arGroups.destroy();
+ 		m_offlineSeen.clear();
+ 	}
+@@ -353,7 +354,7 @@
+ 		if (bLogin) {
+ 			debugLogA("login server hello, sending XOR login");
+ 			ptrA szPassword(getStringA("Password"));
+-			Send(1, OscarPackets::xorLogin(m_szUin, szPassword ? szPassword.get() : "", getByte("ClientIdPreset", 0)));
++			Send(1, OscarPackets::xorLogin(m_szUin, szPassword ? szPassword.get() : "", getByte("ClientIdPreset", 0) ? getByte("ClientIdPreset", 0) : (getDword("UIN") ? 0 : 10)));
+ 		}
+ 		else {
+ 			debugLogA("BOS hello, sending cookie");
+@@ -546,7 +547,7 @@
+ // roster
+ 
+ // mirrors one server-side contact into the contact list
+-void CKicqProto::ApplyRosterItem(uint32_t uin, int groupId, int ssiId, const OscarTlvList &tlvs, bool bFromLogin)
++void CKicqProto::ApplyRosterItem(const std::string &name, int groupId, int ssiId, const OscarTlvList &tlvs, bool bFromLogin)
+ {
+ 	bool bTemporary;
+ 	CMStringW wszGroup;
+@@ -558,15 +559,16 @@
+ 			wszGroup = pGroup->name;
+ 	}
+ 
+-	MCONTACT hContact = FindContact(uin);
++	MCONTACT hContact = FindContact(name);
+ 	bool bNew = (hContact == 0);
+ 	if (bNew)
+-		hContact = CreateContact(uin, bTemporary);
++		hContact = CreateContact(name, bTemporary);
++ if(!hContact) return;
+ 
+ 	bool bAuthorized = !tlvs.has(0x66);
+ 	{
+ 		mir_cslock lck(m_csRoster);
+-		auto *pUser = AddUser(uin, hContact);
++		auto *pUser = AddUser(name, hContact);
+ 		pUser->hContact = hContact;
+ 		pUser->groupId = groupId;
+ 		pUser->ssiId = bTemporary ? 0 : ssiId;
+@@ -640,7 +642,7 @@
+                         GetFileAttributesW(oldPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+                         delSetting("BartOwnAvatarPath");
+                         ReportSelfAvatarChanged();
+-                        QueueBartAvatar(uint32_t(atoi(m_szUin)), 1, hash);
++                        QueueBartAvatar(getDword("UIN"), 1, hash);
+                     }
+                 }
+             }
+@@ -660,9 +662,9 @@
+ 
+ 	// groups may come after their contacts, so contacts are applied once the packet is read
+ 	for (auto &it : contacts) {
+-		uint32_t uin = strtoul(it.name, nullptr, 10);
+-		if (uin)
+-			ApplyRosterItem(uin, it.groupId, it.itemId, OscarTlvList(it.extra), true);
++		const auto name = oscarid::key(it.name.c_str());
++		if (!name.empty())
++			ApplyRosterItem(name, it.groupId, it.itemId, OscarTlvList(it.extra), true);
+ 	}
+ 
+ 	if ((flags & 0x0001) == 0) {
+@@ -679,7 +681,7 @@
+ 		m_iStatus = ID_STATUS_ONLINE;
+ 
+ 	auto *pVer = &pluginInfoEx.version;
+-	Send(OscarPackets::setUserInfo(HIBYTE(HIWORD(*pVer)), LOBYTE(HIWORD(*pVer)), HIBYTE(LOWORD(*pVer)), nullptr, getByte("ClientIdPreset", 0)));
++	Send(OscarPackets::setUserInfo(HIBYTE(HIWORD(*pVer)), LOBYTE(HIWORD(*pVer)), HIBYTE(LOWORD(*pVer)), nullptr, getByte("ClientIdPreset", 0) ? getByte("ClientIdPreset", 0) : (getDword("UIN") ? 0 : 10)));
+ 	Send(OscarPackets::setIcbmParams());
+ 	// Subscribe to presence for SSI contacts. The server sends 03/0B and
+ 	// 03/0C updates to clients registered via BuddyAddBuddies (03/04).
+@@ -689,9 +691,8 @@
+ 		int count = 0;
+ 		mir_cslock lck(m_csRoster);
+ 		for (auto &it : m_arUsers) {
+-			if (!it->uin) continue;
+-			CMStringA uin;
+-			uin.Format("%u", it->uin);
++			if (it->name.empty()) continue;
++			CMStringA uin(it->name.c_str());
+ 			if (buddies.size() + uin.GetLength() + 1 > 3500 && count) {
+ 				Send(OscarSnac(3, 4, 0, buddies.data()));
+ 				buddies = OscarWriter();
+@@ -710,7 +711,7 @@
+ 	// Send only a 4-byte status TLV. The legacy DC-info/away-text
+ 	// extensions are not needed for Open OSCAR Server presence.
+ 	Send(OscarPackets::setStatus(MirandaToIcqStatus(m_iStatus), 256));
+-	Send(OscarPackets::offlineMsgsRequest(atoi(m_szUin), m_seq));
++	if(getDword("UIN")) Send(OscarPackets::offlineMsgsRequest(atoi(m_szUin), m_seq));
+ 
+ 	m_bOnline = true;
+ 	if (getByte("XStatusId", 0)) SendXStatus();
+@@ -748,7 +749,7 @@
+                     path.IsEmpty() || GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) {
+                     delSetting("BartOwnAvatarPath");
+                     ReportSelfAvatarChanged();
+-                    QueueBartAvatar(uint32_t(atoi(m_szUin)), 1, hash);
++                    QueueBartAvatar(getDword("UIN"), 1, hash);
+                 }
+             }
+         }
+@@ -770,19 +771,19 @@
+ 		return;
+ 	}
+ 
+-	uint32_t uin = strtoul(rawName.c_str(), nullptr, 10);
+-	if (type != 0 || uin == 0)
++	const auto name = oscarid::key(rawName);
++	if (type != 0 || name.empty())
+ 		return;
+ 
+ 	if (bDeleted) {
+ 		mir_cslock lck(m_csRoster);
+-		if (auto *pUser = FindUser(uin))
++		if (auto *pUser = FindUser(name))
+ 			if (pUser->ssiId == itemId)
+ 				pUser->ssiId = pUser->groupId = 0;
+ 		return;
+ 	}
+ 
+-	ApplyRosterItem(uin, groupId, itemId, tlvs, false);
++	ApplyRosterItem(name, groupId, itemId, tlvs, false);
+ }
+ 
+ void CKicqProto::HandleSsiResult(const bytes_t &data, uint32_t reqId)
+@@ -793,20 +794,21 @@
+ 
+ 	switch (reqId) {
+ 	case REQ_ADD_CONTACT:
+-		if (m_pendAdd.uin == 0)
++		if (m_pendAdd.id.empty())
+ 			break;
+ 
+ 		if (result == 0 || result == 0x0E) {
+-			char szUin[20];
+-			_itoa(m_pendAdd.uin, szUin, 10);
++			const char *szUin = m_pendAdd.id.c_str();
+ 			{
+ 				mir_cslock lck(m_csRoster);
+-				auto *pUser = AddUser(m_pendAdd.uin, m_pendAdd.hContact);
++				auto *pUser = AddUser(m_pendAdd.id, m_pendAdd.hContact);
+ 				pUser->groupId = m_pendAdd.groupId;
+ 				pUser->ssiId = m_pendAdd.ssiId;
+ 				pUser->bAuthorized = (result == 0);
+ 			}
+ 			setWString(m_pendAdd.hContact, "SrvNick", m_pendAdd.name);
++ if(result==0)delSetting(m_pendAdd.hContact,"Auth");
++ if(!oscarid::uin(m_pendAdd.id)){OscarWriter buddy;buddy.ascii8(szUin);Send(OscarSnac(3,4,0,buddy.data()));}
+ 
+ 			if (result == 0x0E) {
+ 				// the contact requires authorization: add it flagged, then ask
+@@ -817,11 +819,11 @@
+ 				Send(OscarPackets::futureAuthGrant(szUin));
+ 				Send(OscarPackets::authRequest(szUin, TranslateT("Please authorize me")));
+ 			}
+-			m_pendAdd.uin = 0;
++			m_pendAdd.id.clear();
+ 		}
+ 		else {
+-			debugLogA("adding %u failed, code %d", m_pendAdd.uin, result);
+-			m_pendAdd.uin = 0;
++			debugLogA("adding %s failed, code %d", m_pendAdd.id.c_str(), result);
++			m_pendAdd.id.clear();
+ 		}
+ 		break;
+ 
+@@ -830,10 +832,10 @@
+ 		break;
+ 
+ 	case REQ_RENAME:
+-		if (result == 0 && m_pendRename.uin)
+-			if (MCONTACT hContact = FindContact(m_pendRename.uin))
++		if (result == 0 && !m_pendRename.id.empty())
++			if (MCONTACT hContact = FindContact(m_pendRename.id))
+ 				setWString(hContact, "SrvNick", m_pendRename.name);
+-		m_pendRename.uin = 0;
++		m_pendRename.id.clear();
+ 		break;
+ 
+ 	case REQ_ADD_GROUP:
+@@ -982,11 +984,16 @@
+ void CKicqProto::HandleUserOnline(const bytes_t &data)
+ {
+ 	OscarReader r(data);
+-	uint32_t uin = strtoul(r.ascii8().c_str(), nullptr, 10);
++	const auto name = oscarid::key(r.ascii8());
++ if(name.empty()) return;
++ uint32_t uin = oscarid::uin(name);
+ 	r.skip(2); // warning level
+ 	r.skip(2); // TLV count
+ 	OscarTlvList tlvs(r);
+-	if (const auto *bartId = tlvs.find(0x1D)) ObserveBartPresence(uin, bartId->data);
++ if(!uin){MCONTACT c=0;{mir_cslock lock(m_csRoster);if(auto *u=FindUser(name)){u->bOnline=true;c=u->hContact;}}
++  if(c){const auto *flags=tlvs.find(1);setWord(c,"Status",flags && (flags->u16()&0x20)?ID_STATUS_AWAY:ID_STATUS_ONLINE);}return;}
++
++	if (const auto *bartId = tlvs.find(0x1D)) if(uin) ObserveBartPresence(uin, bartId->data);
+ 
+     // Only trace changes for the target Jimm Multi UIN. A presence refresh can
+     // repeat hundreds of times; logging each repeat hid the relevant packets.
+@@ -1031,7 +1038,7 @@
+ 	bool xstatusChanged = false;
+ 	{
+ 		mir_cslock lck(m_csRoster);
+-		auto *pUser = FindUser(uin);
++		auto *pUser = FindUser(name);
+ 		if (pUser == nullptr)
+ 			return;
+ 
+@@ -1307,7 +1314,9 @@
+ void CKicqProto::HandleUserOffline(const bytes_t &data)
+ {
+ 	OscarReader r(data);
+-	uint32_t uin = strtoul(r.ascii8().c_str(), nullptr, 10);
++	const auto name = oscarid::key(r.ascii8());
++ if(name.empty()) return;
++ uint32_t uin = oscarid::uin(name);
+ 
+     {
+         char line[96];
+@@ -1318,7 +1327,7 @@
+ 	MCONTACT hContact;
+ 	{
+ 		mir_cslock lck(m_csRoster);
+-		auto *pUser = FindUser(uin);
++		auto *pUser = FindUser(name);
+ 		if (pUser == nullptr)
+ 			return;
+ 		pUser->bOnline = false;
+@@ -1340,14 +1349,15 @@
+ /////////////////////////////////////////////////////////////////////////////////////////
+ // messages
+ 
+-void CKicqProto::DeliverMessage(uint32_t uin, const CMStringW &text, time_t when)
+-{
+-	MCONTACT hContact = FindContact(uin);
++void CKicqProto::DeliverMessage(const std::string &name, const CMStringW &text, time_t when)
++{
++	MCONTACT hContact = FindContact(name);
+ 	if (hContact == 0)
+-		hContact = CreateContact(uin, true);
++		hContact = CreateContact(name, true);
++ if(!hContact) return;
+ 	{
+ 		mir_cslock lck(m_csRoster);
+-		AddUser(uin, hContact);
++		AddUser(name, hContact);
+ 	}
+ 
+ 	CallService(MS_PROTO_CONTACTISTYPING, hContact, PROTOTYPE_CONTACTTYPING_OFF);
+@@ -1370,9 +1380,9 @@
+ 	OscarTlvList info(r, infoCount);     // sender's presence TLVs
+ 	OscarTlvList msgTlvs(r);
+ 
+-	uint32_t uin = strtoul(sender.c_str(), nullptr, 10);
+-	if (uin == 0)
+-		return;
++	const auto name = oscarid::key(sender);
++ if(name.empty()) return;
++ uint32_t uin = oscarid::uin(name);
+ 
+ 	CMStringW text;
+ 	bool bHaveText = false, bOffline = false;
+@@ -1403,6 +1413,7 @@
+ 		}
+ 	}
+ 	else if (channel == 2) {
++        if(!uin) return; // legacy ICQ relay/OFT2 is UIN-only
+ 		auto *t5 = msgTlvs.find(5);
+ 		if (!t5) {
+ 			debugLogA("ARS RX DIAG4: channel-2 ICBM received WITHOUT TLV(5); sender=%u", (unsigned)uin);
+@@ -1470,7 +1481,7 @@
+       }
+      }
+     }
+-    const bool ownSenderUin = (uin == strtoul(m_szUin.c_str(), nullptr, 10));
++    const bool ownSenderUin = (uin == oscarid::uin(m_szUin.c_str()));
+     if (ownSenderUin || ourOutgoingCookie) {
+      debugLogA("OFT2 RX: discarded outgoing offer reflected by server; sender=%u own=%s cookieMatch=%d",
+        (unsigned)uin, m_szUin.c_str(), (int)ourOutgoingCookie);
+@@ -1588,7 +1599,7 @@
+ 
+ 	if (!bOffline)
+ 		Send(OscarPackets::messageAck(cookie, sender.c_str()));
+-	DeliverMessage(uin, text, when);
++	DeliverMessage(name, text, when);
+ }
+ 
+ void CKicqProto::HandleOfflineMessage(const bytes_t &data)
+@@ -1631,10 +1642,11 @@
+ 			tmMsg.tm_isdst = -1;
+ 			when = mktime(&tmMsg);
+ 		}
+-		DeliverMessage(uin, text, when);
++		if(uin) DeliverMessage(std::to_string(uin), text, when);
+ 	}
+ 	else if (type == 0x4200) {
+-		Send(OscarPackets::deleteOfflineMsgs(atoi(m_szUin), m_seq));
++		if(!getDword("UIN"))return;
++  Send(OscarPackets::deleteOfflineMsgs(atoi(m_szUin), m_seq));
+ 		Send(OscarPackets::anotherOfflineMsgsRequest());
+ 	}
+ }
+@@ -1692,7 +1704,9 @@
+ 	OscarReader r(data);
+ 	r.skip(8);                              // cookie
+ 	r.u16();                                // channel
+-	uint32_t uin = strtoul(r.ascii8().c_str(), nullptr, 10);
++	const auto name = oscarid::key(r.ascii8());
++ if(name.empty()) return;
++ uint32_t uin = oscarid::uin(name);
+ 
+ 	// A channel-2 message ACK may carry an Xtraz AwayStat response.
+  // Never turn it into an ordinary chat message or acknowledge a pending chat.
+@@ -1721,7 +1735,7 @@
+   const bytes_t title = KicqXmlField(xml, "title");
+   const bytes_t desc = KicqXmlField(xml, "desc");
+   if ((!title.empty() || !desc.empty()) && uin != 0) {
+-   if (MCONTACT hContact = FindContact(uin)) {
++   if (MCONTACT hContact = FindContact(name)) {
+     if (getByte(hContact, "XStatusLive", 0)) {
+      setWString(hContact, "XStatusName", OscarText::fromUtf8(KicqUnescapeXml(title)));
+      setWString(hContact, "XStatusMsg", OscarText::fromUtf8(KicqUnescapeXml(desc)));
+@@ -1797,7 +1811,7 @@
+ 	{
+ 		mir_cslock lck(m_csPending);
+ 		for (auto it = m_pendingMsgs.begin(); it != m_pendingMsgs.end(); ++it) {
+-			if (it->second.uin == uin) {
++			if (it->second.name == name) {
+ 				seq = it->second.seq;
+ 				m_pendingMsgs.erase(it);
+ 				break;
+@@ -1806,7 +1820,7 @@
+ 	}
+ 
+ 	if (seq)
+-		if (MCONTACT hContact = FindContact(uin))
++		if (MCONTACT hContact = FindContact(name))
+ 			ProtoBroadcastAck(hContact, ACKTYPE_MESSAGE, ACKRESULT_SUCCESS, (HANDLE)seq, 0);
+ }
+ 
+@@ -1851,8 +1865,8 @@
+ 		m_pendingMsgs.erase(it);
+ 	}
+ 
+-	debugLogA("message to %u failed, error %d", msg.uin, code);
+-	if (MCONTACT hContact = FindContact(msg.uin)) {
++	debugLogA("message to %s failed, error %d", msg.name.c_str(), code);
++	if (MCONTACT hContact = FindContact(msg.name)) {
+ 		CMStringW wszError(FORMAT, TranslateT("The server refused the message (error %d)"), code);
+ 		ProtoBroadcastAck(hContact, ACKTYPE_MESSAGE, ACKRESULT_FAILED, (HANDLE)msg.seq, (LPARAM)wszError.c_str());
+ 	}
+@@ -1862,10 +1876,12 @@
+ {
+ 	OscarReader r(data);
+ 	r.skip(10);
+-	uint32_t uin = strtoul(r.ascii8().c_str(), nullptr, 10);
++	const auto name = oscarid::key(r.ascii8());
++ if(name.empty()) return;
++ uint32_t uin = oscarid::uin(name);
+ 	int type = r.u16();
+ 
+-	if (MCONTACT hContact = FindContact(uin))
++	if (MCONTACT hContact = FindContact(name))
+ 		CallService(MS_PROTO_CONTACTISTYPING, hContact, type == 2 ? PROTOTYPE_CONTACTTYPING_INFINITE : PROTOTYPE_CONTACTTYPING_OFF);
+ }
+ 
+@@ -2007,58 +2023,67 @@
+ void CKicqProto::HandleAuthRequest(const bytes_t &data)
+ {
+ 	OscarReader r(data);
+-	uint32_t uin = strtoul(r.ascii8().c_str(), nullptr, 10);
++	const auto name = oscarid::key(r.ascii8());
++ if(name.empty()) return;
++ uint32_t uin = oscarid::uin(name);
+ 	CMStringW reason(OscarText::textOrCp1251(r.bytes(r.u16())));
+-	if (uin == 0)
+-		return;
+-
+-	MCONTACT hContact = FindContact(uin);
++	
++
++	MCONTACT hContact = FindContact(name);
+ 	if (hContact == 0)
+-		hContact = CreateContact(uin, true);
+-
+-	char szUin[20];
+-	_itoa(uin, szUin, 10);
++		hContact = CreateContact(name, true);
++
++	if(!hContact) return;
++ setByte(hContact,"Grant",1);
++ const char *szUin = name.c_str();
+ 	DB::AUTH_BLOB blob(hContact, T2Utf(getMStringW(hContact, "Nick")), nullptr, nullptr, szUin, T2Utf(reason));
+ 	blob.set_uin(uin);
+ 
+ 	DB::EventInfo dbei;
+ 	dbei.iTimestamp = time(0);
++ dbei.szModule=m_szModuleName;
++ dbei.flags=DBEF_UTF;
++ dbei.eventType=EVENTTYPE_AUTHREQUEST;
+ 	dbei.cbBlob = blob.size();
+ 	dbei.pBlob = blob;
+-	ProtoChainRecv(hContact, PSR_AUTH, 0, (LPARAM)&dbei);
++	Proto_AuthRecv(m_szModuleName,dbei);
+ }
+ 
+ void CKicqProto::HandleAuthReply(const bytes_t &data)
+ {
+ 	OscarReader r(data);
+-	uint32_t uin = strtoul(r.ascii8().c_str(), nullptr, 10);
++	const auto name = oscarid::key(r.ascii8());
++ if(name.empty()) return;
++ uint32_t uin = oscarid::uin(name);
+ 	bool bGranted = r.u8() == 1;
+ 	debugLogA("authorization %s by %u", bGranted ? "granted" : "denied", uin);
+ 
+-	MCONTACT hContact = FindContact(uin);
+-	if (hContact == 0 || !bGranted)
++	MCONTACT hContact = FindContact(name);
++	if(hContact && !bGranted) setByte(hContact,"Auth",1);
++ if (hContact == 0 || !bGranted)
+ 		return;
+ 
+ 	delSetting(hContact, "Auth");
+ 
+ 	mir_cslock lck(m_csRoster);
+-	if (auto *pUser = FindUser(uin))
++	if (auto *pUser = FindUser(name))
+ 		pUser->bAuthorized = true;
+ }
+ 
+ void CKicqProto::HandleYouWereAdded(const bytes_t &data)
+ {
+ 	OscarReader r(data);
+-	uint32_t uin = strtoul(r.ascii8().c_str(), nullptr, 10);
+-	if (uin == 0)
+-		return;
+-
+-	MCONTACT hContact = FindContact(uin);
++	const auto name = oscarid::key(r.ascii8());
++ if(name.empty()) return;
++ uint32_t uin = oscarid::uin(name);
++	
++
++	MCONTACT hContact = FindContact(name);
+ 	if (hContact == 0)
+-		hContact = CreateContact(uin, true);
+-
+-	char szUin[20];
+-	_itoa(uin, szUin, 10);
++		hContact = CreateContact(name, true);
++
++	if(!hContact) return;
++ const char *szUin = name.c_str();
+ 	DB::AUTH_BLOB blob(hContact, T2Utf(getMStringW(hContact, "Nick")), nullptr, nullptr, szUin, nullptr);
+ 	blob.set_uin(uin);
+ 
+--- a/normal/0.96.8/KICQ/res/resource.rc
++++ b/normal/0.96.8/KICQ/res/resource.rc
+@@ -28,8 +28,8 @@
+ EXSTYLE WS_EX_CONTROLPARENT
+ FONT 8, "MS Shell Dlg", 0, 0, 0x1
+ BEGIN
+-    LTEXT           "UIN:",IDC_STATIC,0,7,60,8
+-    EDITTEXT        IDC_UIN,62,5,123,12,ES_AUTOHSCROLL | ES_NUMBER
++    LTEXT           "UIN / SN:",IDC_STATIC,0,7,60,8
++    EDITTEXT        IDC_UIN,62,5,123,12,ES_AUTOHSCROLL
+     LTEXT           "Password:",IDC_STATIC,0,23,60,8
+     EDITTEXT        IDC_PASSWORD,62,21,123,12,ES_PASSWORD | ES_AUTOHSCROLL
+     LTEXT           "Server:",IDC_STATIC,0,39,60,8
+@@ -52,8 +52,8 @@
+ FONT 8, "MS Shell Dlg", 0, 0, 0x1
+ BEGIN
+     GROUPBOX        "Account",IDC_STATIC,7,7,291,62
+-    LTEXT           "UIN:",IDC_STATIC,15,22,80,8
+-    EDITTEXT        IDC_UIN,100,20,120,12,ES_AUTOHSCROLL | ES_NUMBER
++    LTEXT           "UIN / SN:",IDC_STATIC,15,22,80,8
++    EDITTEXT        IDC_UIN,100,20,120,12,ES_AUTOHSCROLL
+     LTEXT           "Password:",IDC_STATIC,15,40,80,8
+     EDITTEXT        IDC_PASSWORD,100,38,120,12,ES_PASSWORD | ES_AUTOHSCROLL
+     GROUPBOX        "Connection",IDC_STATIC,7,73,291,103
+--- a/normal/0.96.8/KICQ/src/main.cpp
++++ b/normal/0.96.8/KICQ/src/main.cpp
+@@ -36,7 +36,7 @@
+ CMPlugin::CMPlugin() :
+ 	ACCPROTOPLUGIN<CKicqProto>("PMLICQ", pluginInfoEx)
+ {
+-	SetUniqueId("UIN");
++	SetUniqueId("ScreenName");
+ }
+ 
+ /////////////////////////////////////////////////////////////////////////////////////////
+--- a/normal/0.96.8/KICQ/src/options.cpp
++++ b/normal/0.96.8/KICQ/src/options.cpp
+@@ -35,7 +35,8 @@
+         edtFileProxyPort(this, IDC_FILEPROXY_PORT),
+ 		cmbClientId(this, IDC_CLIENT_ID), m_account(ppro)
+ 	{
+-		CreateLink(edtUin, "UIN", DBVT_DWORD, 0);
++		// LoginId is applied explicitly to preserve the legacy DWORD UIN.
++		CreateLink(edtUin, "LoginId", L"");
+ 		CreateLink(edtPassword, "Password", L"");
+ 		CreateLink(edtServer, ppro->m_wszServer);
+ 		CreateLink(edtPort, ppro->m_iPort);
+@@ -48,7 +49,9 @@
+ 	{
+ 		// the XOR login of that ICQ era only uses the first 8 characters
+ 		edtPassword.SendMsg(EM_LIMITTEXT, 8, 0);
+-		edtUin.SendMsg(EM_LIMITTEXT, 10, 0);
++		edtUin.SendMsg(EM_LIMITTEXT, 97, 0);
++ auto login=m_account->AccountId();
++ SetDlgItemTextW(m_hwnd,IDC_UIN,_A2T(login.c_str()).get());
+ 		static const wchar_t* const choices[] = {
+ 			L"PMLICQ (default)", L"Miranda NG (actual EXE version)", L"Miranda IM",
+ 			L"QIP 2005", L"QIP 2010", L"QIP Infium", L"QIP 2012",
+@@ -62,7 +65,13 @@
+ 
+ 	bool OnApply() override
+ 	{
+-		if (!CKicqDlgBase::OnApply()) return false;
++		wchar_t raw[98]={}; GetDlgItemTextW(m_hwnd,IDC_UIN,raw,_countof(raw));
++ const auto id=oscarid::key(T2Utf(raw).get());
++ if(id.empty() && raw[0]) return false;
++ if (!CKicqDlgBase::OnApply()) return false;
++ m_account->setDword("UIN",oscarid::uin(id));
++ m_account->setString("LoginId",id.c_str());
++ m_account->setString("ScreenName",id.c_str());
+ 		const LPARAM preset = cmbClientId.GetCurData();
+ 		if (preset < 0 || preset > 10) return false;
+ 		m_account->setByte("ClientIdPreset", BYTE(preset));
+--- /dev/null
++++ b/normal/0.96.8/KICQ/src/oscar_identity.h
+@@ -0,0 +1,26 @@
++#pragma once
++#include <string>
++#include <cstdint>
++// OSCAR names are case-insensitive and ignore ASCII spaces. Numeric UINs
++// remain numeric for ICQ-only services; never parse a prefix of an AIM name.
++namespace oscarid {
++inline uint32_t uin(const std::string &s) {
++ if (s.empty()) return 0;
++ uint64_t n=0;
++ for (char c:s) { if(c<'0'||c>'9') return 0; n=n*10+(c-'0'); if(n>0xffffffffULL) return 0; }
++ return static_cast<uint32_t>(n);
++}
++inline std::string key(const std::string &s) {
++ std::string k;
++ for (unsigned char c:s) {
++  if(c==' ') continue;
++  if(c>='A'&&c<='Z') c+=32;
++  if(!((c>='a'&&c<='z')||(c>='0'&&c<='9')||c=='@'||c=='.'||c=='_'||c=='-')) return {};
++  k+=char(c);
++ }
++ if(k.empty()||k.size()>97) return {};
++ bool numeric=true; for(char c:k) if(c<'0'||c>'9') numeric=false;
++ if(numeric) { auto n=uin(k); return n?std::to_string(n):std::string(); }
++ return k;
++}
++}
+--- a/normal/0.96.8/KICQ/src/proto.cpp
++++ b/normal/0.96.8/KICQ/src/proto.cpp
+@@ -123,7 +123,7 @@
+ 
+ static int CompareUsers(const KicqUser *p1, const KicqUser *p2)
+ {
+-	return (p1->uin < p2->uin) ? -1 : (p1->uin > p2->uin) ? 1 : 0;
++	return p1->name.compare(p2->name);
+ }
+ 
+ CKicqProto::CKicqProto(const char *szModuleName, const wchar_t *wszUserName) :
+@@ -147,6 +147,8 @@
+ 
+ 	HookProtoEvent(ME_OPT_INITIALISE, &CKicqProto::OnOptionsInit);
+ 	CreateProtoService("/XStatusEditor", &CKicqProto::OnMenuXStatus);
++ CreateProtoService("/RetryAuth", &CKicqProto::OnRetryAuth);
++ HookProtoEvent(ME_CLIST_PREBUILDCONTACTMENU,&CKicqProto::OnPreBuildContactMenu);
+ 	CreateProtoService(PS_GETAVATARCAPS, &CKicqProto::OnAvatarCaps);
+ 	CreateProtoService(PS_GETAVATARINFO, &CKicqProto::OnGetAvatarInfo);
+ 	CreateProtoService(PS_GETMYAVATAR, &CKicqProto::OnGetMyAvatar);
+@@ -158,6 +160,7 @@
+ 
+ CKicqProto::~CKicqProto()
+ {
++ if(m_hRetryAuthMenu) Menu_RemoveItem(m_hRetryAuthMenu);
+  StopBart();
+  ShutdownOutgoingFiles();
+ }
+@@ -181,6 +184,15 @@
+ 			if (g_kicqExtraIcon) ExtraIcon_SetIcon(g_kicqExtraIcon, h, INVALID_HANDLE_VALUE);
+ 		}
+ 	}
++ for (auto &contact : AccContacts()) {
++  auto id=ContactId(contact); if(!id.empty()) setString(contact,"ScreenName",id.c_str());
++ }
++ {auto id=AccountId();if(!id.empty()){setString("ScreenName",id.c_str());setString("LoginId",id.c_str());}}
++ if(!m_hRetryAuthMenu) {
++  CMenuItem mi(&g_plugin); mi.name.a=LPGEN("Request authorization again"); mi.position=200200;
++  CMStringA service(FORMAT,"%s/RetryAuth",m_szModuleName); mi.pszService=service.GetBuffer();
++  m_hRetryAuthMenu=Menu_AddContactMenuItem(&mi);
++ }
+ 	EnsureXStatusMenu();
+  bool registered = false;
+  for (const auto &name : g_kicqIconModules)
+@@ -227,17 +239,34 @@
+ /////////////////////////////////////////////////////////////////////////////////////////
+ // contacts
+ 
+-MCONTACT CKicqProto::FindContact(uint32_t uin)
+-{
+-	for (auto &hContact : AccContacts())
+-		if (getDword(hContact, "UIN") == uin)
+-			return hContact;
+-	return 0;
+-}
+-
+-MCONTACT CKicqProto::CreateContact(uint32_t uin, bool bTemporary)
+-{
+-	MCONTACT hContact = FindContact(uin);
++std::string CKicqProto::ContactId(MCONTACT contact)
++{
++ const uint32_t uin = getDword(contact, "UIN");
++ if (uin) return std::to_string(uin);
++ return oscarid::key(getMStringA(contact, "ScreenName").c_str());
++}
++std::string CKicqProto::AccountId()
++{
++ const uint32_t uin = getDword("UIN");
++ if (uin) return std::to_string(uin);
++ return oscarid::key(getMStringA("LoginId").c_str());
++}
++MCONTACT CKicqProto::FindContact(const std::string &name)
++{
++ const auto id = oscarid::key(name);
++ if(id.empty()) return 0;
++ const auto uin=oscarid::uin(id);
++ for (auto &hContact : AccContacts())
++  if (uin ? getDword(hContact,"UIN")==uin : ContactId(hContact)==id) return hContact;
++ return 0;
++}
++
++MCONTACT CKicqProto::CreateContact(const std::string &name, bool bTemporary)
++{
++ const auto id = oscarid::key(name);
++ if(id.empty()) return 0;
++ const auto uin = oscarid::uin(id);
++	MCONTACT hContact = FindContact(id);
+ 	if (hContact)
+ 		return hContact;
+ 
+@@ -245,23 +274,25 @@
+ 	hContact = db_add_contact(m_szModuleName, bTemporary ? DBAC_NOTINLIST : 0);
+ 	if (!hContact)
+ 		return 0;
+-	setDword(hContact, "UIN", uin);
++	if(uin) setDword(hContact, "UIN", uin);
++ setString(hContact, "ScreenName", id.c_str());
++ if(!uin) setWString(hContact, "Nick", _A2T(id.c_str()).get());
+ 	setWord(hContact, "Status", ID_STATUS_OFFLINE);
+ 	return hContact;
+ }
+ 
+-KicqUser* CKicqProto::FindUser(uint32_t uin)
+-{
+-	KicqUser tmp(uin, 0);
++KicqUser* CKicqProto::FindUser(const std::string &name)
++{
++	KicqUser tmp(oscarid::key(name), 0);
+ 	return m_arUsers.find(&tmp);
+ }
+ 
+-KicqUser* CKicqProto::AddUser(uint32_t uin, MCONTACT hContact)
+-{
+-	if (auto *pUser = FindUser(uin))
++KicqUser* CKicqProto::AddUser(const std::string &name, MCONTACT hContact)
++{
++	if (auto *pUser = FindUser(name))
+ 		return pUser;
+ 
+-	auto *pUser = new KicqUser(uin, hContact);
++	auto *pUser = new KicqUser(oscarid::key(name), hContact);
+ 	m_arUsers.insert(pUser);
+ 	return pUser;
+ }
+@@ -392,7 +423,7 @@
+ 	if (IsStatusConnecting(m_iStatus))
+ 		return 0;
+ 
+-	if (getDword("UIN") == 0 || getMStringA("Password").IsEmpty()) {
++	if (AccountId().empty() || getMStringA("Password").IsEmpty()) {
+ 		ProtoBroadcastAck(0, ACKTYPE_LOGIN, ACKRESULT_FAILED, nullptr, LOGINERR_BADUSERID);
+ 		return 0;
+ 	}
+@@ -441,7 +472,7 @@
+ {
+ 	switch (type) {
+ 	case PFLAGNUM_1:
+-		return PF1_FILE | PF1_IM | PF1_SERVERCLIST | PF1_AUTHREQ | PF1_BASICSEARCH | PF1_ADDSEARCHRES | PF1_MODEMSGRECV | PF1_MODEMSGSEND | PF1_NUMERICUSERID;
++		return PF1_FILE | PF1_IM | PF1_SERVERCLIST | PF1_AUTHREQ | PF1_BASICSEARCH | PF1_ADDSEARCHRES | PF1_MODEMSGRECV | PF1_MODEMSGSEND;
+ 
+ 	case PFLAGNUM_2:
+ 		return PF2_ONLINE | PF2_SHORTAWAY | PF2_LONGAWAY | PF2_LIGHTDND | PF2_HEAVYDND | PF2_FREECHAT | PF2_INVISIBLE;
+@@ -453,7 +484,7 @@
+ 		return PF4_SUPPORTTYPING | PF4_IMSENDOFFLINE | PF4_AVATARS;
+ 
+ 	case PFLAG_UNIQUEIDTEXT:
+-		return (INT_PTR)TranslateT("UIN");
++		return (INT_PTR)TranslateT("UIN / Screen Name");
+ 
+ 	case PFLAG_MAXLENOFMESSAGE:
+ 		return 2048;
+@@ -466,9 +497,10 @@
+ 
+ int CKicqProto::SendMsg(MCONTACT hContact, MEVENT, const char *pszSrc)
+ {
+-	uint32_t uin = getDword(hContact, "UIN");
++	const auto peer = ContactId(hContact);
++ uint32_t uin = oscarid::uin(peer);
+ 	int seq = InterlockedIncrement((long *)&m_msgSeq);
+-	if (!m_bOnline || uin == 0) {
++	if (!m_bOnline || peer.empty()) {
+ 		ProtoBroadcastAsync(hContact, ACKTYPE_MESSAGE, ACKRESULT_FAILED, (HANDLE)seq, (LPARAM)TranslateT("You are offline"));
+ 		return seq;
+ 	}
+@@ -476,8 +508,7 @@
+ 	CMStringW text(Utf2T(pszSrc).get());
+ 	text.Replace(L"\n", L"\r\n");
+ 
+-	char szUin[20];
+-	_itoa(uin, szUin, 10);
++	const char *szUin = peer.c_str();
+ 
+ 	bytes_t cookie(8, 0);
+ 	uint64_t id = GetTickCount64() ^ (uint64_t(rand()) << 32);
+@@ -487,7 +518,7 @@
+ 	bool bRelay = false, bUtf8 = false, bOnline = false;
+ 	{
+ 		mir_cslock lck(m_csRoster);
+-		if (auto *pUser = FindUser(uin)) {
++		if (auto *pUser = FindUser(peer)) {
+ 			bOnline = pUser->bOnline;
+ 			bUtf8 = pUser->bUtf8;
+ 			bRelay = pUser->ssiId != 0 && pUser->bAuthorized && pUser->bOnline && pUser->bServerRelay;
+@@ -500,12 +531,12 @@
+ 		reqId = m_nextMsgReq++;
+ 		if (m_nextMsgReq > 0x7FFFFFF0)
+ 			m_nextMsgReq = 0x1000;
+-		m_pendingMsgs[reqId] = { uin, seq };
++		m_pendingMsgs[reqId] = { peer, hContact, seq };
+ 	}
+ 
+-	if (bRelay)
++	if (uin && getDword("UIN") && bRelay)
+ 		Send(OscarPackets::messageChannel2(szUin, text, bUtf8, cookie, reqId));
+-	else if (!bOnline) {
++	else if (uin && getDword("UIN") && !bOnline) {
+ 		// kicq.ru's offline store keeps only bytes 0x01-0x7F and stops at the first 0x00:
+ 		// ASCII text survives as charset 0, anything else only as UCS-2 where only characters
+ 		// >= U+0100 get through. Spaces become EN SPACE (U+2002) so that whole Cyrillic
+@@ -530,12 +561,12 @@
+ 
+ int CKicqProto::UserIsTyping(MCONTACT hContact, int type)
+ {
+-	uint32_t uin = getDword(hContact, "UIN");
+-	if (!m_bOnline || uin == 0 || m_iStatus == ID_STATUS_INVISIBLE)
++	const auto peer = ContactId(hContact);
++ uint32_t uin = oscarid::uin(peer);
++	if (!m_bOnline || peer.empty() || m_iStatus == ID_STATUS_INVISIBLE)
+ 		return 0;
+ 
+-	char szUin[20];
+-	_itoa(uin, szUin, 10);
++	const char *szUin = peer.c_str();
+ 	Send(OscarPackets::typingNotify(szUin, type == PROTOTYPE_SELFTYPING_ON ? 2 : 0));
+ 	return 0;
+ }
+@@ -545,9 +576,9 @@
+ 
+ void CKicqProto::SsiAddContact(MCONTACT hContact, int groupId)
+ {
+-	uint32_t uin = getDword(hContact, "UIN");
+-	char szUin[20];
+-	_itoa(uin, szUin, 10);
++	const auto peer = ContactId(hContact);
++ uint32_t uin = oscarid::uin(peer);
++	const char *szUin = peer.c_str();
+ 
+ 	CMStringW wszNick(db_get_wsm(hContact, "CList", "MyHandle"));
+ 	if (wszNick.IsEmpty())
+@@ -555,7 +586,8 @@
+ 	if (wszNick.IsEmpty())
+ 		wszNick = _A2T(szUin).get();
+ 
+-	m_pendAdd.uin = uin;
++	if(peer.empty()) return;
++ m_pendAdd.id = peer;
+ 	m_pendAdd.name = wszNick;
+ 	m_pendAdd.groupId = groupId;
+ 	m_pendAdd.hContact = hContact;
+@@ -571,12 +603,14 @@
+ 
+ MCONTACT CKicqProto::AddToList(int flags, PROTOSEARCHRESULT *psr)
+ {
+-	uint32_t uin = (psr->flags & PSR_UNICODE) ? _wtoi(psr->id.w) : atoi(psr->id.a);
+-	if (uin == 0)
++	if(!psr || ((psr->flags & PSR_UNICODE) ? psr->id.w==nullptr : psr->id.a==nullptr))return 0;
++ const auto peer = oscarid::key((psr->flags & PSR_UNICODE) ? T2Utf(psr->id.w).get() : psr->id.a);
++	if (peer.empty())
+ 		return 0;
+ 
+ 	bool bTemporary = (flags & PALF_TEMPORARY) != 0;
+-	MCONTACT hContact = CreateContact(uin, bTemporary);
++	MCONTACT hContact = CreateContact(peer, bTemporary);
++ if(!hContact) return 0;
+ 	if (psr->nick.w && (psr->flags & PSR_UNICODE))
+ 		setWString(hContact, "Nick", psr->nick.w);
+ 
+@@ -619,7 +653,7 @@
+ 	if (hContact == 0)
+ 		return 0;
+ 
+-	CMStringW wszUin(FORMAT, L"%u", getDword(hContact, "UIN"));
++	CMStringW wszUin(_A2T(ContactId(hContact).c_str()).get());
+ 	PROTOSEARCHRESULT psr = {};
+ 	psr.cbSize = sizeof(psr);
+ 	psr.flags = PSR_UNICODE;
+@@ -632,11 +666,12 @@
+ 	if (!(flags & CDF_DEL_CONTACT) || !m_bOnline)
+ 		return true;
+ 
+-	uint32_t uin = getDword(hContact, "UIN");
++	const auto peer = ContactId(hContact);
++ uint32_t uin = oscarid::uin(peer);
+ 	int groupId = 0, ssiId = 0;
+ 	{
+ 		mir_cslock lck(m_csRoster);
+-		if (auto *pUser = FindUser(uin)) {
++		if (auto *pUser = FindUser(peer)) {
+ 			groupId = pUser->groupId;
+ 			ssiId = pUser->ssiId;
+ 			m_arUsers.remove(pUser);
+@@ -644,8 +679,7 @@
+ 	}
+ 
+ 	if (ssiId != 0) {
+-		char szUin[20];
+-		_itoa(uin, szUin, 10);
++		const char *szUin = peer.c_str();
+ 		m_pendDel.uin = uin;
+ 		Send(OscarPackets::ssiEditStart());
+ 		Send(OscarPackets::deleteContact(szUin, groupId, ssiId));
+@@ -688,16 +722,17 @@
+ 	if (mir_strcmp(Proto_GetBaseAccountName(hContact), m_szModuleName))
+ 		return 0;
+ 
+-	uint32_t uin = getDword(hContact, "UIN");
++	const auto peer = ContactId(hContact);
++ uint32_t uin = oscarid::uin(peer);
+ 	CMStringW wszNick(db_get_wsm(hContact, "CList", "MyHandle"));
+ 	if (wszNick.IsEmpty())
+-		wszNick.Format(L"%u", uin);
++		wszNick = _A2T(peer.c_str()).get();
+ 
+ 	int groupId = 0, ssiId = 0;
+ 	bool bAuthorized = true;
+ 	{
+ 		mir_cslock lck(m_csRoster);
+-		auto *pUser = FindUser(uin);
++		auto *pUser = FindUser(peer);
+ 		if (pUser == nullptr || pUser->ssiId == 0)
+ 			return 0;
+ 		groupId = pUser->groupId;
+@@ -708,9 +743,8 @@
+ 	if (getMStringW(hContact, "SrvNick") == wszNick)
+ 		return 0; // the change came from the server
+ 
+-	char szUin[20];
+-	_itoa(uin, szUin, 10);
+-	m_pendRename.uin = uin;
++	const char *szUin = peer.c_str();
++	m_pendRename.id = peer;
+ 	m_pendRename.name = wszNick;
+ 	Send(OscarPackets::ssiEditStart());
+ 	Send(OscarPackets::renameContact(szUin, wszNick, groupId, ssiId, !bAuthorized));
+@@ -727,11 +761,12 @@
+ 	if (mir_strcmp(Proto_GetBaseAccountName(hContact), m_szModuleName))
+ 		return 0;
+ 
+-	uint32_t uin = getDword(hContact, "UIN");
++	const auto peer = ContactId(hContact);
++ uint32_t uin = oscarid::uin(peer);
+ 	int oldGroup = 0, ssiId = 0, newGroup = 0;
+ 	{
+ 		mir_cslock lck(m_csRoster);
+-		auto *pUser = FindUser(uin);
++		auto *pUser = FindUser(peer);
+ 		if (pUser == nullptr || pUser->ssiId == 0)
+ 			return 0;
+ 
+@@ -746,8 +781,7 @@
+ 	}
+ 
+ 	// OSCAR has no "move": the item is deleted from the old group and added to the new one
+-	char szUin[20];
+-	_itoa(uin, szUin, 10);
++	const char *szUin = peer.c_str();
+ 	m_pendDel.uin = 0;
+ 	Send(OscarPackets::ssiEditStart());
+ 	Send(OscarPackets::deleteContact(szUin, oldGroup, ssiId));
+@@ -766,14 +800,16 @@
+ 
+ int CKicqProto::AuthRequest(MCONTACT hContact, const wchar_t *szMessage)
+ {
+-	uint32_t uin = getDword(hContact, "UIN");
+-	if (!m_bOnline || uin == 0)
++	const auto peer = ContactId(hContact);
++ uint32_t uin = oscarid::uin(peer);
++	if (!m_bOnline || peer.empty())
+ 		return 1;
+ 
+-	char szUin[20];
+-	_itoa(uin, szUin, 10);
++	const char *szUin = peer.c_str();
+ 	Send(OscarPackets::futureAuthGrant(szUin));
+-	Send(OscarPackets::authRequest(szUin, mir_wstrlen(szMessage) ? szMessage : TranslateT("Please authorize me")));
++	Send(OscarPackets::authRequest(szUin, szMessage && mir_wstrlen(szMessage) ? szMessage : TranslateT("Please authorize me")));
++ setByte(hContact,"Auth",1);
++ {mir_cslock lck(m_csRoster);if(auto *pUser=FindUser(peer))pUser->bAuthorized=false;}
+ 	return 0;
+ }
+ 
+@@ -788,26 +824,26 @@
+ int CKicqProto::Authorize(MEVENT hDbEvent)
+ {
+ 	MCONTACT hContact = AuthEventContact(m_szModuleName, hDbEvent);
+-	uint32_t uin = hContact ? getDword(hContact, "UIN") : 0;
+-	if (!m_bOnline || uin == 0)
++	const auto peer = hContact ? ContactId(hContact) : std::string();
++	if (!m_bOnline || peer.empty())
+ 		return 1;
+ 
+-	char szUin[20];
+-	_itoa(uin, szUin, 10);
++	const char *szUin = peer.c_str();
+ 	Send(OscarPackets::authReply(szUin, true));
++ delSetting(hContact,"Grant");
+ 	return 0;
+ }
+ 
+ int CKicqProto::AuthDeny(MEVENT hDbEvent, const wchar_t *)
+ {
+ 	MCONTACT hContact = AuthEventContact(m_szModuleName, hDbEvent);
+-	uint32_t uin = hContact ? getDword(hContact, "UIN") : 0;
+-	if (!m_bOnline || uin == 0)
++	const auto peer = hContact ? ContactId(hContact) : std::string();
++	if (!m_bOnline || peer.empty())
+ 		return 1;
+ 
+-	char szUin[20];
+-	_itoa(uin, szUin, 10);
++	const char *szUin = peer.c_str();
+ 	Send(OscarPackets::authReply(szUin, false));
++ delSetting(hContact,"Grant");
+ 	return 0;
+ }
+ 
+@@ -945,23 +981,36 @@
+ int CKicqProto::GetInfo(MCONTACT hContact, int)
+ {
+ 	uint32_t uin = hContact ? getDword(hContact, "UIN") : getDword("UIN");
+-	if (!m_bOnline || uin == 0)
++	if (!m_bOnline || uin == 0 || !getDword("UIN"))
+ 		return 1;
+ 
+ 	RequestUserInfo(uin, hContact, nullptr);
+ 	return 0;
+ }
+ 
++struct KicqScreenSearch { std::string id; HANDLE handle; };
++void __cdecl CKicqProto::SearchScreenName(void *param)
++{
++ std::unique_ptr<KicqScreenSearch> search(static_cast<KicqScreenSearch*>(param));
++ // Direct add by exact OSCAR name; no claim that the account exists.
++ Sleep(100);
++ CMStringW id(_A2T(search->id.c_str()).get());
++ PROTOSEARCHRESULT psr = {}; psr.cbSize=sizeof(psr); psr.flags=PSR_UNICODE;
++ psr.id.w=id.GetBuffer(); psr.nick.w=id.GetBuffer();
++ ProtoBroadcastAck(0,ACKTYPE_SEARCH,ACKRESULT_DATA,search->handle,(LPARAM)&psr);
++ ProtoBroadcastAck(0,ACKTYPE_SEARCH,ACKRESULT_SUCCESS,search->handle,0);
++}
+ HANDLE CKicqProto::SearchBasic(const wchar_t *id)
+ {
+-	uint32_t uin = _wtoi(id);
+-	if (!m_bOnline || uin == 0)
+-		return nullptr;
+-
+-	static long searchId = 0;
+-	HANDLE hSearch = (HANDLE)(INT_PTR)InterlockedIncrement(&searchId);
+-	RequestUserInfo(uin, 0, hSearch);
+-	return hSearch;
++ if (!m_bOnline || !id) return nullptr;
++ const auto peer=oscarid::key(T2Utf(id).get());
++ if(peer.empty()) return nullptr;
++ const uint32_t uin=oscarid::uin(peer);
++ static long searchId=0;
++ HANDLE hSearch=(HANDLE)(INT_PTR)InterlockedIncrement(&searchId);
++ if(uin && getDword("UIN")) RequestUserInfo(uin,0,hSearch);
++ else ForkThread(&CKicqProto::SearchScreenName,new KicqScreenSearch{peer,hSearch});
++ return hSearch;
+ }
+ 
+ // X-status selector with bilingual names and local title/description editor.
+@@ -2074,3 +2123,16 @@
+  // Accepted locally. The server's SSI result, then BART's upload result decide success.
+  return 0;
+ }
++
++INT_PTR __cdecl CKicqProto::OnRetryAuth(WPARAM w, LPARAM)
++{
++ MCONTACT c=(MCONTACT)w;
++ if(!c || mir_strcmp(Proto_GetBaseAccountName(c),m_szModuleName) || !getByte(c,"Auth",0)) return 1;
++ return AuthRequest(c,TranslateT("Please authorize me"));
++}
++int __cdecl CKicqProto::OnPreBuildContactMenu(WPARAM w, LPARAM)
++{
++ MCONTACT c=(MCONTACT)w;
++ if(m_hRetryAuthMenu) Menu_ShowItem(m_hRetryAuthMenu,c && m_bOnline && !mir_strcmp(Proto_GetBaseAccountName(c),m_szModuleName) && getByte(c,"Auth",0));
++ return 0;
++}
+--- a/normal/0.96.8/KICQ/src/proto.h
++++ b/normal/0.96.8/KICQ/src/proto.h
+@@ -1,3 +1,4 @@
++#include "oscar_identity.h"
+ /*
+ Copyright (C) 2026 Miranda NG team
+ 
+@@ -38,10 +39,11 @@
+ // per-contact state that lives only as long as the connection
+ struct KicqUser
+ {
+-	KicqUser(uint32_t _uin, MCONTACT _hContact) :
+-		uin(_uin), hContact(_hContact)
++	KicqUser(const std::string &id, MCONTACT _hContact) :
++		name(id), uin(oscarid::uin(id)), hContact(_hContact)
+ 	{}
+ 
++	std::string name;
+ 	uint32_t uin;
+ 	MCONTACT hContact;
+ 	int groupId = 0, ssiId = 0; // 0: not on the server-side list
+@@ -52,7 +54,8 @@
+ 
+ struct KicqPendingMsg
+ {
+-	uint32_t uin;
++	std::string name;
++	MCONTACT contact;
+ 	int seq;
+ };
+ 
+@@ -197,8 +200,12 @@
+ 	void HandleYouWereAdded(const bytes_t &data);
+ 	void HandleSsiItem(const bytes_t &data, bool bDeleted);
+ 	void HandleSsiResult(const bytes_t &data, uint32_t reqId);
+-	void DeliverMessage(uint32_t uin, const CMStringW &text, time_t when);
++	void DeliverMessage(const std::string &name, const CMStringW &text, time_t when);
+ 	void CheckTimeouts();
++	void __cdecl SearchScreenName(void *);
++	HGENMENU m_hRetryAuthMenu = nullptr;
++	INT_PTR __cdecl OnRetryAuth(WPARAM, LPARAM);
++	int __cdecl OnPreBuildContactMenu(WPARAM, LPARAM);
+ 
+ 	// roster
+ 	mir_cs m_csRoster;
+@@ -206,20 +213,26 @@
+ 	OBJLIST<KicqGroup> m_arGroups;
+ 	std::set<CMStringW> m_offlineSeen;
+ 
+-	KicqUser* FindUser(uint32_t uin);
+-	KicqUser* AddUser(uint32_t uin, MCONTACT hContact);
++	KicqUser* FindUser(const std::string &name);
++	KicqUser* FindUser(uint32_t uin) { return uin ? FindUser(std::to_string(uin)) : nullptr; }
++	KicqUser* AddUser(const std::string &name, MCONTACT hContact);
+ 	KicqGroup* FindGroup(int id);
+ 	KicqGroup* FindGroup(const wchar_t *name);
+ 	int NewSsiId();
+-	MCONTACT FindContact(uint32_t uin);
+-	MCONTACT CreateContact(uint32_t uin, bool bTemporary);
+-	void ApplyRosterItem(uint32_t uin, int groupId, int ssiId, const OscarTlvList &tlvs, bool bFromLogin);
++	std::string ContactId(MCONTACT contact);
++	std::string AccountId();
++	MCONTACT FindContact(const std::string &name);
++	MCONTACT FindContact(uint32_t uin) { return uin ? FindContact(std::to_string(uin)) : 0; }
++	MCONTACT CreateContact(const std::string &name, bool bTemporary);
++	MCONTACT CreateContact(uint32_t uin, bool temporary) { return uin ? CreateContact(std::to_string(uin), temporary) : 0; }
++	void ApplyRosterItem(const std::string &name, int groupId, int ssiId, const OscarTlvList &tlvs, bool bFromLogin);
+ 	int ResolveGroupFor(MCONTACT hContact);
+ 
+ 	// one SSI edit at a time, like Jasmine: the result names only the request type
+ 	struct PendingSsi
+ 	{
+ 		uint32_t uin = 0;
++		std::string id;
+ 		CMStringW name;
+ 		int groupId = 0, ssiId = 0;
+ 		MCONTACT hContact = 0;
+--- a/normal/0.96.8/KICQ/src/server.cpp
++++ b/normal/0.96.8/KICQ/src/server.cpp
+@@ -94,10 +94,11 @@
+ {
+ 	m_iLoginError = 0;
+ 	m_cookie.clear();
+-	m_szUin.Format("%u", getDword("UIN"));
++	m_szUin = AccountId().c_str();
+ 	{
+ 		mir_cslock lck(m_csRoster);
+ 		m_arUsers.destroy();
++  m_pendAdd.id.clear();m_pendRename.id.clear();
+ 		m_arGroups.destroy();
+ 		m_offlineSeen.clear();
+ 	}
+@@ -353,7 +354,7 @@
+ 		if (bLogin) {
+ 			debugLogA("login server hello, sending XOR login");
+ 			ptrA szPassword(getStringA("Password"));
+-			Send(1, OscarPackets::xorLogin(m_szUin, szPassword ? szPassword.get() : "", getByte("ClientIdPreset", 0)));
++			Send(1, OscarPackets::xorLogin(m_szUin, szPassword ? szPassword.get() : "", getByte("ClientIdPreset", 0) ? getByte("ClientIdPreset", 0) : (getDword("UIN") ? 0 : 10)));
+ 		}
+ 		else {
+ 			debugLogA("BOS hello, sending cookie");
+@@ -546,7 +547,7 @@
+ // roster
+ 
+ // mirrors one server-side contact into the contact list
+-void CKicqProto::ApplyRosterItem(uint32_t uin, int groupId, int ssiId, const OscarTlvList &tlvs, bool bFromLogin)
++void CKicqProto::ApplyRosterItem(const std::string &name, int groupId, int ssiId, const OscarTlvList &tlvs, bool bFromLogin)
+ {
+ 	bool bTemporary;
+ 	CMStringW wszGroup;
+@@ -558,15 +559,16 @@
+ 			wszGroup = pGroup->name;
+ 	}
+ 
+-	MCONTACT hContact = FindContact(uin);
++	MCONTACT hContact = FindContact(name);
+ 	bool bNew = (hContact == 0);
+ 	if (bNew)
+-		hContact = CreateContact(uin, bTemporary);
++		hContact = CreateContact(name, bTemporary);
++ if(!hContact) return;
+ 
+ 	bool bAuthorized = !tlvs.has(0x66);
+ 	{
+ 		mir_cslock lck(m_csRoster);
+-		auto *pUser = AddUser(uin, hContact);
++		auto *pUser = AddUser(name, hContact);
+ 		pUser->hContact = hContact;
+ 		pUser->groupId = groupId;
+ 		pUser->ssiId = bTemporary ? 0 : ssiId;
+@@ -640,7 +642,7 @@
+                         GetFileAttributesW(oldPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+                         delSetting("BartOwnAvatarPath");
+                         ReportSelfAvatarChanged();
+-                        QueueBartAvatar(uint32_t(atoi(m_szUin)), 1, hash);
++                        QueueBartAvatar(getDword("UIN"), 1, hash);
+                     }
+                 }
+             }
+@@ -660,9 +662,9 @@
+ 
+ 	// groups may come after their contacts, so contacts are applied once the packet is read
+ 	for (auto &it : contacts) {
+-		uint32_t uin = strtoul(it.name, nullptr, 10);
+-		if (uin)
+-			ApplyRosterItem(uin, it.groupId, it.itemId, OscarTlvList(it.extra), true);
++		const auto name = oscarid::key(it.name.c_str());
++		if (!name.empty())
++			ApplyRosterItem(name, it.groupId, it.itemId, OscarTlvList(it.extra), true);
+ 	}
+ 
+ 	if ((flags & 0x0001) == 0) {
+@@ -679,7 +681,7 @@
+ 		m_iStatus = ID_STATUS_ONLINE;
+ 
+ 	auto *pVer = &pluginInfoEx.version;
+-	Send(OscarPackets::setUserInfo(HIBYTE(HIWORD(*pVer)), LOBYTE(HIWORD(*pVer)), HIBYTE(LOWORD(*pVer)), nullptr, getByte("ClientIdPreset", 0)));
++	Send(OscarPackets::setUserInfo(HIBYTE(HIWORD(*pVer)), LOBYTE(HIWORD(*pVer)), HIBYTE(LOWORD(*pVer)), nullptr, getByte("ClientIdPreset", 0) ? getByte("ClientIdPreset", 0) : (getDword("UIN") ? 0 : 10)));
+ 	Send(OscarPackets::setIcbmParams());
+ 	// Subscribe to presence for SSI contacts. The server sends 03/0B and
+ 	// 03/0C updates to clients registered via BuddyAddBuddies (03/04).
+@@ -689,9 +691,8 @@
+ 		int count = 0;
+ 		mir_cslock lck(m_csRoster);
+ 		for (auto &it : m_arUsers) {
+-			if (!it->uin) continue;
+-			CMStringA uin;
+-			uin.Format("%u", it->uin);
++			if (it->name.empty()) continue;
++			CMStringA uin(it->name.c_str());
+ 			if (buddies.size() + uin.GetLength() + 1 > 3500 && count) {
+ 				Send(OscarSnac(3, 4, 0, buddies.data()));
+ 				buddies = OscarWriter();
+@@ -710,7 +711,7 @@
+ 	// Send only a 4-byte status TLV. The legacy DC-info/away-text
+ 	// extensions are not needed for Open OSCAR Server presence.
+ 	Send(OscarPackets::setStatus(MirandaToIcqStatus(m_iStatus), 256));
+-	Send(OscarPackets::offlineMsgsRequest(atoi(m_szUin), m_seq));
++	if(getDword("UIN")) Send(OscarPackets::offlineMsgsRequest(atoi(m_szUin), m_seq));
+ 
+ 	m_bOnline = true;
+ 	if (getByte("XStatusId", 0)) SendXStatus();
+@@ -748,7 +749,7 @@
+                     path.IsEmpty() || GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) {
+                     delSetting("BartOwnAvatarPath");
+                     ReportSelfAvatarChanged();
+-                    QueueBartAvatar(uint32_t(atoi(m_szUin)), 1, hash);
++                    QueueBartAvatar(getDword("UIN"), 1, hash);
+                 }
+             }
+         }
+@@ -770,19 +771,19 @@
+ 		return;
+ 	}
+ 
+-	uint32_t uin = strtoul(rawName.c_str(), nullptr, 10);
+-	if (type != 0 || uin == 0)
++	const auto name = oscarid::key(rawName);
++	if (type != 0 || name.empty())
+ 		return;
+ 
+ 	if (bDeleted) {
+ 		mir_cslock lck(m_csRoster);
+-		if (auto *pUser = FindUser(uin))
++		if (auto *pUser = FindUser(name))
+ 			if (pUser->ssiId == itemId)
+ 				pUser->ssiId = pUser->groupId = 0;
+ 		return;
+ 	}
+ 
+-	ApplyRosterItem(uin, groupId, itemId, tlvs, false);
++	ApplyRosterItem(name, groupId, itemId, tlvs, false);
+ }
+ 
+ void CKicqProto::HandleSsiResult(const bytes_t &data, uint32_t reqId)
+@@ -793,20 +794,21 @@
+ 
+ 	switch (reqId) {
+ 	case REQ_ADD_CONTACT:
+-		if (m_pendAdd.uin == 0)
++		if (m_pendAdd.id.empty())
+ 			break;
+ 
+ 		if (result == 0 || result == 0x0E) {
+-			char szUin[20];
+-			_itoa(m_pendAdd.uin, szUin, 10);
++			const char *szUin = m_pendAdd.id.c_str();
+ 			{
+ 				mir_cslock lck(m_csRoster);
+-				auto *pUser = AddUser(m_pendAdd.uin, m_pendAdd.hContact);
++				auto *pUser = AddUser(m_pendAdd.id, m_pendAdd.hContact);
+ 				pUser->groupId = m_pendAdd.groupId;
+ 				pUser->ssiId = m_pendAdd.ssiId;
+ 				pUser->bAuthorized = (result == 0);
+ 			}
+ 			setWString(m_pendAdd.hContact, "SrvNick", m_pendAdd.name);
++ if(result==0)delSetting(m_pendAdd.hContact,"Auth");
++ if(!oscarid::uin(m_pendAdd.id)){OscarWriter buddy;buddy.ascii8(szUin);Send(OscarSnac(3,4,0,buddy.data()));}
+ 
+ 			if (result == 0x0E) {
+ 				// the contact requires authorization: add it flagged, then ask
+@@ -817,11 +819,11 @@
+ 				Send(OscarPackets::futureAuthGrant(szUin));
+ 				Send(OscarPackets::authRequest(szUin, TranslateT("Please authorize me")));
+ 			}
+-			m_pendAdd.uin = 0;
++			m_pendAdd.id.clear();
+ 		}
+ 		else {
+-			debugLogA("adding %u failed, code %d", m_pendAdd.uin, result);
+-			m_pendAdd.uin = 0;
++			debugLogA("adding %s failed, code %d", m_pendAdd.id.c_str(), result);
++			m_pendAdd.id.clear();
+ 		}
+ 		break;
+ 
+@@ -830,10 +832,10 @@
+ 		break;
+ 
+ 	case REQ_RENAME:
+-		if (result == 0 && m_pendRename.uin)
+-			if (MCONTACT hContact = FindContact(m_pendRename.uin))
++		if (result == 0 && !m_pendRename.id.empty())
++			if (MCONTACT hContact = FindContact(m_pendRename.id))
+ 				setWString(hContact, "SrvNick", m_pendRename.name);
+-		m_pendRename.uin = 0;
++		m_pendRename.id.clear();
+ 		break;
+ 
+ 	case REQ_ADD_GROUP:
+@@ -982,11 +984,16 @@
+ void CKicqProto::HandleUserOnline(const bytes_t &data)
+ {
+ 	OscarReader r(data);
+-	uint32_t uin = strtoul(r.ascii8().c_str(), nullptr, 10);
++	const auto name = oscarid::key(r.ascii8());
++ if(name.empty()) return;
++ uint32_t uin = oscarid::uin(name);
+ 	r.skip(2); // warning level
+ 	r.skip(2); // TLV count
+ 	OscarTlvList tlvs(r);
+-	if (const auto *bartId = tlvs.find(0x1D)) ObserveBartPresence(uin, bartId->data);
++ if(!uin){MCONTACT c=0;{mir_cslock lock(m_csRoster);if(auto *u=FindUser(name)){u->bOnline=true;c=u->hContact;}}
++  if(c){const auto *flags=tlvs.find(1);setWord(c,"Status",flags && (flags->u16()&0x20)?ID_STATUS_AWAY:ID_STATUS_ONLINE);}return;}
++
++	if (const auto *bartId = tlvs.find(0x1D)) if(uin) ObserveBartPresence(uin, bartId->data);
+ 
+     // Only trace changes for the target Jimm Multi UIN. A presence refresh can
+     // repeat hundreds of times; logging each repeat hid the relevant packets.
+@@ -1031,7 +1038,7 @@
+ 	bool xstatusChanged = false;
+ 	{
+ 		mir_cslock lck(m_csRoster);
+-		auto *pUser = FindUser(uin);
++		auto *pUser = FindUser(name);
+ 		if (pUser == nullptr)
+ 			return;
+ 
+@@ -1307,7 +1314,9 @@
+ void CKicqProto::HandleUserOffline(const bytes_t &data)
+ {
+ 	OscarReader r(data);
+-	uint32_t uin = strtoul(r.ascii8().c_str(), nullptr, 10);
++	const auto name = oscarid::key(r.ascii8());
++ if(name.empty()) return;
++ uint32_t uin = oscarid::uin(name);
+ 
+     {
+         char line[96];
+@@ -1318,7 +1327,7 @@
+ 	MCONTACT hContact;
+ 	{
+ 		mir_cslock lck(m_csRoster);
+-		auto *pUser = FindUser(uin);
++		auto *pUser = FindUser(name);
+ 		if (pUser == nullptr)
+ 			return;
+ 		pUser->bOnline = false;
+@@ -1340,14 +1349,15 @@
+ /////////////////////////////////////////////////////////////////////////////////////////
+ // messages
+ 
+-void CKicqProto::DeliverMessage(uint32_t uin, const CMStringW &text, time_t when)
+-{
+-	MCONTACT hContact = FindContact(uin);
++void CKicqProto::DeliverMessage(const std::string &name, const CMStringW &text, time_t when)
++{
++	MCONTACT hContact = FindContact(name);
+ 	if (hContact == 0)
+-		hContact = CreateContact(uin, true);
++		hContact = CreateContact(name, true);
++ if(!hContact) return;
+ 	{
+ 		mir_cslock lck(m_csRoster);
+-		AddUser(uin, hContact);
++		AddUser(name, hContact);
+ 	}
+ 
+ 	CallService(MS_PROTO_CONTACTISTYPING, hContact, PROTOTYPE_CONTACTTYPING_OFF);
+@@ -1370,9 +1380,9 @@
+ 	OscarTlvList info(r, infoCount);     // sender's presence TLVs
+ 	OscarTlvList msgTlvs(r);
+ 
+-	uint32_t uin = strtoul(sender.c_str(), nullptr, 10);
+-	if (uin == 0)
+-		return;
++	const auto name = oscarid::key(sender);
++ if(name.empty()) return;
++ uint32_t uin = oscarid::uin(name);
+ 
+ 	CMStringW text;
+ 	bool bHaveText = false, bOffline = false;
+@@ -1403,6 +1413,7 @@
+ 		}
+ 	}
+ 	else if (channel == 2) {
++        if(!uin) return; // legacy ICQ relay/OFT2 is UIN-only
+ 		auto *t5 = msgTlvs.find(5);
+ 		if (!t5) {
+ 			debugLogA("ARS RX DIAG4: channel-2 ICBM received WITHOUT TLV(5); sender=%u", (unsigned)uin);
+@@ -1470,7 +1481,7 @@
+       }
+      }
+     }
+-    const bool ownSenderUin = (uin == strtoul(m_szUin.c_str(), nullptr, 10));
++    const bool ownSenderUin = (uin == oscarid::uin(m_szUin.c_str()));
+     if (ownSenderUin || ourOutgoingCookie) {
+      debugLogA("OFT2 RX: discarded outgoing offer reflected by server; sender=%u own=%s cookieMatch=%d",
+        (unsigned)uin, m_szUin.c_str(), (int)ourOutgoingCookie);
+@@ -1588,7 +1599,7 @@
+ 
+ 	if (!bOffline)
+ 		Send(OscarPackets::messageAck(cookie, sender.c_str()));
+-	DeliverMessage(uin, text, when);
++	DeliverMessage(name, text, when);
+ }
+ 
+ void CKicqProto::HandleOfflineMessage(const bytes_t &data)
+@@ -1631,10 +1642,11 @@
+ 			tmMsg.tm_isdst = -1;
+ 			when = mktime(&tmMsg);
+ 		}
+-		DeliverMessage(uin, text, when);
++		if(uin) DeliverMessage(std::to_string(uin), text, when);
+ 	}
+ 	else if (type == 0x4200) {
+-		Send(OscarPackets::deleteOfflineMsgs(atoi(m_szUin), m_seq));
++		if(!getDword("UIN"))return;
++  Send(OscarPackets::deleteOfflineMsgs(atoi(m_szUin), m_seq));
+ 		Send(OscarPackets::anotherOfflineMsgsRequest());
+ 	}
+ }
+@@ -1692,7 +1704,9 @@
+ 	OscarReader r(data);
+ 	r.skip(8);                              // cookie
+ 	r.u16();                                // channel
+-	uint32_t uin = strtoul(r.ascii8().c_str(), nullptr, 10);
++	const auto name = oscarid::key(r.ascii8());
++ if(name.empty()) return;
++ uint32_t uin = oscarid::uin(name);
+ 
+ 	// A channel-2 message ACK may carry an Xtraz AwayStat response.
+  // Never turn it into an ordinary chat message or acknowledge a pending chat.
+@@ -1721,7 +1735,7 @@
+   const bytes_t title = KicqXmlField(xml, "title");
+   const bytes_t desc = KicqXmlField(xml, "desc");
+   if ((!title.empty() || !desc.empty()) && uin != 0) {
+-   if (MCONTACT hContact = FindContact(uin)) {
++   if (MCONTACT hContact = FindContact(name)) {
+     if (getByte(hContact, "XStatusLive", 0)) {
+      setWString(hContact, "XStatusName", OscarText::fromUtf8(KicqUnescapeXml(title)));
+      setWString(hContact, "XStatusMsg", OscarText::fromUtf8(KicqUnescapeXml(desc)));
+@@ -1797,7 +1811,7 @@
+ 	{
+ 		mir_cslock lck(m_csPending);
+ 		for (auto it = m_pendingMsgs.begin(); it != m_pendingMsgs.end(); ++it) {
+-			if (it->second.uin == uin) {
++			if (it->second.name == name) {
+ 				seq = it->second.seq;
+ 				m_pendingMsgs.erase(it);
+ 				break;
+@@ -1806,7 +1820,7 @@
+ 	}
+ 
+ 	if (seq)
+-		if (MCONTACT hContact = FindContact(uin))
++		if (MCONTACT hContact = FindContact(name))
+ 			ProtoBroadcastAck(hContact, ACKTYPE_MESSAGE, ACKRESULT_SUCCESS, (HANDLE)seq, 0);
+ }
+ 
+@@ -1851,8 +1865,8 @@
+ 		m_pendingMsgs.erase(it);
+ 	}
+ 
+-	debugLogA("message to %u failed, error %d", msg.uin, code);
+-	if (MCONTACT hContact = FindContact(msg.uin)) {
++	debugLogA("message to %s failed, error %d", msg.name.c_str(), code);
++	if (MCONTACT hContact = FindContact(msg.name)) {
+ 		CMStringW wszError(FORMAT, TranslateT("The server refused the message (error %d)"), code);
+ 		ProtoBroadcastAck(hContact, ACKTYPE_MESSAGE, ACKRESULT_FAILED, (HANDLE)msg.seq, (LPARAM)wszError.c_str());
+ 	}
+@@ -1862,10 +1876,12 @@
+ {
+ 	OscarReader r(data);
+ 	r.skip(10);
+-	uint32_t uin = strtoul(r.ascii8().c_str(), nullptr, 10);
++	const auto name = oscarid::key(r.ascii8());
++ if(name.empty()) return;
++ uint32_t uin = oscarid::uin(name);
+ 	int type = r.u16();
+ 
+-	if (MCONTACT hContact = FindContact(uin))
++	if (MCONTACT hContact = FindContact(name))
+ 		CallService(MS_PROTO_CONTACTISTYPING, hContact, type == 2 ? PROTOTYPE_CONTACTTYPING_INFINITE : PROTOTYPE_CONTACTTYPING_OFF);
+ }
+ 
+@@ -2007,58 +2023,67 @@
+ void CKicqProto::HandleAuthRequest(const bytes_t &data)
+ {
+ 	OscarReader r(data);
+-	uint32_t uin = strtoul(r.ascii8().c_str(), nullptr, 10);
++	const auto name = oscarid::key(r.ascii8());
++ if(name.empty()) return;
++ uint32_t uin = oscarid::uin(name);
+ 	CMStringW reason(OscarText::textOrCp1251(r.bytes(r.u16())));
+-	if (uin == 0)
+-		return;
+-
+-	MCONTACT hContact = FindContact(uin);
++	
++
++	MCONTACT hContact = FindContact(name);
+ 	if (hContact == 0)
+-		hContact = CreateContact(uin, true);
+-
+-	char szUin[20];
+-	_itoa(uin, szUin, 10);
++		hContact = CreateContact(name, true);
++
++	if(!hContact) return;
++ setByte(hContact,"Grant",1);
++ const char *szUin = name.c_str();
+ 	DB::AUTH_BLOB blob(hContact, T2Utf(getMStringW(hContact, "Nick")), nullptr, nullptr, szUin, T2Utf(reason));
+ 	blob.set_uin(uin);
+ 
+ 	DB::EventInfo dbei;
+ 	dbei.iTimestamp = time(0);
++ dbei.szModule=m_szModuleName;
++ dbei.flags=DBEF_UTF;
++ dbei.eventType=EVENTTYPE_AUTHREQUEST;
+ 	dbei.cbBlob = blob.size();
+ 	dbei.pBlob = blob;
+-	ProtoChainRecv(hContact, PSR_AUTH, 0, (LPARAM)&dbei);
++	Proto_AuthRecv(m_szModuleName,dbei);
+ }
+ 
+ void CKicqProto::HandleAuthReply(const bytes_t &data)
+ {
+ 	OscarReader r(data);
+-	uint32_t uin = strtoul(r.ascii8().c_str(), nullptr, 10);
++	const auto name = oscarid::key(r.ascii8());
++ if(name.empty()) return;
++ uint32_t uin = oscarid::uin(name);
+ 	bool bGranted = r.u8() == 1;
+ 	debugLogA("authorization %s by %u", bGranted ? "granted" : "denied", uin);
+ 
+-	MCONTACT hContact = FindContact(uin);
+-	if (hContact == 0 || !bGranted)
++	MCONTACT hContact = FindContact(name);
++	if(hContact && !bGranted) setByte(hContact,"Auth",1);
++ if (hContact == 0 || !bGranted)
+ 		return;
+ 
+ 	delSetting(hContact, "Auth");
+ 
+ 	mir_cslock lck(m_csRoster);
+-	if (auto *pUser = FindUser(uin))
++	if (auto *pUser = FindUser(name))
+ 		pUser->bAuthorized = true;
+ }
+ 
+ void CKicqProto::HandleYouWereAdded(const bytes_t &data)
+ {
+ 	OscarReader r(data);
+-	uint32_t uin = strtoul(r.ascii8().c_str(), nullptr, 10);
+-	if (uin == 0)
+-		return;
+-
+-	MCONTACT hContact = FindContact(uin);
++	const auto name = oscarid::key(r.ascii8());
++ if(name.empty()) return;
++ uint32_t uin = oscarid::uin(name);
++	
++
++	MCONTACT hContact = FindContact(name);
+ 	if (hContact == 0)
+-		hContact = CreateContact(uin, true);
+-
+-	char szUin[20];
+-	_itoa(uin, szUin, 10);
++		hContact = CreateContact(name, true);
++
++	if(!hContact) return;
++ const char *szUin = name.c_str();
+ 	DB::AUTH_BLOB blob(hContact, T2Utf(getMStringW(hContact, "Nick")), nullptr, nullptr, szUin, nullptr);
+ 	blob.set_uin(uin);
+ 
+--- /dev/null
++++ b/tests/identity_test.cpp
+@@ -0,0 +1,4 @@
++#include "oscar_identity.h"
++#include <cassert>
++#include <iostream>
++int main(){using namespace oscarid;assert(key("Alice Example")=="aliceexample");assert(key("ALICEEXAMPLE")=="aliceexample");assert(key("00042")=="42");assert(uin("42")==42);assert(uin("42test")==0);assert(key("4294967295")=="4294967295");assert(key("4294967296").empty());assert(key("0").empty());assert(key("a\n").empty());assert(key("Test@example.org")=="test@example.org");std::cout<<"OSCAR identity tests passed\n";}
+--- a/windows-xp-x86/0.96.7/KICQ/res/resource.rc
++++ b/windows-xp-x86/0.96.7/KICQ/res/resource.rc
+@@ -28,8 +28,8 @@
+ EXSTYLE WS_EX_CONTROLPARENT
+ FONT 8, "MS Shell Dlg", 0, 0, 0x1
+ BEGIN
+-    LTEXT           "UIN:",IDC_STATIC,0,7,60,8
+-    EDITTEXT        IDC_UIN,62,5,123,12,ES_AUTOHSCROLL | ES_NUMBER
++    LTEXT           "UIN / SN:",IDC_STATIC,0,7,60,8
++    EDITTEXT        IDC_UIN,62,5,123,12,ES_AUTOHSCROLL
+     LTEXT           "Password:",IDC_STATIC,0,23,60,8
+     EDITTEXT        IDC_PASSWORD,62,21,123,12,ES_PASSWORD | ES_AUTOHSCROLL
+     LTEXT           "Server:",IDC_STATIC,0,39,60,8
+@@ -52,8 +52,8 @@
+ FONT 8, "MS Shell Dlg", 0, 0, 0x1
+ BEGIN
+     GROUPBOX        "Account",IDC_STATIC,7,7,291,62
+-    LTEXT           "UIN:",IDC_STATIC,15,22,80,8
+-    EDITTEXT        IDC_UIN,100,20,120,12,ES_AUTOHSCROLL | ES_NUMBER
++    LTEXT           "UIN / SN:",IDC_STATIC,15,22,80,8
++    EDITTEXT        IDC_UIN,100,20,120,12,ES_AUTOHSCROLL
+     LTEXT           "Password:",IDC_STATIC,15,40,80,8
+     EDITTEXT        IDC_PASSWORD,100,38,120,12,ES_PASSWORD | ES_AUTOHSCROLL
+     GROUPBOX        "Connection",IDC_STATIC,7,73,291,103
+--- a/windows-xp-x86/0.96.7/KICQ/src/main.cpp
++++ b/windows-xp-x86/0.96.7/KICQ/src/main.cpp
+@@ -36,7 +36,7 @@
+ CMPlugin::CMPlugin() :
+ 	ACCPROTOPLUGIN<CKicqProto>("PMLICQ", pluginInfoEx)
+ {
+-	SetUniqueId("UIN");
++	SetUniqueId("ScreenName");
+ }
+ 
+ /////////////////////////////////////////////////////////////////////////////////////////
+--- a/windows-xp-x86/0.96.7/KICQ/src/options.cpp
++++ b/windows-xp-x86/0.96.7/KICQ/src/options.cpp
+@@ -35,7 +35,8 @@
+         edtFileProxyPort(this, IDC_FILEPROXY_PORT),
+ 		cmbClientId(this, IDC_CLIENT_ID), m_account(ppro)
+ 	{
+-		CreateLink(edtUin, "UIN", DBVT_DWORD, 0);
++		// LoginId is applied explicitly to preserve the legacy DWORD UIN.
++		CreateLink(edtUin, "LoginId", L"");
+ 		CreateLink(edtPassword, "Password", L"");
+ 		CreateLink(edtServer, ppro->m_wszServer);
+ 		CreateLink(edtPort, ppro->m_iPort);
+@@ -48,7 +49,9 @@
+ 	{
+ 		// the XOR login of that ICQ era only uses the first 8 characters
+ 		edtPassword.SendMsg(EM_LIMITTEXT, 8, 0);
+-		edtUin.SendMsg(EM_LIMITTEXT, 10, 0);
++		edtUin.SendMsg(EM_LIMITTEXT, 97, 0);
++ auto login=m_account->AccountId();
++ SetDlgItemTextW(m_hwnd,IDC_UIN,_A2T(login.c_str()).get());
+ 		static const wchar_t* const choices[] = {
+ 			L"PMLICQ (default)", L"Miranda NG (actual EXE version)", L"Miranda IM",
+ 			L"QIP 2005", L"QIP 2010", L"QIP Infium", L"QIP 2012",
+@@ -62,7 +65,13 @@
+ 
+ 	bool OnApply() override
+ 	{
+-		if (!CKicqDlgBase::OnApply()) return false;
++		wchar_t raw[98]={}; GetDlgItemTextW(m_hwnd,IDC_UIN,raw,_countof(raw));
++ const auto id=oscarid::key(T2Utf(raw).get());
++ if(id.empty() && raw[0]) return false;
++ if (!CKicqDlgBase::OnApply()) return false;
++ m_account->setDword("UIN",oscarid::uin(id));
++ m_account->setString("LoginId",id.c_str());
++ m_account->setString("ScreenName",id.c_str());
+ 		const LPARAM preset = cmbClientId.GetCurData();
+ 		if (preset < 0 || preset > 10) return false;
+ 		m_account->setByte("ClientIdPreset", BYTE(preset));
+--- /dev/null
++++ b/windows-xp-x86/0.96.7/KICQ/src/oscar_identity.h
+@@ -0,0 +1,26 @@
++#pragma once
++#include <string>
++#include <cstdint>
++// OSCAR names are case-insensitive and ignore ASCII spaces. Numeric UINs
++// remain numeric for ICQ-only services; never parse a prefix of an AIM name.
++namespace oscarid {
++inline uint32_t uin(const std::string &s) {
++ if (s.empty()) return 0;
++ uint64_t n=0;
++ for (char c:s) { if(c<'0'||c>'9') return 0; n=n*10+(c-'0'); if(n>0xffffffffULL) return 0; }
++ return static_cast<uint32_t>(n);
++}
++inline std::string key(const std::string &s) {
++ std::string k;
++ for (unsigned char c:s) {
++  if(c==' ') continue;
++  if(c>='A'&&c<='Z') c+=32;
++  if(!((c>='a'&&c<='z')||(c>='0'&&c<='9')||c=='@'||c=='.'||c=='_'||c=='-')) return {};
++  k+=char(c);
++ }
++ if(k.empty()||k.size()>97) return {};
++ bool numeric=true; for(char c:k) if(c<'0'||c>'9') numeric=false;
++ if(numeric) { auto n=uin(k); return n?std::to_string(n):std::string(); }
++ return k;
++}
++}
+--- a/windows-xp-x86/0.96.7/KICQ/src/proto.cpp
++++ b/windows-xp-x86/0.96.7/KICQ/src/proto.cpp
+@@ -119,7 +119,7 @@
+ 
+ static int CompareUsers(const KicqUser *p1, const KicqUser *p2)
+ {
+-	return (p1->uin < p2->uin) ? -1 : (p1->uin > p2->uin) ? 1 : 0;
++	return p1->name.compare(p2->name);
+ }
+ 
+ CKicqProto::CKicqProto(const char *szModuleName, const wchar_t *wszUserName) :
+@@ -143,6 +143,8 @@
+ 
+ 	HookProtoEvent(ME_OPT_INITIALISE, &CKicqProto::OnOptionsInit);
+ 	CreateProtoService("/XStatusEditor", &CKicqProto::OnMenuXStatus);
++ CreateProtoService("/RetryAuth", &CKicqProto::OnRetryAuth);
++ HookProtoEvent(ME_CLIST_PREBUILDCONTACTMENU,&CKicqProto::OnPreBuildContactMenu);
+ 	CreateProtoService(PS_GETAVATARCAPS, &CKicqProto::OnAvatarCaps);
+ 	CreateProtoService(PS_GETAVATARINFO, &CKicqProto::OnGetAvatarInfo);
+ 	CreateProtoService(PS_GETMYAVATAR, &CKicqProto::OnGetMyAvatar);
+@@ -154,6 +156,7 @@
+ 
+ CKicqProto::~CKicqProto()
+ {
++ if(m_hRetryAuthMenu) Menu_RemoveItem(m_hRetryAuthMenu);
+  StopBart();
+  ShutdownOutgoingFiles();
+ }
+@@ -177,6 +180,15 @@
+ 			if (g_kicqExtraIcon) ExtraIcon_SetIcon(g_kicqExtraIcon, h, INVALID_HANDLE_VALUE);
+ 		}
+ 	}
++ for (auto &contact : AccContacts()) {
++  auto id=ContactId(contact); if(!id.empty()) setString(contact,"ScreenName",id.c_str());
++ }
++ {auto id=AccountId();if(!id.empty()){setString("ScreenName",id.c_str());setString("LoginId",id.c_str());}}
++ if(!m_hRetryAuthMenu) {
++  CMenuItem mi(&g_plugin); mi.name.a=LPGEN("Request authorization again"); mi.position=200200;
++  CMStringA service(FORMAT,"%s/RetryAuth",m_szModuleName); mi.pszService=service.GetBuffer();
++  m_hRetryAuthMenu=Menu_AddContactMenuItem(&mi);
++ }
+ 	EnsureXStatusMenu();
+  bool registered = false;
+  for (const auto &name : g_kicqIconModules)
+@@ -223,19 +235,36 @@
+ /////////////////////////////////////////////////////////////////////////////////////////
+ // contacts
+ 
+-MCONTACT CKicqProto::FindContact(uint32_t uin)
+-{
+-	for (auto &hContact : AccContacts())
+-		if (getDword(hContact, "UIN") == uin)
+-			return hContact;
+-	return 0;
+-}
+-
+-MCONTACT CKicqProto::CreateContact(uint32_t uin, bool bTemporary)
+-{
++std::string CKicqProto::ContactId(MCONTACT contact)
++{
++ const uint32_t uin = getDword(contact, "UIN");
++ if (uin) return std::to_string(uin);
++ return oscarid::key(getMStringA(contact, "ScreenName").c_str());
++}
++std::string CKicqProto::AccountId()
++{
++ const uint32_t uin = getDword("UIN");
++ if (uin) return std::to_string(uin);
++ return oscarid::key(getMStringA("LoginId").c_str());
++}
++MCONTACT CKicqProto::FindContact(const std::string &name)
++{
++ const auto id = oscarid::key(name);
++ if(id.empty()) return 0;
++ const auto uin=oscarid::uin(id);
++ for (auto &hContact : AccContacts())
++  if (uin ? getDword(hContact,"UIN")==uin : ContactId(hContact)==id) return hContact;
++ return 0;
++}
++
++MCONTACT CKicqProto::CreateContact(const std::string &name, bool bTemporary)
++{
++ const auto id = oscarid::key(name);
++ if(id.empty()) return 0;
++ const auto uin = oscarid::uin(id);
+ 	static volatile LONG traceCount = 0;
+ 	LONG sequence = InterlockedIncrement(&traceCount);
+-	MCONTACT hContact = FindContact(uin);
++	MCONTACT hContact = FindContact(id);
+ 	bool trace = sequence <= 12 || (sequence % 25) == 0;
+ 	if (trace) KicqDiagTrace("CreateContact ENTER");
+ 	if (hContact) {
+@@ -257,24 +286,26 @@
+     bool bound = boundProto && mir_strcmp(boundProto, m_szModuleName) == 0;
+     if (!bound) KicqDiagTrace("ERROR CreateContact ACCOUNT BINDING MISMATCH");
+     else if (trace) KicqDiagTrace("CreateContact ACCOUNT BINDING OK");
+-	setDword(hContact, "UIN", uin);
++	if(uin) setDword(hContact, "UIN", uin);
++ setString(hContact, "ScreenName", id.c_str());
++ if(!uin) setWString(hContact, "Nick", _A2T(id.c_str()).get());
+ 	setWord(hContact, "Status", ID_STATUS_OFFLINE);
+ 	if (trace) KicqDiagTrace("CreateContact EXIT (UIN/Status stored)");
+ 	return hContact;
+ }
+ 
+-KicqUser* CKicqProto::FindUser(uint32_t uin)
+-{
+-	KicqUser tmp(uin, 0);
++KicqUser* CKicqProto::FindUser(const std::string &name)
++{
++	KicqUser tmp(oscarid::key(name), 0);
+ 	return m_arUsers.find(&tmp);
+ }
+ 
+-KicqUser* CKicqProto::AddUser(uint32_t uin, MCONTACT hContact)
+-{
+-	if (auto *pUser = FindUser(uin))
++KicqUser* CKicqProto::AddUser(const std::string &name, MCONTACT hContact)
++{
++	if (auto *pUser = FindUser(name))
+ 		return pUser;
+ 
+-	auto *pUser = new KicqUser(uin, hContact);
++	auto *pUser = new KicqUser(oscarid::key(name), hContact);
+ 	m_arUsers.insert(pUser);
+ 	return pUser;
+ }
+@@ -405,7 +436,7 @@
+ 	if (IsStatusConnecting(m_iStatus))
+ 		return 0;
+ 
+-	if (getDword("UIN") == 0 || getMStringA("Password").IsEmpty()) {
++	if (AccountId().empty() || getMStringA("Password").IsEmpty()) {
+ 		ProtoBroadcastAck(0, ACKTYPE_LOGIN, ACKRESULT_FAILED, nullptr, LOGINERR_BADUSERID);
+ 		return 0;
+ 	}
+@@ -454,7 +485,7 @@
+ {
+ 	switch (type) {
+ 	case PFLAGNUM_1:
+-		return PF1_FILE | PF1_IM | PF1_SERVERCLIST | PF1_AUTHREQ | PF1_BASICSEARCH | PF1_ADDSEARCHRES | PF1_MODEMSGRECV | PF1_MODEMSGSEND | PF1_NUMERICUSERID;
++		return PF1_FILE | PF1_IM | PF1_SERVERCLIST | PF1_AUTHREQ | PF1_BASICSEARCH | PF1_ADDSEARCHRES | PF1_MODEMSGRECV | PF1_MODEMSGSEND;
+ 
+ 	case PFLAGNUM_2:
+ 		return PF2_ONLINE | PF2_SHORTAWAY | PF2_LONGAWAY | PF2_LIGHTDND | PF2_HEAVYDND | PF2_FREECHAT | PF2_INVISIBLE;
+@@ -466,7 +497,7 @@
+ 		return PF4_SUPPORTTYPING | PF4_IMSENDOFFLINE | PF4_AVATARS;
+ 
+ 	case PFLAG_UNIQUEIDTEXT:
+-		return (INT_PTR)TranslateT("UIN");
++		return (INT_PTR)TranslateT("UIN / Screen Name");
+ 
+ 	case PFLAG_MAXLENOFMESSAGE:
+ 		return 2048;
+@@ -479,9 +510,10 @@
+ 
+ int CKicqProto::SendMsg(MCONTACT hContact, MEVENT, const char *pszSrc)
+ {
+-	uint32_t uin = getDword(hContact, "UIN");
++	const auto peer = ContactId(hContact);
++ uint32_t uin = oscarid::uin(peer);
+ 	int seq = InterlockedIncrement((long *)&m_msgSeq);
+-	if (!m_bOnline || uin == 0) {
++	if (!m_bOnline || peer.empty()) {
+ 		ProtoBroadcastAsync(hContact, ACKTYPE_MESSAGE, ACKRESULT_FAILED, (HANDLE)seq, (LPARAM)TranslateT("You are offline"));
+ 		return seq;
+ 	}
+@@ -489,8 +521,7 @@
+ 	CMStringW text(Utf2T(pszSrc).get());
+ 	text.Replace(L"\n", L"\r\n");
+ 
+-	char szUin[20];
+-	_itoa(uin, szUin, 10);
++	const char *szUin = peer.c_str();
+ 
+ 	bytes_t cookie(8, 0);
+ 	uint64_t id = GetTickCount() ^ (uint64_t(rand()) << 32);
+@@ -500,7 +531,7 @@
+ 	bool bRelay = false, bUtf8 = false, bOnline = false;
+ 	{
+ 		mir_cslock lck(m_csRoster);
+-		if (auto *pUser = FindUser(uin)) {
++		if (auto *pUser = FindUser(peer)) {
+ 			bOnline = pUser->bOnline;
+ 			bUtf8 = pUser->bUtf8;
+ 			bRelay = pUser->ssiId != 0 && pUser->bAuthorized && pUser->bOnline && pUser->bServerRelay;
+@@ -513,12 +544,12 @@
+ 		reqId = m_nextMsgReq++;
+ 		if (m_nextMsgReq > 0x7FFFFFF0)
+ 			m_nextMsgReq = 0x1000;
+-		m_pendingMsgs[reqId] = { uin, seq };
++		m_pendingMsgs[reqId] = { peer, hContact, seq };
+ 	}
+ 
+-	if (bRelay)
++	if (uin && getDword("UIN") && bRelay)
+ 		Send(OscarPackets::messageChannel2(szUin, text, bUtf8, cookie, reqId));
+-	else if (!bOnline) {
++	else if (uin && getDword("UIN") && !bOnline) {
+ 		// kicq.ru's offline store keeps only bytes 0x01-0x7F and stops at the first 0x00:
+ 		// ASCII text survives as charset 0, anything else only as UCS-2 where only characters
+ 		// >= U+0100 get through. Spaces become EN SPACE (U+2002) so that whole Cyrillic
+@@ -543,12 +574,12 @@
+ 
+ int CKicqProto::UserIsTyping(MCONTACT hContact, int type)
+ {
+-	uint32_t uin = getDword(hContact, "UIN");
+-	if (!m_bOnline || uin == 0 || m_iStatus == ID_STATUS_INVISIBLE)
++	const auto peer = ContactId(hContact);
++ uint32_t uin = oscarid::uin(peer);
++	if (!m_bOnline || peer.empty() || m_iStatus == ID_STATUS_INVISIBLE)
+ 		return 0;
+ 
+-	char szUin[20];
+-	_itoa(uin, szUin, 10);
++	const char *szUin = peer.c_str();
+ 	Send(OscarPackets::typingNotify(szUin, type == PROTOTYPE_SELFTYPING_ON ? 2 : 0));
+ 	return 0;
+ }
+@@ -558,9 +589,9 @@
+ 
+ void CKicqProto::SsiAddContact(MCONTACT hContact, int groupId)
+ {
+-	uint32_t uin = getDword(hContact, "UIN");
+-	char szUin[20];
+-	_itoa(uin, szUin, 10);
++	const auto peer = ContactId(hContact);
++ uint32_t uin = oscarid::uin(peer);
++	const char *szUin = peer.c_str();
+ 
+ 	CMStringW wszNick(db_get_wsm(hContact, "CList", "MyHandle"));
+ 	if (wszNick.IsEmpty())
+@@ -568,7 +599,8 @@
+ 	if (wszNick.IsEmpty())
+ 		wszNick = _A2T(szUin).get();
+ 
+-	m_pendAdd.uin = uin;
++	if(peer.empty()) return;
++ m_pendAdd.id = peer;
+ 	m_pendAdd.name = wszNick;
+ 	m_pendAdd.groupId = groupId;
+ 	m_pendAdd.hContact = hContact;
+@@ -584,12 +616,14 @@
+ 
+ MCONTACT CKicqProto::AddToList(int flags, PROTOSEARCHRESULT *psr)
+ {
+-	uint32_t uin = (psr->flags & PSR_UNICODE) ? _wtoi(psr->id.w) : atoi(psr->id.a);
+-	if (uin == 0)
++	if(!psr || ((psr->flags & PSR_UNICODE) ? psr->id.w==nullptr : psr->id.a==nullptr))return 0;
++ const auto peer = oscarid::key((psr->flags & PSR_UNICODE) ? T2Utf(psr->id.w).get() : psr->id.a);
++	if (peer.empty())
+ 		return 0;
+ 
+ 	bool bTemporary = (flags & PALF_TEMPORARY) != 0;
+-	MCONTACT hContact = CreateContact(uin, bTemporary);
++	MCONTACT hContact = CreateContact(peer, bTemporary);
++ if(!hContact) return 0;
+ 	if (psr->nick.w && (psr->flags & PSR_UNICODE))
+ 		setWString(hContact, "Nick", psr->nick.w);
+ 
+@@ -632,7 +666,7 @@
+ 	if (hContact == 0)
+ 		return 0;
+ 
+-	CMStringW wszUin(FORMAT, L"%u", getDword(hContact, "UIN"));
++	CMStringW wszUin(_A2T(ContactId(hContact).c_str()).get());
+ 	PROTOSEARCHRESULT psr = {};
+ 	psr.cbSize = sizeof(psr);
+ 	psr.flags = PSR_UNICODE;
+@@ -645,11 +679,12 @@
+ 	if (!(flags & CDF_DEL_CONTACT) || !m_bOnline)
+ 		return true;
+ 
+-	uint32_t uin = getDword(hContact, "UIN");
++	const auto peer = ContactId(hContact);
++ uint32_t uin = oscarid::uin(peer);
+ 	int groupId = 0, ssiId = 0;
+ 	{
+ 		mir_cslock lck(m_csRoster);
+-		if (auto *pUser = FindUser(uin)) {
++		if (auto *pUser = FindUser(peer)) {
+ 			groupId = pUser->groupId;
+ 			ssiId = pUser->ssiId;
+ 			m_arUsers.remove(pUser);
+@@ -657,8 +692,7 @@
+ 	}
+ 
+ 	if (ssiId != 0) {
+-		char szUin[20];
+-		_itoa(uin, szUin, 10);
++		const char *szUin = peer.c_str();
+ 		m_pendDel.uin = uin;
+ 		Send(OscarPackets::ssiEditStart());
+ 		Send(OscarPackets::deleteContact(szUin, groupId, ssiId));
+@@ -697,16 +731,17 @@
+ 	if (mir_strcmp(Proto_GetBaseAccountName(hContact), m_szModuleName))
+ 		return 0;
+ 
+-	uint32_t uin = getDword(hContact, "UIN");
++	const auto peer = ContactId(hContact);
++ uint32_t uin = oscarid::uin(peer);
+ 	CMStringW wszNick(db_get_wsm(hContact, "CList", "MyHandle"));
+ 	if (wszNick.IsEmpty())
+-		wszNick.Format(L"%u", uin);
++		wszNick = _A2T(peer.c_str()).get();
+ 
+ 	int groupId = 0, ssiId = 0;
+ 	bool bAuthorized = true;
+ 	{
+ 		mir_cslock lck(m_csRoster);
+-		auto *pUser = FindUser(uin);
++		auto *pUser = FindUser(peer);
+ 		if (pUser == nullptr || pUser->ssiId == 0)
+ 			return 0;
+ 		groupId = pUser->groupId;
+@@ -717,9 +752,8 @@
+ 	if (getMStringW(hContact, "SrvNick") == wszNick)
+ 		return 0; // the change came from the server
+ 
+-	char szUin[20];
+-	_itoa(uin, szUin, 10);
+-	m_pendRename.uin = uin;
++	const char *szUin = peer.c_str();
++	m_pendRename.id = peer;
+ 	m_pendRename.name = wszNick;
+ 	Send(OscarPackets::ssiEditStart());
+ 	Send(OscarPackets::renameContact(szUin, wszNick, groupId, ssiId, !bAuthorized));
+@@ -736,11 +770,12 @@
+ 	if (mir_strcmp(Proto_GetBaseAccountName(hContact), m_szModuleName))
+ 		return 0;
+ 
+-	uint32_t uin = getDword(hContact, "UIN");
++	const auto peer = ContactId(hContact);
++ uint32_t uin = oscarid::uin(peer);
+ 	int oldGroup = 0, ssiId = 0, newGroup = 0;
+ 	{
+ 		mir_cslock lck(m_csRoster);
+-		auto *pUser = FindUser(uin);
++		auto *pUser = FindUser(peer);
+ 		if (pUser == nullptr || pUser->ssiId == 0)
+ 			return 0;
+ 
+@@ -755,8 +790,7 @@
+ 	}
+ 
+ 	// OSCAR has no "move": the item is deleted from the old group and added to the new one
+-	char szUin[20];
+-	_itoa(uin, szUin, 10);
++	const char *szUin = peer.c_str();
+ 	m_pendDel.uin = 0;
+ 	Send(OscarPackets::ssiEditStart());
+ 	Send(OscarPackets::deleteContact(szUin, oldGroup, ssiId));
+@@ -775,14 +809,16 @@
+ 
+ int CKicqProto::AuthRequest(MCONTACT hContact, const wchar_t *szMessage)
+ {
+-	uint32_t uin = getDword(hContact, "UIN");
+-	if (!m_bOnline || uin == 0)
++	const auto peer = ContactId(hContact);
++ uint32_t uin = oscarid::uin(peer);
++	if (!m_bOnline || peer.empty())
+ 		return 1;
+ 
+-	char szUin[20];
+-	_itoa(uin, szUin, 10);
++	const char *szUin = peer.c_str();
+ 	Send(OscarPackets::futureAuthGrant(szUin));
+-	Send(OscarPackets::authRequest(szUin, mir_wstrlen(szMessage) ? szMessage : TranslateT("Please authorize me")));
++	Send(OscarPackets::authRequest(szUin, szMessage && mir_wstrlen(szMessage) ? szMessage : TranslateT("Please authorize me")));
++ setByte(hContact,"Auth",1);
++ {mir_cslock lck(m_csRoster);if(auto *pUser=FindUser(peer))pUser->bAuthorized=false;}
+ 	return 0;
+ }
+ 
+@@ -797,26 +833,26 @@
+ int CKicqProto::Authorize(MEVENT hDbEvent)
+ {
+ 	MCONTACT hContact = AuthEventContact(m_szModuleName, hDbEvent);
+-	uint32_t uin = hContact ? getDword(hContact, "UIN") : 0;
+-	if (!m_bOnline || uin == 0)
++	const auto peer = hContact ? ContactId(hContact) : std::string();
++	if (!m_bOnline || peer.empty())
+ 		return 1;
+ 
+-	char szUin[20];
+-	_itoa(uin, szUin, 10);
++	const char *szUin = peer.c_str();
+ 	Send(OscarPackets::authReply(szUin, true));
++ delSetting(hContact,"Grant");
+ 	return 0;
+ }
+ 
+ int CKicqProto::AuthDeny(MEVENT hDbEvent, const wchar_t *)
+ {
+ 	MCONTACT hContact = AuthEventContact(m_szModuleName, hDbEvent);
+-	uint32_t uin = hContact ? getDword(hContact, "UIN") : 0;
+-	if (!m_bOnline || uin == 0)
++	const auto peer = hContact ? ContactId(hContact) : std::string();
++	if (!m_bOnline || peer.empty())
+ 		return 1;
+ 
+-	char szUin[20];
+-	_itoa(uin, szUin, 10);
++	const char *szUin = peer.c_str();
+ 	Send(OscarPackets::authReply(szUin, false));
++ delSetting(hContact,"Grant");
+ 	return 0;
+ }
+ 
+@@ -954,23 +990,36 @@
+ int CKicqProto::GetInfo(MCONTACT hContact, int)
+ {
+ 	uint32_t uin = hContact ? getDword(hContact, "UIN") : getDword("UIN");
+-	if (!m_bOnline || uin == 0)
++	if (!m_bOnline || uin == 0 || !getDword("UIN"))
+ 		return 1;
+ 
+ 	RequestUserInfo(uin, hContact, nullptr);
+ 	return 0;
+ }
+ 
++struct KicqScreenSearch { std::string id; HANDLE handle; };
++void __cdecl CKicqProto::SearchScreenName(void *param)
++{
++ std::unique_ptr<KicqScreenSearch> search(static_cast<KicqScreenSearch*>(param));
++ // Direct add by exact OSCAR name; no claim that the account exists.
++ Sleep(100);
++ CMStringW id(_A2T(search->id.c_str()).get());
++ PROTOSEARCHRESULT psr = {}; psr.cbSize=sizeof(psr); psr.flags=PSR_UNICODE;
++ psr.id.w=id.GetBuffer(); psr.nick.w=id.GetBuffer();
++ ProtoBroadcastAck(0,ACKTYPE_SEARCH,ACKRESULT_DATA,search->handle,(LPARAM)&psr);
++ ProtoBroadcastAck(0,ACKTYPE_SEARCH,ACKRESULT_SUCCESS,search->handle,0);
++}
+ HANDLE CKicqProto::SearchBasic(const wchar_t *id)
+ {
+-	uint32_t uin = _wtoi(id);
+-	if (!m_bOnline || uin == 0)
+-		return nullptr;
+-
+-	static long searchId = 0;
+-	HANDLE hSearch = (HANDLE)(INT_PTR)InterlockedIncrement(&searchId);
+-	RequestUserInfo(uin, 0, hSearch);
+-	return hSearch;
++ if (!m_bOnline || !id) return nullptr;
++ const auto peer=oscarid::key(T2Utf(id).get());
++ if(peer.empty()) return nullptr;
++ const uint32_t uin=oscarid::uin(peer);
++ static long searchId=0;
++ HANDLE hSearch=(HANDLE)(INT_PTR)InterlockedIncrement(&searchId);
++ if(uin && getDword("UIN")) RequestUserInfo(uin,0,hSearch);
++ else ForkThread(&CKicqProto::SearchScreenName,new KicqScreenSearch{peer,hSearch});
++ return hSearch;
+ }
+ 
+ // X-status selector with bilingual names and local title/description editor.
+@@ -2067,3 +2116,16 @@
+  // Accepted locally. The server's SSI result, then BART's upload result decide success.
+  return 0;
+ }
++
++INT_PTR __cdecl CKicqProto::OnRetryAuth(WPARAM w, LPARAM)
++{
++ MCONTACT c=(MCONTACT)w;
++ if(!c || mir_strcmp(Proto_GetBaseAccountName(c),m_szModuleName) || !getByte(c,"Auth",0)) return 1;
++ return AuthRequest(c,TranslateT("Please authorize me"));
++}
++int __cdecl CKicqProto::OnPreBuildContactMenu(WPARAM w, LPARAM)
++{
++ MCONTACT c=(MCONTACT)w;
++ if(m_hRetryAuthMenu) Menu_ShowItem(m_hRetryAuthMenu,c && m_bOnline && !mir_strcmp(Proto_GetBaseAccountName(c),m_szModuleName) && getByte(c,"Auth",0));
++ return 0;
++}
+--- a/windows-xp-x86/0.96.7/KICQ/src/proto.h
++++ b/windows-xp-x86/0.96.7/KICQ/src/proto.h
+@@ -1,3 +1,4 @@
++#include "oscar_identity.h"
+ /*
+ Copyright (C) 2026 Miranda NG team
+ 
+@@ -38,10 +39,11 @@
+ // per-contact state that lives only as long as the connection
+ struct KicqUser
+ {
+-	KicqUser(uint32_t _uin, MCONTACT _hContact) :
+-		uin(_uin), hContact(_hContact)
++	KicqUser(const std::string &id, MCONTACT _hContact) :
++		name(id), uin(oscarid::uin(id)), hContact(_hContact)
+ 	{}
+ 
++	std::string name;
+ 	uint32_t uin;
+ 	MCONTACT hContact;
+ 	int groupId = 0, ssiId = 0; // 0: not on the server-side list
+@@ -52,7 +54,8 @@
+ 
+ struct KicqPendingMsg
+ {
+-	uint32_t uin;
++	std::string name;
++	MCONTACT contact;
+ 	int seq;
+ };
+ 
+@@ -197,8 +200,12 @@
+ 	void HandleYouWereAdded(const bytes_t &data);
+ 	void HandleSsiItem(const bytes_t &data, bool bDeleted);
+ 	void HandleSsiResult(const bytes_t &data, uint32_t reqId);
+-	void DeliverMessage(uint32_t uin, const CMStringW &text, time_t when);
++	void DeliverMessage(const std::string &name, const CMStringW &text, time_t when);
+ 	void CheckTimeouts();
++	void __cdecl SearchScreenName(void *);
++	HGENMENU m_hRetryAuthMenu = nullptr;
++	INT_PTR __cdecl OnRetryAuth(WPARAM, LPARAM);
++	int __cdecl OnPreBuildContactMenu(WPARAM, LPARAM);
+ 
+ 	// roster
+ 	mir_cs m_csRoster;
+@@ -206,20 +213,26 @@
+ 	OBJLIST<KicqGroup> m_arGroups;
+ 	std::set<CMStringW> m_offlineSeen;
+ 
+-	KicqUser* FindUser(uint32_t uin);
+-	KicqUser* AddUser(uint32_t uin, MCONTACT hContact);
++	KicqUser* FindUser(const std::string &name);
++	KicqUser* FindUser(uint32_t uin) { return uin ? FindUser(std::to_string(uin)) : nullptr; }
++	KicqUser* AddUser(const std::string &name, MCONTACT hContact);
+ 	KicqGroup* FindGroup(int id);
+ 	KicqGroup* FindGroup(const wchar_t *name);
+ 	int NewSsiId();
+-	MCONTACT FindContact(uint32_t uin);
+-	MCONTACT CreateContact(uint32_t uin, bool bTemporary);
+-	void ApplyRosterItem(uint32_t uin, int groupId, int ssiId, const OscarTlvList &tlvs, bool bFromLogin);
++	std::string ContactId(MCONTACT contact);
++	std::string AccountId();
++	MCONTACT FindContact(const std::string &name);
++	MCONTACT FindContact(uint32_t uin) { return uin ? FindContact(std::to_string(uin)) : 0; }
++	MCONTACT CreateContact(const std::string &name, bool bTemporary);
++	MCONTACT CreateContact(uint32_t uin, bool temporary) { return uin ? CreateContact(std::to_string(uin), temporary) : 0; }
++	void ApplyRosterItem(const std::string &name, int groupId, int ssiId, const OscarTlvList &tlvs, bool bFromLogin);
+ 	int ResolveGroupFor(MCONTACT hContact);
+ 
+ 	// one SSI edit at a time, like Jasmine: the result names only the request type
+ 	struct PendingSsi
+ 	{
+ 		uint32_t uin = 0;
++		std::string id;
+ 		CMStringW name;
+ 		int groupId = 0, ssiId = 0;
+ 		MCONTACT hContact = 0;
+--- a/windows-xp-x86/0.96.7/KICQ/src/server.cpp
++++ b/windows-xp-x86/0.96.7/KICQ/src/server.cpp
+@@ -122,10 +122,11 @@
+ 	KicqXpTrace("ServerThread begin");
+ 	m_iLoginError = 0;
+ 	m_cookie.clear();
+-	m_szUin.Format("%u", getDword("UIN"));
++	m_szUin = AccountId().c_str();
+ 	{
+ 		mir_cslock lck(m_csRoster);
+ 		m_arUsers.destroy();
++  m_pendAdd.id.clear();m_pendRename.id.clear();
+ 		m_arGroups.destroy();
+ 		m_offlineSeen.clear();
+ 	}
+@@ -383,7 +384,7 @@
+ 		if (bLogin) {
+ 			debugLogA("login server hello, sending XOR login");
+ 			ptrA szPassword(getStringA("Password"));
+-			Send(1, OscarPackets::xorLogin(m_szUin, szPassword ? szPassword.get() : "", getByte("ClientIdPreset", 0)));
++			Send(1, OscarPackets::xorLogin(m_szUin, szPassword ? szPassword.get() : "", getByte("ClientIdPreset", 0) ? getByte("ClientIdPreset", 0) : (getDword("UIN") ? 0 : 10)));
+ 		}
+ 		else {
+ 			debugLogA("BOS hello, sending cookie");
+@@ -583,7 +584,7 @@
+ // roster
+ 
+ // mirrors one server-side contact into the contact list
+-void CKicqProto::ApplyRosterItem(uint32_t uin, int groupId, int ssiId, const OscarTlvList &tlvs, bool bFromLogin)
++void CKicqProto::ApplyRosterItem(const std::string &name, int groupId, int ssiId, const OscarTlvList &tlvs, bool bFromLogin)
+ {
+ 	static volatile LONG rosterCount = 0;
+     LONG seq = InterlockedIncrement(&rosterCount);
+@@ -599,10 +600,11 @@
+ 			wszGroup = pGroup->name;
+ 	}
+ 
+-	MCONTACT hContact = FindContact(uin);
++	MCONTACT hContact = FindContact(name);
+ 	bool bNew = (hContact == 0);
+ 	if (bNew)
+-        hContact = CreateContact(uin, bTemporary);
++        hContact = CreateContact(name, bTemporary);
++ if(!hContact) return;
+     if (!hContact) {
+         KicqDiagTrace("ERROR ApplyRosterItem contact handle is NULL");
+         return;
+@@ -623,7 +625,7 @@
+ 	bool bAuthorized = !tlvs.has(0x66);
+ 	{
+ 		mir_cslock lck(m_csRoster);
+-		auto *pUser = AddUser(uin, hContact);
++		auto *pUser = AddUser(name, hContact);
+ 		pUser->hContact = hContact;
+ 		pUser->groupId = groupId;
+ 		pUser->ssiId = bTemporary ? 0 : ssiId;
+@@ -733,7 +735,7 @@
+                         GetFileAttributesW(oldPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+                         delSetting("BartOwnAvatarPath");
+                         ReportSelfAvatarChanged();
+-                        QueueBartAvatar(uint32_t(atoi(m_szUin)), 1, hash);
++                        QueueBartAvatar(getDword("UIN"), 1, hash);
+                     }
+                 }
+             }
+@@ -756,9 +758,9 @@
+ 	size_t xpRosterIndex = 0;
+ 	for (auto &it : contacts) {
+ 		if ((xpRosterIndex++ % 25) == 0) KicqXpTrace("HandleRoster contacts batch begin");
+-		uint32_t uin = strtoul(it.name, nullptr, 10);
+-		if (uin)
+-			ApplyRosterItem(uin, it.groupId, it.itemId, OscarTlvList(it.extra), true);
++		const auto name = oscarid::key(it.name.c_str());
++		if (!name.empty())
++			ApplyRosterItem(name, it.groupId, it.itemId, OscarTlvList(it.extra), true);
+ 	}
+ 
+ 	KicqXpTrace("HandleRoster contacts applied");
+@@ -778,7 +780,7 @@
+ 		m_iStatus = ID_STATUS_ONLINE;
+ 
+ 	auto *pVer = &pluginInfoEx.version;
+-	Send(OscarPackets::setUserInfo(HIBYTE(HIWORD(*pVer)), LOBYTE(HIWORD(*pVer)), HIBYTE(LOWORD(*pVer)), nullptr, getByte("ClientIdPreset", 0)));
++	Send(OscarPackets::setUserInfo(HIBYTE(HIWORD(*pVer)), LOBYTE(HIWORD(*pVer)), HIBYTE(LOWORD(*pVer)), nullptr, getByte("ClientIdPreset", 0) ? getByte("ClientIdPreset", 0) : (getDword("UIN") ? 0 : 10)));
+ 	Send(OscarPackets::setIcbmParams());
+ 	// Subscribe to presence for SSI contacts. The server sends 03/0B and
+ 	// 03/0C updates to clients registered via BuddyAddBuddies (03/04).
+@@ -786,19 +788,18 @@
+ 	// Snapshot UINs under the roster lock, but never perform blocking
+ 	// Netlib_Send while that lock is held. On Windows XP, synchronous
+ 	// sends can pause roster/UI updates for the socket timeout period.
+-	std::vector<uint32_t> buddyUins;
++	std::vector<std::string> buddyUins;
+ 	{
+ 		mir_cslock lck(m_csRoster);
+ 		for (auto &it : m_arUsers)
+-			if (it->uin)
+-				buddyUins.push_back(it->uin);
++			if (!it->name.empty())
++				buddyUins.push_back(it->name);
+ 	}
+ 	{
+ 		OscarWriter buddies;
+ 		int count = 0;
+-		for (uint32_t buddyUin : buddyUins) {
+-			CMStringA uin;
+-			uin.Format("%u", buddyUin);
++		for (const auto &buddyUin : buddyUins) {
++			CMStringA uin(buddyUin.c_str());
+ 			if (buddies.size() + uin.GetLength() + 1 > 3500 && count) {
+ 				Send(OscarSnac(3, 4, 0, buddies.data()));
+ 				buddies = OscarWriter();
+@@ -818,7 +819,7 @@
+ 	// Send only a 4-byte status TLV. The legacy DC-info/away-text
+ 	// extensions are not needed for Open OSCAR Server presence.
+ 	Send(OscarPackets::setStatus(MirandaToIcqStatus(m_iStatus), 256));
+-	Send(OscarPackets::offlineMsgsRequest(atoi(m_szUin), m_seq));
++	if(getDword("UIN")) Send(OscarPackets::offlineMsgsRequest(atoi(m_szUin), m_seq));
+ 
+ 	m_bOnline = true;
+ 	if (getByte("XStatusId", 0)) SendXStatus();
+@@ -857,7 +858,7 @@
+                     path.IsEmpty() || GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) {
+                     delSetting("BartOwnAvatarPath");
+                     ReportSelfAvatarChanged();
+-                    QueueBartAvatar(uint32_t(atoi(m_szUin)), 1, hash);
++                    QueueBartAvatar(getDword("UIN"), 1, hash);
+                 }
+             }
+         }
+@@ -879,19 +880,19 @@
+ 		return;
+ 	}
+ 
+-	uint32_t uin = strtoul(rawName.c_str(), nullptr, 10);
+-	if (type != 0 || uin == 0)
++	const auto name = oscarid::key(rawName);
++	if (type != 0 || name.empty())
+ 		return;
+ 
+ 	if (bDeleted) {
+ 		mir_cslock lck(m_csRoster);
+-		if (auto *pUser = FindUser(uin))
++		if (auto *pUser = FindUser(name))
+ 			if (pUser->ssiId == itemId)
+ 				pUser->ssiId = pUser->groupId = 0;
+ 		return;
+ 	}
+ 
+-	ApplyRosterItem(uin, groupId, itemId, tlvs, false);
++	ApplyRosterItem(name, groupId, itemId, tlvs, false);
+ }
+ 
+ void CKicqProto::HandleSsiResult(const bytes_t &data, uint32_t reqId)
+@@ -902,20 +903,21 @@
+ 
+ 	switch (reqId) {
+ 	case REQ_ADD_CONTACT:
+-		if (m_pendAdd.uin == 0)
++		if (m_pendAdd.id.empty())
+ 			break;
+ 
+ 		if (result == 0 || result == 0x0E) {
+-			char szUin[20];
+-			_itoa(m_pendAdd.uin, szUin, 10);
++			const char *szUin = m_pendAdd.id.c_str();
+ 			{
+ 				mir_cslock lck(m_csRoster);
+-				auto *pUser = AddUser(m_pendAdd.uin, m_pendAdd.hContact);
++				auto *pUser = AddUser(m_pendAdd.id, m_pendAdd.hContact);
+ 				pUser->groupId = m_pendAdd.groupId;
+ 				pUser->ssiId = m_pendAdd.ssiId;
+ 				pUser->bAuthorized = (result == 0);
+ 			}
+ 			setWString(m_pendAdd.hContact, "SrvNick", m_pendAdd.name);
++ if(result==0)delSetting(m_pendAdd.hContact,"Auth");
++ if(!oscarid::uin(m_pendAdd.id)){OscarWriter buddy;buddy.ascii8(szUin);Send(OscarSnac(3,4,0,buddy.data()));}
+ 
+ 			if (result == 0x0E) {
+ 				// the contact requires authorization: add it flagged, then ask
+@@ -926,11 +928,11 @@
+ 				Send(OscarPackets::futureAuthGrant(szUin));
+ 				Send(OscarPackets::authRequest(szUin, TranslateT("Please authorize me")));
+ 			}
+-			m_pendAdd.uin = 0;
++			m_pendAdd.id.clear();
+ 		}
+ 		else {
+-			debugLogA("adding %u failed, code %d", m_pendAdd.uin, result);
+-			m_pendAdd.uin = 0;
++			debugLogA("adding %s failed, code %d", m_pendAdd.id.c_str(), result);
++			m_pendAdd.id.clear();
+ 		}
+ 		break;
+ 
+@@ -939,10 +941,10 @@
+ 		break;
+ 
+ 	case REQ_RENAME:
+-		if (result == 0 && m_pendRename.uin)
+-			if (MCONTACT hContact = FindContact(m_pendRename.uin))
++		if (result == 0 && !m_pendRename.id.empty())
++			if (MCONTACT hContact = FindContact(m_pendRename.id))
+ 				setWString(hContact, "SrvNick", m_pendRename.name);
+-		m_pendRename.uin = 0;
++		m_pendRename.id.clear();
+ 		break;
+ 
+ 	case REQ_ADD_GROUP:
+@@ -1091,11 +1093,16 @@
+ void CKicqProto::HandleUserOnline(const bytes_t &data)
+ {
+ 	OscarReader r(data);
+-	uint32_t uin = strtoul(r.ascii8().c_str(), nullptr, 10);
++	const auto name = oscarid::key(r.ascii8());
++ if(name.empty()) return;
++ uint32_t uin = oscarid::uin(name);
+ 	r.skip(2); // warning level
+ 	r.skip(2); // TLV count
+ 	OscarTlvList tlvs(r);
+-	if (const auto *bartId = tlvs.find(0x1D)) ObserveBartPresence(uin, bartId->data);
++ if(!uin){MCONTACT c=0;{mir_cslock lock(m_csRoster);if(auto *u=FindUser(name)){u->bOnline=true;c=u->hContact;}}
++  if(c){const auto *flags=tlvs.find(1);setWord(c,"Status",flags && (flags->u16()&0x20)?ID_STATUS_AWAY:ID_STATUS_ONLINE);}return;}
++
++	if (const auto *bartId = tlvs.find(0x1D)) if(uin) ObserveBartPresence(uin, bartId->data);
+ 
+     // Only trace changes for the target Jimm Multi UIN. A presence refresh can
+     // repeat hundreds of times; logging each repeat hid the relevant packets.
+@@ -1140,7 +1147,7 @@
+ 	bool xstatusChanged = false;
+ 	{
+ 		mir_cslock lck(m_csRoster);
+-		auto *pUser = FindUser(uin);
++		auto *pUser = FindUser(name);
+ 		if (pUser == nullptr)
+ 			return;
+ 
+@@ -1421,7 +1428,9 @@
+ void CKicqProto::HandleUserOffline(const bytes_t &data)
+ {
+ 	OscarReader r(data);
+-	uint32_t uin = strtoul(r.ascii8().c_str(), nullptr, 10);
++	const auto name = oscarid::key(r.ascii8());
++ if(name.empty()) return;
++ uint32_t uin = oscarid::uin(name);
+ 
+     {
+         char line[96];
+@@ -1432,7 +1441,7 @@
+ 	MCONTACT hContact;
+ 	{
+ 		mir_cslock lck(m_csRoster);
+-		auto *pUser = FindUser(uin);
++		auto *pUser = FindUser(name);
+ 		if (pUser == nullptr)
+ 			return;
+ 		pUser->bOnline = false;
+@@ -1454,12 +1463,13 @@
+ /////////////////////////////////////////////////////////////////////////////////////////
+ // messages
+ 
+-void CKicqProto::DeliverMessage(uint32_t uin, const CMStringW &text, time_t when)
++void CKicqProto::DeliverMessage(const std::string &name, const CMStringW &text, time_t when)
+ {
+     KicqDiagTrace("DeliverMessage ENTER (content omitted)");
+-	MCONTACT hContact = FindContact(uin);
++	MCONTACT hContact = FindContact(name);
+ 	if (hContact == 0)
+-        hContact = CreateContact(uin, true);
++        hContact = CreateContact(name, true);
++ if(!hContact) return;
+     if (!hContact) {
+         KicqDiagTrace("ERROR DeliverMessage no contact handle");
+         return;
+@@ -1467,7 +1477,7 @@
+     KicqDiagTrace("DeliverMessage contact handle OK");
+ 	{
+ 		mir_cslock lck(m_csRoster);
+-		AddUser(uin, hContact);
++		AddUser(name, hContact);
+ 	}
+ 
+ 	CallService(MS_PROTO_CONTACTISTYPING, hContact, PROTOTYPE_CONTACTTYPING_OFF);
+@@ -1493,11 +1503,9 @@
+ 	OscarTlvList info(r, infoCount);     // sender's presence TLVs
+ 	OscarTlvList msgTlvs(r);
+ 
+-	uint32_t uin = strtoul(sender.c_str(), nullptr, 10);
+-	if (uin == 0) {
+-        KicqDiagTrace("HandleIncomingMessage invalid sender id");
+-        return;
+-    }
++	const auto name = oscarid::key(sender);
++ if(name.empty()) return;
++ uint32_t uin = oscarid::uin(name);
+     {
+         char line[96];
+         mir_snprintf(line, "HandleIncomingMessage channel=%d bytes=%u", channel, (unsigned)data.size());
+@@ -1532,6 +1540,7 @@
+ 		}
+ 	}
+ 	else if (channel == 2) {
++        if(!uin) return; // legacy ICQ relay/OFT2 is UIN-only
+ 		auto *t5 = msgTlvs.find(5);
+ 		if (!t5) {
+ 			debugLogA("ARS RX DIAG4: channel-2 ICBM received WITHOUT TLV(5); sender=%u", (unsigned)uin);
+@@ -1599,7 +1608,7 @@
+       }
+      }
+     }
+-    const bool ownSenderUin = (uin == strtoul(m_szUin.c_str(), nullptr, 10));
++    const bool ownSenderUin = (uin == oscarid::uin(m_szUin.c_str()));
+     if (ownSenderUin || ourOutgoingCookie) {
+      debugLogA("OFT2 RX: discarded outgoing offer reflected by server; sender=%u own=%s cookieMatch=%d",
+        (unsigned)uin, m_szUin.c_str(), (int)ourOutgoingCookie);
+@@ -1719,7 +1728,7 @@
+     KicqDiagTrace("HandleIncomingMessage decoded plain text (content omitted)");
+ 	if (!bOffline)
+ 		Send(OscarPackets::messageAck(cookie, sender.c_str()));
+-	DeliverMessage(uin, text, when);
++	DeliverMessage(name, text, when);
+ }
+ 
+ void CKicqProto::HandleOfflineMessage(const bytes_t &data)
+@@ -1762,10 +1771,11 @@
+ 			tmMsg.tm_isdst = -1;
+ 			when = mktime(&tmMsg);
+ 		}
+-		DeliverMessage(uin, text, when);
++		if(uin) DeliverMessage(std::to_string(uin), text, when);
+ 	}
+ 	else if (type == 0x4200) {
+-		Send(OscarPackets::deleteOfflineMsgs(atoi(m_szUin), m_seq));
++		if(!getDword("UIN"))return;
++  Send(OscarPackets::deleteOfflineMsgs(atoi(m_szUin), m_seq));
+ 		Send(OscarPackets::anotherOfflineMsgsRequest());
+ 	}
+ }
+@@ -1823,7 +1833,9 @@
+ 	OscarReader r(data);
+ 	r.skip(8);                              // cookie
+ 	r.u16();                                // channel
+-	uint32_t uin = strtoul(r.ascii8().c_str(), nullptr, 10);
++	const auto name = oscarid::key(r.ascii8());
++ if(name.empty()) return;
++ uint32_t uin = oscarid::uin(name);
+ 
+ 	// A channel-2 message ACK may carry an Xtraz AwayStat response.
+  // Never turn it into an ordinary chat message or acknowledge a pending chat.
+@@ -1852,7 +1864,7 @@
+   const bytes_t title = KicqXmlField(xml, "title");
+   const bytes_t desc = KicqXmlField(xml, "desc");
+   if ((!title.empty() || !desc.empty()) && uin != 0) {
+-   if (MCONTACT hContact = FindContact(uin)) {
++   if (MCONTACT hContact = FindContact(name)) {
+     if (getByte(hContact, "XStatusLive", 0)) {
+      setWString(hContact, "XStatusName", OscarText::fromUtf8(KicqUnescapeXml(title)));
+      setWString(hContact, "XStatusMsg", OscarText::fromUtf8(KicqUnescapeXml(desc)));
+@@ -1928,7 +1940,7 @@
+ 	{
+ 		mir_cslock lck(m_csPending);
+ 		for (auto it = m_pendingMsgs.begin(); it != m_pendingMsgs.end(); ++it) {
+-			if (it->second.uin == uin) {
++			if (it->second.name == name) {
+ 				seq = it->second.seq;
+ 				m_pendingMsgs.erase(it);
+ 				break;
+@@ -1937,7 +1949,7 @@
+ 	}
+ 
+ 	if (seq)
+-		if (MCONTACT hContact = FindContact(uin))
++		if (MCONTACT hContact = FindContact(name))
+ 			ProtoBroadcastAck(hContact, ACKTYPE_MESSAGE, ACKRESULT_SUCCESS, (HANDLE)seq, 0);
+ }
+ 
+@@ -1982,8 +1994,8 @@
+ 		m_pendingMsgs.erase(it);
+ 	}
+ 
+-	debugLogA("message to %u failed, error %d", msg.uin, code);
+-	if (MCONTACT hContact = FindContact(msg.uin)) {
++	debugLogA("message to %s failed, error %d", msg.name.c_str(), code);
++	if (MCONTACT hContact = FindContact(msg.name)) {
+ 		CMStringW wszError(FORMAT, TranslateT("The server refused the message (error %d)"), code);
+ 		ProtoBroadcastAck(hContact, ACKTYPE_MESSAGE, ACKRESULT_FAILED, (HANDLE)msg.seq, (LPARAM)wszError.c_str());
+ 	}
+@@ -1993,10 +2005,12 @@
+ {
+ 	OscarReader r(data);
+ 	r.skip(10);
+-	uint32_t uin = strtoul(r.ascii8().c_str(), nullptr, 10);
++	const auto name = oscarid::key(r.ascii8());
++ if(name.empty()) return;
++ uint32_t uin = oscarid::uin(name);
+ 	int type = r.u16();
+ 
+-	if (MCONTACT hContact = FindContact(uin))
++	if (MCONTACT hContact = FindContact(name))
+ 		CallService(MS_PROTO_CONTACTISTYPING, hContact, type == 2 ? PROTOTYPE_CONTACTTYPING_INFINITE : PROTOTYPE_CONTACTTYPING_OFF);
+ }
+ 
+@@ -2138,58 +2152,67 @@
+ void CKicqProto::HandleAuthRequest(const bytes_t &data)
+ {
+ 	OscarReader r(data);
+-	uint32_t uin = strtoul(r.ascii8().c_str(), nullptr, 10);
++	const auto name = oscarid::key(r.ascii8());
++ if(name.empty()) return;
++ uint32_t uin = oscarid::uin(name);
+ 	CMStringW reason(OscarText::textOrCp1251(r.bytes(r.u16())));
+-	if (uin == 0)
+-		return;
+-
+-	MCONTACT hContact = FindContact(uin);
++	
++
++	MCONTACT hContact = FindContact(name);
+ 	if (hContact == 0)
+-		hContact = CreateContact(uin, true);
+-
+-	char szUin[20];
+-	_itoa(uin, szUin, 10);
++		hContact = CreateContact(name, true);
++
++	if(!hContact) return;
++ setByte(hContact,"Grant",1);
++ const char *szUin = name.c_str();
+ 	DB::AUTH_BLOB blob(hContact, T2Utf(getMStringW(hContact, "Nick")), nullptr, nullptr, szUin, T2Utf(reason));
+ 	blob.set_uin(uin);
+ 
+ 	DB::EventInfo dbei;
+ 	dbei.iTimestamp = time(0);
++ dbei.szModule=m_szModuleName;
++ dbei.flags=DBEF_UTF;
++ dbei.eventType=EVENTTYPE_AUTHREQUEST;
+ 	dbei.cbBlob = blob.size();
+ 	dbei.pBlob = blob;
+-	ProtoChainRecv(hContact, PSR_AUTH, 0, (LPARAM)&dbei);
++	Proto_AuthRecv(m_szModuleName,dbei);
+ }
+ 
+ void CKicqProto::HandleAuthReply(const bytes_t &data)
+ {
+ 	OscarReader r(data);
+-	uint32_t uin = strtoul(r.ascii8().c_str(), nullptr, 10);
++	const auto name = oscarid::key(r.ascii8());
++ if(name.empty()) return;
++ uint32_t uin = oscarid::uin(name);
+ 	bool bGranted = r.u8() == 1;
+ 	debugLogA("authorization %s by %u", bGranted ? "granted" : "denied", uin);
+ 
+-	MCONTACT hContact = FindContact(uin);
+-	if (hContact == 0 || !bGranted)
++	MCONTACT hContact = FindContact(name);
++	if(hContact && !bGranted) setByte(hContact,"Auth",1);
++ if (hContact == 0 || !bGranted)
+ 		return;
+ 
+ 	delSetting(hContact, "Auth");
+ 
+ 	mir_cslock lck(m_csRoster);
+-	if (auto *pUser = FindUser(uin))
++	if (auto *pUser = FindUser(name))
+ 		pUser->bAuthorized = true;
+ }
+ 
+ void CKicqProto::HandleYouWereAdded(const bytes_t &data)
+ {
+ 	OscarReader r(data);
+-	uint32_t uin = strtoul(r.ascii8().c_str(), nullptr, 10);
+-	if (uin == 0)
+-		return;
+-
+-	MCONTACT hContact = FindContact(uin);
++	const auto name = oscarid::key(r.ascii8());
++ if(name.empty()) return;
++ uint32_t uin = oscarid::uin(name);
++	
++
++	MCONTACT hContact = FindContact(name);
+ 	if (hContact == 0)
+-		hContact = CreateContact(uin, true);
+-
+-	char szUin[20];
+-	_itoa(uin, szUin, 10);
++		hContact = CreateContact(name, true);
++
++	if(!hContact) return;
++ const char *szUin = name.c_str();
+ 	DB::AUTH_BLOB blob(hContact, T2Utf(getMStringW(hContact, "Nick")), nullptr, nullptr, szUin, nullptr);
+ 	blob.set_uin(uin);
+ 
+--- a/windows-xp-x86/0.96.8/KICQ/res/resource.rc
++++ b/windows-xp-x86/0.96.8/KICQ/res/resource.rc
+@@ -28,8 +28,8 @@
+ EXSTYLE WS_EX_CONTROLPARENT
+ FONT 8, "MS Shell Dlg", 0, 0, 0x1
+ BEGIN
+-    LTEXT           "UIN:",IDC_STATIC,0,7,60,8
+-    EDITTEXT        IDC_UIN,62,5,123,12,ES_AUTOHSCROLL | ES_NUMBER
++    LTEXT           "UIN / SN:",IDC_STATIC,0,7,60,8
++    EDITTEXT        IDC_UIN,62,5,123,12,ES_AUTOHSCROLL
+     LTEXT           "Password:",IDC_STATIC,0,23,60,8
+     EDITTEXT        IDC_PASSWORD,62,21,123,12,ES_PASSWORD | ES_AUTOHSCROLL
+     LTEXT           "Server:",IDC_STATIC,0,39,60,8
+@@ -52,8 +52,8 @@
+ FONT 8, "MS Shell Dlg", 0, 0, 0x1
+ BEGIN
+     GROUPBOX        "Account",IDC_STATIC,7,7,291,62
+-    LTEXT           "UIN:",IDC_STATIC,15,22,80,8
+-    EDITTEXT        IDC_UIN,100,20,120,12,ES_AUTOHSCROLL | ES_NUMBER
++    LTEXT           "UIN / SN:",IDC_STATIC,15,22,80,8
++    EDITTEXT        IDC_UIN,100,20,120,12,ES_AUTOHSCROLL
+     LTEXT           "Password:",IDC_STATIC,15,40,80,8
+     EDITTEXT        IDC_PASSWORD,100,38,120,12,ES_PASSWORD | ES_AUTOHSCROLL
+     GROUPBOX        "Connection",IDC_STATIC,7,73,291,103
+--- a/windows-xp-x86/0.96.8/KICQ/src/main.cpp
++++ b/windows-xp-x86/0.96.8/KICQ/src/main.cpp
+@@ -36,7 +36,7 @@
+ CMPlugin::CMPlugin() :
+ 	ACCPROTOPLUGIN<CKicqProto>("PMLICQ", pluginInfoEx)
+ {
+-	SetUniqueId("UIN");
++	SetUniqueId("ScreenName");
+ }
+ 
+ /////////////////////////////////////////////////////////////////////////////////////////
+--- a/windows-xp-x86/0.96.8/KICQ/src/options.cpp
++++ b/windows-xp-x86/0.96.8/KICQ/src/options.cpp
+@@ -35,7 +35,8 @@
+         edtFileProxyPort(this, IDC_FILEPROXY_PORT),
+ 		cmbClientId(this, IDC_CLIENT_ID), m_account(ppro)
+ 	{
+-		CreateLink(edtUin, "UIN", DBVT_DWORD, 0);
++		// LoginId is applied explicitly to preserve the legacy DWORD UIN.
++		CreateLink(edtUin, "LoginId", L"");
+ 		CreateLink(edtPassword, "Password", L"");
+ 		CreateLink(edtServer, ppro->m_wszServer);
+ 		CreateLink(edtPort, ppro->m_iPort);
+@@ -48,7 +49,9 @@
+ 	{
+ 		// the XOR login of that ICQ era only uses the first 8 characters
+ 		edtPassword.SendMsg(EM_LIMITTEXT, 8, 0);
+-		edtUin.SendMsg(EM_LIMITTEXT, 10, 0);
++		edtUin.SendMsg(EM_LIMITTEXT, 97, 0);
++ auto login=m_account->AccountId();
++ SetDlgItemTextW(m_hwnd,IDC_UIN,_A2T(login.c_str()).get());
+ 		static const wchar_t* const choices[] = {
+ 			L"PMLICQ (default)", L"Miranda NG (actual EXE version)", L"Miranda IM",
+ 			L"QIP 2005", L"QIP 2010", L"QIP Infium", L"QIP 2012",
+@@ -62,7 +65,13 @@
+ 
+ 	bool OnApply() override
+ 	{
+-		if (!CKicqDlgBase::OnApply()) return false;
++		wchar_t raw[98]={}; GetDlgItemTextW(m_hwnd,IDC_UIN,raw,_countof(raw));
++ const auto id=oscarid::key(T2Utf(raw).get());
++ if(id.empty() && raw[0]) return false;
++ if (!CKicqDlgBase::OnApply()) return false;
++ m_account->setDword("UIN",oscarid::uin(id));
++ m_account->setString("LoginId",id.c_str());
++ m_account->setString("ScreenName",id.c_str());
+ 		const LPARAM preset = cmbClientId.GetCurData();
+ 		if (preset < 0 || preset > 10) return false;
+ 		m_account->setByte("ClientIdPreset", BYTE(preset));
+--- /dev/null
++++ b/windows-xp-x86/0.96.8/KICQ/src/oscar_identity.h
+@@ -0,0 +1,26 @@
++#pragma once
++#include <string>
++#include <cstdint>
++// OSCAR names are case-insensitive and ignore ASCII spaces. Numeric UINs
++// remain numeric for ICQ-only services; never parse a prefix of an AIM name.
++namespace oscarid {
++inline uint32_t uin(const std::string &s) {
++ if (s.empty()) return 0;
++ uint64_t n=0;
++ for (char c:s) { if(c<'0'||c>'9') return 0; n=n*10+(c-'0'); if(n>0xffffffffULL) return 0; }
++ return static_cast<uint32_t>(n);
++}
++inline std::string key(const std::string &s) {
++ std::string k;
++ for (unsigned char c:s) {
++  if(c==' ') continue;
++  if(c>='A'&&c<='Z') c+=32;
++  if(!((c>='a'&&c<='z')||(c>='0'&&c<='9')||c=='@'||c=='.'||c=='_'||c=='-')) return {};
++  k+=char(c);
++ }
++ if(k.empty()||k.size()>97) return {};
++ bool numeric=true; for(char c:k) if(c<'0'||c>'9') numeric=false;
++ if(numeric) { auto n=uin(k); return n?std::to_string(n):std::string(); }
++ return k;
++}
++}
+--- a/windows-xp-x86/0.96.8/KICQ/src/proto.cpp
++++ b/windows-xp-x86/0.96.8/KICQ/src/proto.cpp
+@@ -119,7 +119,7 @@
+ 
+ static int CompareUsers(const KicqUser *p1, const KicqUser *p2)
+ {
+-	return (p1->uin < p2->uin) ? -1 : (p1->uin > p2->uin) ? 1 : 0;
++	return p1->name.compare(p2->name);
+ }
+ 
+ CKicqProto::CKicqProto(const char *szModuleName, const wchar_t *wszUserName) :
+@@ -143,6 +143,8 @@
+ 
+ 	HookProtoEvent(ME_OPT_INITIALISE, &CKicqProto::OnOptionsInit);
+ 	CreateProtoService("/XStatusEditor", &CKicqProto::OnMenuXStatus);
++ CreateProtoService("/RetryAuth", &CKicqProto::OnRetryAuth);
++ HookProtoEvent(ME_CLIST_PREBUILDCONTACTMENU,&CKicqProto::OnPreBuildContactMenu);
+ 	CreateProtoService(PS_GETAVATARCAPS, &CKicqProto::OnAvatarCaps);
+ 	CreateProtoService(PS_GETAVATARINFO, &CKicqProto::OnGetAvatarInfo);
+ 	CreateProtoService(PS_GETMYAVATAR, &CKicqProto::OnGetMyAvatar);
+@@ -154,6 +156,7 @@
+ 
+ CKicqProto::~CKicqProto()
+ {
++ if(m_hRetryAuthMenu) Menu_RemoveItem(m_hRetryAuthMenu);
+  StopBart();
+  ShutdownOutgoingFiles();
+ }
+@@ -177,6 +180,15 @@
+ 			if (g_kicqExtraIcon) ExtraIcon_SetIcon(g_kicqExtraIcon, h, INVALID_HANDLE_VALUE);
+ 		}
+ 	}
++ for (auto &contact : AccContacts()) {
++  auto id=ContactId(contact); if(!id.empty()) setString(contact,"ScreenName",id.c_str());
++ }
++ {auto id=AccountId();if(!id.empty()){setString("ScreenName",id.c_str());setString("LoginId",id.c_str());}}
++ if(!m_hRetryAuthMenu) {
++  CMenuItem mi(&g_plugin); mi.name.a=LPGEN("Request authorization again"); mi.position=200200;
++  CMStringA service(FORMAT,"%s/RetryAuth",m_szModuleName); mi.pszService=service.GetBuffer();
++  m_hRetryAuthMenu=Menu_AddContactMenuItem(&mi);
++ }
+ 	EnsureXStatusMenu();
+  bool registered = false;
+  for (const auto &name : g_kicqIconModules)
+@@ -223,19 +235,36 @@
+ /////////////////////////////////////////////////////////////////////////////////////////
+ // contacts
+ 
+-MCONTACT CKicqProto::FindContact(uint32_t uin)
+-{
+-	for (auto &hContact : AccContacts())
+-		if (getDword(hContact, "UIN") == uin)
+-			return hContact;
+-	return 0;
+-}
+-
+-MCONTACT CKicqProto::CreateContact(uint32_t uin, bool bTemporary)
+-{
++std::string CKicqProto::ContactId(MCONTACT contact)
++{
++ const uint32_t uin = getDword(contact, "UIN");
++ if (uin) return std::to_string(uin);
++ return oscarid::key(getMStringA(contact, "ScreenName").c_str());
++}
++std::string CKicqProto::AccountId()
++{
++ const uint32_t uin = getDword("UIN");
++ if (uin) return std::to_string(uin);
++ return oscarid::key(getMStringA("LoginId").c_str());
++}
++MCONTACT CKicqProto::FindContact(const std::string &name)
++{
++ const auto id = oscarid::key(name);
++ if(id.empty()) return 0;
++ const auto uin=oscarid::uin(id);
++ for (auto &hContact : AccContacts())
++  if (uin ? getDword(hContact,"UIN")==uin : ContactId(hContact)==id) return hContact;
++ return 0;
++}
++
++MCONTACT CKicqProto::CreateContact(const std::string &name, bool bTemporary)
++{
++ const auto id = oscarid::key(name);
++ if(id.empty()) return 0;
++ const auto uin = oscarid::uin(id);
+ 	static volatile LONG traceCount = 0;
+ 	LONG sequence = InterlockedIncrement(&traceCount);
+-	MCONTACT hContact = FindContact(uin);
++	MCONTACT hContact = FindContact(id);
+ 	bool trace = sequence <= 12 || (sequence % 25) == 0;
+ 	if (trace) KicqDiagTrace("CreateContact ENTER");
+ 	if (hContact) {
+@@ -252,24 +281,26 @@
+     bool bound = boundProto && mir_strcmp(boundProto, m_szModuleName) == 0;
+     if (!bound) KicqDiagTrace("ERROR CreateContact ACCOUNT BINDING MISMATCH");
+     else if (trace) KicqDiagTrace("CreateContact ACCOUNT BINDING OK");
+-	setDword(hContact, "UIN", uin);
++	if(uin) setDword(hContact, "UIN", uin);
++ setString(hContact, "ScreenName", id.c_str());
++ if(!uin) setWString(hContact, "Nick", _A2T(id.c_str()).get());
+ 	setWord(hContact, "Status", ID_STATUS_OFFLINE);
+ 	if (trace) KicqDiagTrace("CreateContact EXIT (UIN/Status stored)");
+ 	return hContact;
+ }
+ 
+-KicqUser* CKicqProto::FindUser(uint32_t uin)
+-{
+-	KicqUser tmp(uin, 0);
++KicqUser* CKicqProto::FindUser(const std::string &name)
++{
++	KicqUser tmp(oscarid::key(name), 0);
+ 	return m_arUsers.find(&tmp);
+ }
+ 
+-KicqUser* CKicqProto::AddUser(uint32_t uin, MCONTACT hContact)
+-{
+-	if (auto *pUser = FindUser(uin))
++KicqUser* CKicqProto::AddUser(const std::string &name, MCONTACT hContact)
++{
++	if (auto *pUser = FindUser(name))
+ 		return pUser;
+ 
+-	auto *pUser = new KicqUser(uin, hContact);
++	auto *pUser = new KicqUser(oscarid::key(name), hContact);
+ 	m_arUsers.insert(pUser);
+ 	return pUser;
+ }
+@@ -400,7 +431,7 @@
+ 	if (IsStatusConnecting(m_iStatus))
+ 		return 0;
+ 
+-	if (getDword("UIN") == 0 || getMStringA("Password").IsEmpty()) {
++	if (AccountId().empty() || getMStringA("Password").IsEmpty()) {
+ 		ProtoBroadcastAck(0, ACKTYPE_LOGIN, ACKRESULT_FAILED, nullptr, LOGINERR_BADUSERID);
+ 		return 0;
+ 	}
+@@ -449,7 +480,7 @@
+ {
+ 	switch (type) {
+ 	case PFLAGNUM_1:
+-		return PF1_FILE | PF1_IM | PF1_SERVERCLIST | PF1_AUTHREQ | PF1_BASICSEARCH | PF1_ADDSEARCHRES | PF1_MODEMSGRECV | PF1_MODEMSGSEND | PF1_NUMERICUSERID;
++		return PF1_FILE | PF1_IM | PF1_SERVERCLIST | PF1_AUTHREQ | PF1_BASICSEARCH | PF1_ADDSEARCHRES | PF1_MODEMSGRECV | PF1_MODEMSGSEND;
+ 
+ 	case PFLAGNUM_2:
+ 		return PF2_ONLINE | PF2_SHORTAWAY | PF2_LONGAWAY | PF2_LIGHTDND | PF2_HEAVYDND | PF2_FREECHAT | PF2_INVISIBLE;
+@@ -461,7 +492,7 @@
+ 		return PF4_SUPPORTTYPING | PF4_IMSENDOFFLINE | PF4_AVATARS;
+ 
+ 	case PFLAG_UNIQUEIDTEXT:
+-		return (INT_PTR)TranslateT("UIN");
++		return (INT_PTR)TranslateT("UIN / Screen Name");
+ 
+ 	case PFLAG_MAXLENOFMESSAGE:
+ 		return 2048;
+@@ -474,9 +505,10 @@
+ 
+ int CKicqProto::SendMsg(MCONTACT hContact, MEVENT, const char *pszSrc)
+ {
+-	uint32_t uin = getDword(hContact, "UIN");
++	const auto peer = ContactId(hContact);
++ uint32_t uin = oscarid::uin(peer);
+ 	int seq = InterlockedIncrement((long *)&m_msgSeq);
+-	if (!m_bOnline || uin == 0) {
++	if (!m_bOnline || peer.empty()) {
+ 		ProtoBroadcastAsync(hContact, ACKTYPE_MESSAGE, ACKRESULT_FAILED, (HANDLE)seq, (LPARAM)TranslateT("You are offline"));
+ 		return seq;
+ 	}
+@@ -484,8 +516,7 @@
+ 	CMStringW text(Utf2T(pszSrc).get());
+ 	text.Replace(L"\n", L"\r\n");
+ 
+-	char szUin[20];
+-	_itoa(uin, szUin, 10);
++	const char *szUin = peer.c_str();
+ 
+ 	bytes_t cookie(8, 0);
+ 	uint64_t id = GetTickCount() ^ (uint64_t(rand()) << 32);
+@@ -495,7 +526,7 @@
+ 	bool bRelay = false, bUtf8 = false, bOnline = false;
+ 	{
+ 		mir_cslock lck(m_csRoster);
+-		if (auto *pUser = FindUser(uin)) {
++		if (auto *pUser = FindUser(peer)) {
+ 			bOnline = pUser->bOnline;
+ 			bUtf8 = pUser->bUtf8;
+ 			bRelay = pUser->ssiId != 0 && pUser->bAuthorized && pUser->bOnline && pUser->bServerRelay;
+@@ -508,12 +539,12 @@
+ 		reqId = m_nextMsgReq++;
+ 		if (m_nextMsgReq > 0x7FFFFFF0)
+ 			m_nextMsgReq = 0x1000;
+-		m_pendingMsgs[reqId] = { uin, seq };
++		m_pendingMsgs[reqId] = { peer, hContact, seq };
+ 	}
+ 
+-	if (bRelay)
++	if (uin && getDword("UIN") && bRelay)
+ 		Send(OscarPackets::messageChannel2(szUin, text, bUtf8, cookie, reqId));
+-	else if (!bOnline) {
++	else if (uin && getDword("UIN") && !bOnline) {
+ 		// kicq.ru's offline store keeps only bytes 0x01-0x7F and stops at the first 0x00:
+ 		// ASCII text survives as charset 0, anything else only as UCS-2 where only characters
+ 		// >= U+0100 get through. Spaces become EN SPACE (U+2002) so that whole Cyrillic
+@@ -538,12 +569,12 @@
+ 
+ int CKicqProto::UserIsTyping(MCONTACT hContact, int type)
+ {
+-	uint32_t uin = getDword(hContact, "UIN");
+-	if (!m_bOnline || uin == 0 || m_iStatus == ID_STATUS_INVISIBLE)
++	const auto peer = ContactId(hContact);
++ uint32_t uin = oscarid::uin(peer);
++	if (!m_bOnline || peer.empty() || m_iStatus == ID_STATUS_INVISIBLE)
+ 		return 0;
+ 
+-	char szUin[20];
+-	_itoa(uin, szUin, 10);
++	const char *szUin = peer.c_str();
+ 	Send(OscarPackets::typingNotify(szUin, type == PROTOTYPE_SELFTYPING_ON ? 2 : 0));
+ 	return 0;
+ }
+@@ -553,9 +584,9 @@
+ 
+ void CKicqProto::SsiAddContact(MCONTACT hContact, int groupId)
+ {
+-	uint32_t uin = getDword(hContact, "UIN");
+-	char szUin[20];
+-	_itoa(uin, szUin, 10);
++	const auto peer = ContactId(hContact);
++ uint32_t uin = oscarid::uin(peer);
++	const char *szUin = peer.c_str();
+ 
+ 	CMStringW wszNick(db_get_wsm(hContact, "CList", "MyHandle"));
+ 	if (wszNick.IsEmpty())
+@@ -563,7 +594,8 @@
+ 	if (wszNick.IsEmpty())
+ 		wszNick = _A2T(szUin).get();
+ 
+-	m_pendAdd.uin = uin;
++	if(peer.empty()) return;
++ m_pendAdd.id = peer;
+ 	m_pendAdd.name = wszNick;
+ 	m_pendAdd.groupId = groupId;
+ 	m_pendAdd.hContact = hContact;
+@@ -579,12 +611,14 @@
+ 
+ MCONTACT CKicqProto::AddToList(int flags, PROTOSEARCHRESULT *psr)
+ {
+-	uint32_t uin = (psr->flags & PSR_UNICODE) ? _wtoi(psr->id.w) : atoi(psr->id.a);
+-	if (uin == 0)
++	if(!psr || ((psr->flags & PSR_UNICODE) ? psr->id.w==nullptr : psr->id.a==nullptr))return 0;
++ const auto peer = oscarid::key((psr->flags & PSR_UNICODE) ? T2Utf(psr->id.w).get() : psr->id.a);
++	if (peer.empty())
+ 		return 0;
+ 
+ 	bool bTemporary = (flags & PALF_TEMPORARY) != 0;
+-	MCONTACT hContact = CreateContact(uin, bTemporary);
++	MCONTACT hContact = CreateContact(peer, bTemporary);
++ if(!hContact) return 0;
+ 	if (psr->nick.w && (psr->flags & PSR_UNICODE))
+ 		setWString(hContact, "Nick", psr->nick.w);
+ 
+@@ -627,7 +661,7 @@
+ 	if (hContact == 0)
+ 		return 0;
+ 
+-	CMStringW wszUin(FORMAT, L"%u", getDword(hContact, "UIN"));
++	CMStringW wszUin(_A2T(ContactId(hContact).c_str()).get());
+ 	PROTOSEARCHRESULT psr = {};
+ 	psr.cbSize = sizeof(psr);
+ 	psr.flags = PSR_UNICODE;
+@@ -640,11 +674,12 @@
+ 	if (!(flags & CDF_DEL_CONTACT) || !m_bOnline)
+ 		return true;
+ 
+-	uint32_t uin = getDword(hContact, "UIN");
++	const auto peer = ContactId(hContact);
++ uint32_t uin = oscarid::uin(peer);
+ 	int groupId = 0, ssiId = 0;
+ 	{
+ 		mir_cslock lck(m_csRoster);
+-		if (auto *pUser = FindUser(uin)) {
++		if (auto *pUser = FindUser(peer)) {
+ 			groupId = pUser->groupId;
+ 			ssiId = pUser->ssiId;
+ 			m_arUsers.remove(pUser);
+@@ -652,8 +687,7 @@
+ 	}
+ 
+ 	if (ssiId != 0) {
+-		char szUin[20];
+-		_itoa(uin, szUin, 10);
++		const char *szUin = peer.c_str();
+ 		m_pendDel.uin = uin;
+ 		Send(OscarPackets::ssiEditStart());
+ 		Send(OscarPackets::deleteContact(szUin, groupId, ssiId));
+@@ -692,16 +726,17 @@
+ 	if (mir_strcmp(Proto_GetBaseAccountName(hContact), m_szModuleName))
+ 		return 0;
+ 
+-	uint32_t uin = getDword(hContact, "UIN");
++	const auto peer = ContactId(hContact);
++ uint32_t uin = oscarid::uin(peer);
+ 	CMStringW wszNick(db_get_wsm(hContact, "CList", "MyHandle"));
+ 	if (wszNick.IsEmpty())
+-		wszNick.Format(L"%u", uin);
++		wszNick = _A2T(peer.c_str()).get();
+ 
+ 	int groupId = 0, ssiId = 0;
+ 	bool bAuthorized = true;
+ 	{
+ 		mir_cslock lck(m_csRoster);
+-		auto *pUser = FindUser(uin);
++		auto *pUser = FindUser(peer);
+ 		if (pUser == nullptr || pUser->ssiId == 0)
+ 			return 0;
+ 		groupId = pUser->groupId;
+@@ -712,9 +747,8 @@
+ 	if (getMStringW(hContact, "SrvNick") == wszNick)
+ 		return 0; // the change came from the server
+ 
+-	char szUin[20];
+-	_itoa(uin, szUin, 10);
+-	m_pendRename.uin = uin;
++	const char *szUin = peer.c_str();
++	m_pendRename.id = peer;
+ 	m_pendRename.name = wszNick;
+ 	Send(OscarPackets::ssiEditStart());
+ 	Send(OscarPackets::renameContact(szUin, wszNick, groupId, ssiId, !bAuthorized));
+@@ -731,11 +765,12 @@
+ 	if (mir_strcmp(Proto_GetBaseAccountName(hContact), m_szModuleName))
+ 		return 0;
+ 
+-	uint32_t uin = getDword(hContact, "UIN");
++	const auto peer = ContactId(hContact);
++ uint32_t uin = oscarid::uin(peer);
+ 	int oldGroup = 0, ssiId = 0, newGroup = 0;
+ 	{
+ 		mir_cslock lck(m_csRoster);
+-		auto *pUser = FindUser(uin);
++		auto *pUser = FindUser(peer);
+ 		if (pUser == nullptr || pUser->ssiId == 0)
+ 			return 0;
+ 
+@@ -750,8 +785,7 @@
+ 	}
+ 
+ 	// OSCAR has no "move": the item is deleted from the old group and added to the new one
+-	char szUin[20];
+-	_itoa(uin, szUin, 10);
++	const char *szUin = peer.c_str();
+ 	m_pendDel.uin = 0;
+ 	Send(OscarPackets::ssiEditStart());
+ 	Send(OscarPackets::deleteContact(szUin, oldGroup, ssiId));
+@@ -770,14 +804,16 @@
+ 
+ int CKicqProto::AuthRequest(MCONTACT hContact, const wchar_t *szMessage)
+ {
+-	uint32_t uin = getDword(hContact, "UIN");
+-	if (!m_bOnline || uin == 0)
++	const auto peer = ContactId(hContact);
++ uint32_t uin = oscarid::uin(peer);
++	if (!m_bOnline || peer.empty())
+ 		return 1;
+ 
+-	char szUin[20];
+-	_itoa(uin, szUin, 10);
++	const char *szUin = peer.c_str();
+ 	Send(OscarPackets::futureAuthGrant(szUin));
+-	Send(OscarPackets::authRequest(szUin, mir_wstrlen(szMessage) ? szMessage : TranslateT("Please authorize me")));
++	Send(OscarPackets::authRequest(szUin, szMessage && mir_wstrlen(szMessage) ? szMessage : TranslateT("Please authorize me")));
++ setByte(hContact,"Auth",1);
++ {mir_cslock lck(m_csRoster);if(auto *pUser=FindUser(peer))pUser->bAuthorized=false;}
+ 	return 0;
+ }
+ 
+@@ -792,26 +828,26 @@
+ int CKicqProto::Authorize(MEVENT hDbEvent)
+ {
+ 	MCONTACT hContact = AuthEventContact(m_szModuleName, hDbEvent);
+-	uint32_t uin = hContact ? getDword(hContact, "UIN") : 0;
+-	if (!m_bOnline || uin == 0)
++	const auto peer = hContact ? ContactId(hContact) : std::string();
++	if (!m_bOnline || peer.empty())
+ 		return 1;
+ 
+-	char szUin[20];
+-	_itoa(uin, szUin, 10);
++	const char *szUin = peer.c_str();
+ 	Send(OscarPackets::authReply(szUin, true));
++ delSetting(hContact,"Grant");
+ 	return 0;
+ }
+ 
+ int CKicqProto::AuthDeny(MEVENT hDbEvent, const wchar_t *)
+ {
+ 	MCONTACT hContact = AuthEventContact(m_szModuleName, hDbEvent);
+-	uint32_t uin = hContact ? getDword(hContact, "UIN") : 0;
+-	if (!m_bOnline || uin == 0)
++	const auto peer = hContact ? ContactId(hContact) : std::string();
++	if (!m_bOnline || peer.empty())
+ 		return 1;
+ 
+-	char szUin[20];
+-	_itoa(uin, szUin, 10);
++	const char *szUin = peer.c_str();
+ 	Send(OscarPackets::authReply(szUin, false));
++ delSetting(hContact,"Grant");
+ 	return 0;
+ }
+ 
+@@ -949,23 +985,36 @@
+ int CKicqProto::GetInfo(MCONTACT hContact, int)
+ {
+ 	uint32_t uin = hContact ? getDword(hContact, "UIN") : getDword("UIN");
+-	if (!m_bOnline || uin == 0)
++	if (!m_bOnline || uin == 0 || !getDword("UIN"))
+ 		return 1;
+ 
+ 	RequestUserInfo(uin, hContact, nullptr);
+ 	return 0;
+ }
+ 
++struct KicqScreenSearch { std::string id; HANDLE handle; };
++void __cdecl CKicqProto::SearchScreenName(void *param)
++{
++ std::unique_ptr<KicqScreenSearch> search(static_cast<KicqScreenSearch*>(param));
++ // Direct add by exact OSCAR name; no claim that the account exists.
++ Sleep(100);
++ CMStringW id(_A2T(search->id.c_str()).get());
++ PROTOSEARCHRESULT psr = {}; psr.cbSize=sizeof(psr); psr.flags=PSR_UNICODE;
++ psr.id.w=id.GetBuffer(); psr.nick.w=id.GetBuffer();
++ ProtoBroadcastAck(0,ACKTYPE_SEARCH,ACKRESULT_DATA,search->handle,(LPARAM)&psr);
++ ProtoBroadcastAck(0,ACKTYPE_SEARCH,ACKRESULT_SUCCESS,search->handle,0);
++}
+ HANDLE CKicqProto::SearchBasic(const wchar_t *id)
+ {
+-	uint32_t uin = _wtoi(id);
+-	if (!m_bOnline || uin == 0)
+-		return nullptr;
+-
+-	static long searchId = 0;
+-	HANDLE hSearch = (HANDLE)(INT_PTR)InterlockedIncrement(&searchId);
+-	RequestUserInfo(uin, 0, hSearch);
+-	return hSearch;
++ if (!m_bOnline || !id) return nullptr;
++ const auto peer=oscarid::key(T2Utf(id).get());
++ if(peer.empty()) return nullptr;
++ const uint32_t uin=oscarid::uin(peer);
++ static long searchId=0;
++ HANDLE hSearch=(HANDLE)(INT_PTR)InterlockedIncrement(&searchId);
++ if(uin && getDword("UIN")) RequestUserInfo(uin,0,hSearch);
++ else ForkThread(&CKicqProto::SearchScreenName,new KicqScreenSearch{peer,hSearch});
++ return hSearch;
+ }
+ 
+ // X-status selector with bilingual names and local title/description editor.
+@@ -2062,3 +2111,16 @@
+  // Accepted locally. The server's SSI result, then BART's upload result decide success.
+  return 0;
+ }
++
++INT_PTR __cdecl CKicqProto::OnRetryAuth(WPARAM w, LPARAM)
++{
++ MCONTACT c=(MCONTACT)w;
++ if(!c || mir_strcmp(Proto_GetBaseAccountName(c),m_szModuleName) || !getByte(c,"Auth",0)) return 1;
++ return AuthRequest(c,TranslateT("Please authorize me"));
++}
++int __cdecl CKicqProto::OnPreBuildContactMenu(WPARAM w, LPARAM)
++{
++ MCONTACT c=(MCONTACT)w;
++ if(m_hRetryAuthMenu) Menu_ShowItem(m_hRetryAuthMenu,c && m_bOnline && !mir_strcmp(Proto_GetBaseAccountName(c),m_szModuleName) && getByte(c,"Auth",0));
++ return 0;
++}
+--- a/windows-xp-x86/0.96.8/KICQ/src/proto.h
++++ b/windows-xp-x86/0.96.8/KICQ/src/proto.h
+@@ -1,3 +1,4 @@
++#include "oscar_identity.h"
+ /*
+ Copyright (C) 2026 Miranda NG team
+ 
+@@ -38,10 +39,11 @@
+ // per-contact state that lives only as long as the connection
+ struct KicqUser
+ {
+-	KicqUser(uint32_t _uin, MCONTACT _hContact) :
+-		uin(_uin), hContact(_hContact)
++	KicqUser(const std::string &id, MCONTACT _hContact) :
++		name(id), uin(oscarid::uin(id)), hContact(_hContact)
+ 	{}
+ 
++	std::string name;
+ 	uint32_t uin;
+ 	MCONTACT hContact;
+ 	int groupId = 0, ssiId = 0; // 0: not on the server-side list
+@@ -52,7 +54,8 @@
+ 
+ struct KicqPendingMsg
+ {
+-	uint32_t uin;
++	std::string name;
++	MCONTACT contact;
+ 	int seq;
+ };
+ 
+@@ -197,8 +200,12 @@
+ 	void HandleYouWereAdded(const bytes_t &data);
+ 	void HandleSsiItem(const bytes_t &data, bool bDeleted);
+ 	void HandleSsiResult(const bytes_t &data, uint32_t reqId);
+-	void DeliverMessage(uint32_t uin, const CMStringW &text, time_t when);
++	void DeliverMessage(const std::string &name, const CMStringW &text, time_t when);
+ 	void CheckTimeouts();
++	void __cdecl SearchScreenName(void *);
++	HGENMENU m_hRetryAuthMenu = nullptr;
++	INT_PTR __cdecl OnRetryAuth(WPARAM, LPARAM);
++	int __cdecl OnPreBuildContactMenu(WPARAM, LPARAM);
+ 
+ 	// roster
+ 	mir_cs m_csRoster;
+@@ -206,20 +213,26 @@
+ 	OBJLIST<KicqGroup> m_arGroups;
+ 	std::set<CMStringW> m_offlineSeen;
+ 
+-	KicqUser* FindUser(uint32_t uin);
+-	KicqUser* AddUser(uint32_t uin, MCONTACT hContact);
++	KicqUser* FindUser(const std::string &name);
++	KicqUser* FindUser(uint32_t uin) { return uin ? FindUser(std::to_string(uin)) : nullptr; }
++	KicqUser* AddUser(const std::string &name, MCONTACT hContact);
+ 	KicqGroup* FindGroup(int id);
+ 	KicqGroup* FindGroup(const wchar_t *name);
+ 	int NewSsiId();
+-	MCONTACT FindContact(uint32_t uin);
+-	MCONTACT CreateContact(uint32_t uin, bool bTemporary);
+-	void ApplyRosterItem(uint32_t uin, int groupId, int ssiId, const OscarTlvList &tlvs, bool bFromLogin);
++	std::string ContactId(MCONTACT contact);
++	std::string AccountId();
++	MCONTACT FindContact(const std::string &name);
++	MCONTACT FindContact(uint32_t uin) { return uin ? FindContact(std::to_string(uin)) : 0; }
++	MCONTACT CreateContact(const std::string &name, bool bTemporary);
++	MCONTACT CreateContact(uint32_t uin, bool temporary) { return uin ? CreateContact(std::to_string(uin), temporary) : 0; }
++	void ApplyRosterItem(const std::string &name, int groupId, int ssiId, const OscarTlvList &tlvs, bool bFromLogin);
+ 	int ResolveGroupFor(MCONTACT hContact);
+ 
+ 	// one SSI edit at a time, like Jasmine: the result names only the request type
+ 	struct PendingSsi
+ 	{
+ 		uint32_t uin = 0;
++		std::string id;
+ 		CMStringW name;
+ 		int groupId = 0, ssiId = 0;
+ 		MCONTACT hContact = 0;
+--- a/windows-xp-x86/0.96.8/KICQ/src/server.cpp
++++ b/windows-xp-x86/0.96.8/KICQ/src/server.cpp
+@@ -122,10 +122,11 @@
+ 	KicqXpTrace("ServerThread begin");
+ 	m_iLoginError = 0;
+ 	m_cookie.clear();
+-	m_szUin.Format("%u", getDword("UIN"));
++	m_szUin = AccountId().c_str();
+ 	{
+ 		mir_cslock lck(m_csRoster);
+ 		m_arUsers.destroy();
++  m_pendAdd.id.clear();m_pendRename.id.clear();
+ 		m_arGroups.destroy();
+ 		m_offlineSeen.clear();
+ 	}
+@@ -383,7 +384,7 @@
+ 		if (bLogin) {
+ 			debugLogA("login server hello, sending XOR login");
+ 			ptrA szPassword(getStringA("Password"));
+-			Send(1, OscarPackets::xorLogin(m_szUin, szPassword ? szPassword.get() : "", getByte("ClientIdPreset", 0)));
++			Send(1, OscarPackets::xorLogin(m_szUin, szPassword ? szPassword.get() : "", getByte("ClientIdPreset", 0) ? getByte("ClientIdPreset", 0) : (getDword("UIN") ? 0 : 10)));
+ 		}
+ 		else {
+ 			debugLogA("BOS hello, sending cookie");
+@@ -583,7 +584,7 @@
+ // roster
+ 
+ // mirrors one server-side contact into the contact list
+-void CKicqProto::ApplyRosterItem(uint32_t uin, int groupId, int ssiId, const OscarTlvList &tlvs, bool bFromLogin)
++void CKicqProto::ApplyRosterItem(const std::string &name, int groupId, int ssiId, const OscarTlvList &tlvs, bool bFromLogin)
+ {
+ 	static volatile LONG rosterCount = 0;
+     LONG seq = InterlockedIncrement(&rosterCount);
+@@ -599,10 +600,11 @@
+ 			wszGroup = pGroup->name;
+ 	}
+ 
+-	MCONTACT hContact = FindContact(uin);
++	MCONTACT hContact = FindContact(name);
+ 	bool bNew = (hContact == 0);
+ 	if (bNew)
+-        hContact = CreateContact(uin, bTemporary);
++        hContact = CreateContact(name, bTemporary);
++ if(!hContact) return;
+     if (!hContact) {
+         KicqDiagTrace("ERROR ApplyRosterItem contact handle is NULL");
+         return;
+@@ -623,7 +625,7 @@
+ 	bool bAuthorized = !tlvs.has(0x66);
+ 	{
+ 		mir_cslock lck(m_csRoster);
+-		auto *pUser = AddUser(uin, hContact);
++		auto *pUser = AddUser(name, hContact);
+ 		pUser->hContact = hContact;
+ 		pUser->groupId = groupId;
+ 		pUser->ssiId = bTemporary ? 0 : ssiId;
+@@ -733,7 +735,7 @@
+                         GetFileAttributesW(oldPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+                         delSetting("BartOwnAvatarPath");
+                         ReportSelfAvatarChanged();
+-                        QueueBartAvatar(uint32_t(atoi(m_szUin)), 1, hash);
++                        QueueBartAvatar(getDword("UIN"), 1, hash);
+                     }
+                 }
+             }
+@@ -756,9 +758,9 @@
+ 	size_t xpRosterIndex = 0;
+ 	for (auto &it : contacts) {
+ 		if ((xpRosterIndex++ % 25) == 0) KicqXpTrace("HandleRoster contacts batch begin");
+-		uint32_t uin = strtoul(it.name, nullptr, 10);
+-		if (uin)
+-			ApplyRosterItem(uin, it.groupId, it.itemId, OscarTlvList(it.extra), true);
++		const auto name = oscarid::key(it.name.c_str());
++		if (!name.empty())
++			ApplyRosterItem(name, it.groupId, it.itemId, OscarTlvList(it.extra), true);
+ 	}
+ 
+ 	KicqXpTrace("HandleRoster contacts applied");
+@@ -778,7 +780,7 @@
+ 		m_iStatus = ID_STATUS_ONLINE;
+ 
+ 	auto *pVer = &pluginInfoEx.version;
+-	Send(OscarPackets::setUserInfo(HIBYTE(HIWORD(*pVer)), LOBYTE(HIWORD(*pVer)), HIBYTE(LOWORD(*pVer)), nullptr, getByte("ClientIdPreset", 0)));
++	Send(OscarPackets::setUserInfo(HIBYTE(HIWORD(*pVer)), LOBYTE(HIWORD(*pVer)), HIBYTE(LOWORD(*pVer)), nullptr, getByte("ClientIdPreset", 0) ? getByte("ClientIdPreset", 0) : (getDword("UIN") ? 0 : 10)));
+ 	Send(OscarPackets::setIcbmParams());
+ 	// Subscribe to presence for SSI contacts. The server sends 03/0B and
+ 	// 03/0C updates to clients registered via BuddyAddBuddies (03/04).
+@@ -786,19 +788,18 @@
+ 	// Snapshot UINs under the roster lock, but never perform blocking
+ 	// Netlib_Send while that lock is held. On Windows XP, synchronous
+ 	// sends can pause roster/UI updates for the socket timeout period.
+-	std::vector<uint32_t> buddyUins;
++	std::vector<std::string> buddyUins;
+ 	{
+ 		mir_cslock lck(m_csRoster);
+ 		for (auto &it : m_arUsers)
+-			if (it->uin)
+-				buddyUins.push_back(it->uin);
++			if (!it->name.empty())
++				buddyUins.push_back(it->name);
+ 	}
+ 	{
+ 		OscarWriter buddies;
+ 		int count = 0;
+-		for (uint32_t buddyUin : buddyUins) {
+-			CMStringA uin;
+-			uin.Format("%u", buddyUin);
++		for (const auto &buddyUin : buddyUins) {
++			CMStringA uin(buddyUin.c_str());
+ 			if (buddies.size() + uin.GetLength() + 1 > 3500 && count) {
+ 				Send(OscarSnac(3, 4, 0, buddies.data()));
+ 				buddies = OscarWriter();
+@@ -818,7 +819,7 @@
+ 	// Send only a 4-byte status TLV. The legacy DC-info/away-text
+ 	// extensions are not needed for Open OSCAR Server presence.
+ 	Send(OscarPackets::setStatus(MirandaToIcqStatus(m_iStatus), 256));
+-	Send(OscarPackets::offlineMsgsRequest(atoi(m_szUin), m_seq));
++	if(getDword("UIN")) Send(OscarPackets::offlineMsgsRequest(atoi(m_szUin), m_seq));
+ 
+ 	m_bOnline = true;
+ 	if (getByte("XStatusId", 0)) SendXStatus();
+@@ -857,7 +858,7 @@
+                     path.IsEmpty() || GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) {
+                     delSetting("BartOwnAvatarPath");
+                     ReportSelfAvatarChanged();
+-                    QueueBartAvatar(uint32_t(atoi(m_szUin)), 1, hash);
++                    QueueBartAvatar(getDword("UIN"), 1, hash);
+                 }
+             }
+         }
+@@ -879,19 +880,19 @@
+ 		return;
+ 	}
+ 
+-	uint32_t uin = strtoul(rawName.c_str(), nullptr, 10);
+-	if (type != 0 || uin == 0)
++	const auto name = oscarid::key(rawName);
++	if (type != 0 || name.empty())
+ 		return;
+ 
+ 	if (bDeleted) {
+ 		mir_cslock lck(m_csRoster);
+-		if (auto *pUser = FindUser(uin))
++		if (auto *pUser = FindUser(name))
+ 			if (pUser->ssiId == itemId)
+ 				pUser->ssiId = pUser->groupId = 0;
+ 		return;
+ 	}
+ 
+-	ApplyRosterItem(uin, groupId, itemId, tlvs, false);
++	ApplyRosterItem(name, groupId, itemId, tlvs, false);
+ }
+ 
+ void CKicqProto::HandleSsiResult(const bytes_t &data, uint32_t reqId)
+@@ -902,20 +903,21 @@
+ 
+ 	switch (reqId) {
+ 	case REQ_ADD_CONTACT:
+-		if (m_pendAdd.uin == 0)
++		if (m_pendAdd.id.empty())
+ 			break;
+ 
+ 		if (result == 0 || result == 0x0E) {
+-			char szUin[20];
+-			_itoa(m_pendAdd.uin, szUin, 10);
++			const char *szUin = m_pendAdd.id.c_str();
+ 			{
+ 				mir_cslock lck(m_csRoster);
+-				auto *pUser = AddUser(m_pendAdd.uin, m_pendAdd.hContact);
++				auto *pUser = AddUser(m_pendAdd.id, m_pendAdd.hContact);
+ 				pUser->groupId = m_pendAdd.groupId;
+ 				pUser->ssiId = m_pendAdd.ssiId;
+ 				pUser->bAuthorized = (result == 0);
+ 			}
+ 			setWString(m_pendAdd.hContact, "SrvNick", m_pendAdd.name);
++ if(result==0)delSetting(m_pendAdd.hContact,"Auth");
++ if(!oscarid::uin(m_pendAdd.id)){OscarWriter buddy;buddy.ascii8(szUin);Send(OscarSnac(3,4,0,buddy.data()));}
+ 
+ 			if (result == 0x0E) {
+ 				// the contact requires authorization: add it flagged, then ask
+@@ -926,11 +928,11 @@
+ 				Send(OscarPackets::futureAuthGrant(szUin));
+ 				Send(OscarPackets::authRequest(szUin, TranslateT("Please authorize me")));
+ 			}
+-			m_pendAdd.uin = 0;
++			m_pendAdd.id.clear();
+ 		}
+ 		else {
+-			debugLogA("adding %u failed, code %d", m_pendAdd.uin, result);
+-			m_pendAdd.uin = 0;
++			debugLogA("adding %s failed, code %d", m_pendAdd.id.c_str(), result);
++			m_pendAdd.id.clear();
+ 		}
+ 		break;
+ 
+@@ -939,10 +941,10 @@
+ 		break;
+ 
+ 	case REQ_RENAME:
+-		if (result == 0 && m_pendRename.uin)
+-			if (MCONTACT hContact = FindContact(m_pendRename.uin))
++		if (result == 0 && !m_pendRename.id.empty())
++			if (MCONTACT hContact = FindContact(m_pendRename.id))
+ 				setWString(hContact, "SrvNick", m_pendRename.name);
+-		m_pendRename.uin = 0;
++		m_pendRename.id.clear();
+ 		break;
+ 
+ 	case REQ_ADD_GROUP:
+@@ -1091,11 +1093,16 @@
+ void CKicqProto::HandleUserOnline(const bytes_t &data)
+ {
+ 	OscarReader r(data);
+-	uint32_t uin = strtoul(r.ascii8().c_str(), nullptr, 10);
++	const auto name = oscarid::key(r.ascii8());
++ if(name.empty()) return;
++ uint32_t uin = oscarid::uin(name);
+ 	r.skip(2); // warning level
+ 	r.skip(2); // TLV count
+ 	OscarTlvList tlvs(r);
+-	if (const auto *bartId = tlvs.find(0x1D)) ObserveBartPresence(uin, bartId->data);
++ if(!uin){MCONTACT c=0;{mir_cslock lock(m_csRoster);if(auto *u=FindUser(name)){u->bOnline=true;c=u->hContact;}}
++  if(c){const auto *flags=tlvs.find(1);setWord(c,"Status",flags && (flags->u16()&0x20)?ID_STATUS_AWAY:ID_STATUS_ONLINE);}return;}
++
++	if (const auto *bartId = tlvs.find(0x1D)) if(uin) ObserveBartPresence(uin, bartId->data);
+ 
+     // Only trace changes for the target Jimm Multi UIN. A presence refresh can
+     // repeat hundreds of times; logging each repeat hid the relevant packets.
+@@ -1140,7 +1147,7 @@
+ 	bool xstatusChanged = false;
+ 	{
+ 		mir_cslock lck(m_csRoster);
+-		auto *pUser = FindUser(uin);
++		auto *pUser = FindUser(name);
+ 		if (pUser == nullptr)
+ 			return;
+ 
+@@ -1421,7 +1428,9 @@
+ void CKicqProto::HandleUserOffline(const bytes_t &data)
+ {
+ 	OscarReader r(data);
+-	uint32_t uin = strtoul(r.ascii8().c_str(), nullptr, 10);
++	const auto name = oscarid::key(r.ascii8());
++ if(name.empty()) return;
++ uint32_t uin = oscarid::uin(name);
+ 
+     {
+         char line[96];
+@@ -1432,7 +1441,7 @@
+ 	MCONTACT hContact;
+ 	{
+ 		mir_cslock lck(m_csRoster);
+-		auto *pUser = FindUser(uin);
++		auto *pUser = FindUser(name);
+ 		if (pUser == nullptr)
+ 			return;
+ 		pUser->bOnline = false;
+@@ -1454,12 +1463,13 @@
+ /////////////////////////////////////////////////////////////////////////////////////////
+ // messages
+ 
+-void CKicqProto::DeliverMessage(uint32_t uin, const CMStringW &text, time_t when)
++void CKicqProto::DeliverMessage(const std::string &name, const CMStringW &text, time_t when)
+ {
+     KicqDiagTrace("DeliverMessage ENTER (content omitted)");
+-	MCONTACT hContact = FindContact(uin);
++	MCONTACT hContact = FindContact(name);
+ 	if (hContact == 0)
+-        hContact = CreateContact(uin, true);
++        hContact = CreateContact(name, true);
++ if(!hContact) return;
+     if (!hContact) {
+         KicqDiagTrace("ERROR DeliverMessage no contact handle");
+         return;
+@@ -1467,7 +1477,7 @@
+     KicqDiagTrace("DeliverMessage contact handle OK");
+ 	{
+ 		mir_cslock lck(m_csRoster);
+-		AddUser(uin, hContact);
++		AddUser(name, hContact);
+ 	}
+ 
+ 	CallService(MS_PROTO_CONTACTISTYPING, hContact, PROTOTYPE_CONTACTTYPING_OFF);
+@@ -1493,11 +1503,9 @@
+ 	OscarTlvList info(r, infoCount);     // sender's presence TLVs
+ 	OscarTlvList msgTlvs(r);
+ 
+-	uint32_t uin = strtoul(sender.c_str(), nullptr, 10);
+-	if (uin == 0) {
+-        KicqDiagTrace("HandleIncomingMessage invalid sender id");
+-        return;
+-    }
++	const auto name = oscarid::key(sender);
++ if(name.empty()) return;
++ uint32_t uin = oscarid::uin(name);
+     {
+         char line[96];
+         mir_snprintf(line, "HandleIncomingMessage channel=%d bytes=%u", channel, (unsigned)data.size());
+@@ -1532,6 +1540,7 @@
+ 		}
+ 	}
+ 	else if (channel == 2) {
++        if(!uin) return; // legacy ICQ relay/OFT2 is UIN-only
+ 		auto *t5 = msgTlvs.find(5);
+ 		if (!t5) {
+ 			debugLogA("ARS RX DIAG4: channel-2 ICBM received WITHOUT TLV(5); sender=%u", (unsigned)uin);
+@@ -1599,7 +1608,7 @@
+       }
+      }
+     }
+-    const bool ownSenderUin = (uin == strtoul(m_szUin.c_str(), nullptr, 10));
++    const bool ownSenderUin = (uin == oscarid::uin(m_szUin.c_str()));
+     if (ownSenderUin || ourOutgoingCookie) {
+      debugLogA("OFT2 RX: discarded outgoing offer reflected by server; sender=%u own=%s cookieMatch=%d",
+        (unsigned)uin, m_szUin.c_str(), (int)ourOutgoingCookie);
+@@ -1719,7 +1728,7 @@
+     KicqDiagTrace("HandleIncomingMessage decoded plain text (content omitted)");
+ 	if (!bOffline)
+ 		Send(OscarPackets::messageAck(cookie, sender.c_str()));
+-	DeliverMessage(uin, text, when);
++	DeliverMessage(name, text, when);
+ }
+ 
+ void CKicqProto::HandleOfflineMessage(const bytes_t &data)
+@@ -1762,10 +1771,11 @@
+ 			tmMsg.tm_isdst = -1;
+ 			when = mktime(&tmMsg);
+ 		}
+-		DeliverMessage(uin, text, when);
++		if(uin) DeliverMessage(std::to_string(uin), text, when);
+ 	}
+ 	else if (type == 0x4200) {
+-		Send(OscarPackets::deleteOfflineMsgs(atoi(m_szUin), m_seq));
++		if(!getDword("UIN"))return;
++  Send(OscarPackets::deleteOfflineMsgs(atoi(m_szUin), m_seq));
+ 		Send(OscarPackets::anotherOfflineMsgsRequest());
+ 	}
+ }
+@@ -1823,7 +1833,9 @@
+ 	OscarReader r(data);
+ 	r.skip(8);                              // cookie
+ 	r.u16();                                // channel
+-	uint32_t uin = strtoul(r.ascii8().c_str(), nullptr, 10);
++	const auto name = oscarid::key(r.ascii8());
++ if(name.empty()) return;
++ uint32_t uin = oscarid::uin(name);
+ 
+ 	// A channel-2 message ACK may carry an Xtraz AwayStat response.
+  // Never turn it into an ordinary chat message or acknowledge a pending chat.
+@@ -1852,7 +1864,7 @@
+   const bytes_t title = KicqXmlField(xml, "title");
+   const bytes_t desc = KicqXmlField(xml, "desc");
+   if ((!title.empty() || !desc.empty()) && uin != 0) {
+-   if (MCONTACT hContact = FindContact(uin)) {
++   if (MCONTACT hContact = FindContact(name)) {
+     if (getByte(hContact, "XStatusLive", 0)) {
+      setWString(hContact, "XStatusName", OscarText::fromUtf8(KicqUnescapeXml(title)));
+      setWString(hContact, "XStatusMsg", OscarText::fromUtf8(KicqUnescapeXml(desc)));
+@@ -1928,7 +1940,7 @@
+ 	{
+ 		mir_cslock lck(m_csPending);
+ 		for (auto it = m_pendingMsgs.begin(); it != m_pendingMsgs.end(); ++it) {
+-			if (it->second.uin == uin) {
++			if (it->second.name == name) {
+ 				seq = it->second.seq;
+ 				m_pendingMsgs.erase(it);
+ 				break;
+@@ -1937,7 +1949,7 @@
+ 	}
+ 
+ 	if (seq)
+-		if (MCONTACT hContact = FindContact(uin))
++		if (MCONTACT hContact = FindContact(name))
+ 			ProtoBroadcastAck(hContact, ACKTYPE_MESSAGE, ACKRESULT_SUCCESS, (HANDLE)seq, 0);
+ }
+ 
+@@ -1982,8 +1994,8 @@
+ 		m_pendingMsgs.erase(it);
+ 	}
+ 
+-	debugLogA("message to %u failed, error %d", msg.uin, code);
+-	if (MCONTACT hContact = FindContact(msg.uin)) {
++	debugLogA("message to %s failed, error %d", msg.name.c_str(), code);
++	if (MCONTACT hContact = FindContact(msg.name)) {
+ 		CMStringW wszError(FORMAT, TranslateT("The server refused the message (error %d)"), code);
+ 		ProtoBroadcastAck(hContact, ACKTYPE_MESSAGE, ACKRESULT_FAILED, (HANDLE)msg.seq, (LPARAM)wszError.c_str());
+ 	}
+@@ -1993,10 +2005,12 @@
+ {
+ 	OscarReader r(data);
+ 	r.skip(10);
+-	uint32_t uin = strtoul(r.ascii8().c_str(), nullptr, 10);
++	const auto name = oscarid::key(r.ascii8());
++ if(name.empty()) return;
++ uint32_t uin = oscarid::uin(name);
+ 	int type = r.u16();
+ 
+-	if (MCONTACT hContact = FindContact(uin))
++	if (MCONTACT hContact = FindContact(name))
+ 		CallService(MS_PROTO_CONTACTISTYPING, hContact, type == 2 ? PROTOTYPE_CONTACTTYPING_INFINITE : PROTOTYPE_CONTACTTYPING_OFF);
+ }
+ 
+@@ -2138,58 +2152,67 @@
+ void CKicqProto::HandleAuthRequest(const bytes_t &data)
+ {
+ 	OscarReader r(data);
+-	uint32_t uin = strtoul(r.ascii8().c_str(), nullptr, 10);
++	const auto name = oscarid::key(r.ascii8());
++ if(name.empty()) return;
++ uint32_t uin = oscarid::uin(name);
+ 	CMStringW reason(OscarText::textOrCp1251(r.bytes(r.u16())));
+-	if (uin == 0)
+-		return;
+-
+-	MCONTACT hContact = FindContact(uin);
++	
++
++	MCONTACT hContact = FindContact(name);
+ 	if (hContact == 0)
+-		hContact = CreateContact(uin, true);
+-
+-	char szUin[20];
+-	_itoa(uin, szUin, 10);
++		hContact = CreateContact(name, true);
++
++	if(!hContact) return;
++ setByte(hContact,"Grant",1);
++ const char *szUin = name.c_str();
+ 	DB::AUTH_BLOB blob(hContact, T2Utf(getMStringW(hContact, "Nick")), nullptr, nullptr, szUin, T2Utf(reason));
+ 	blob.set_uin(uin);
+ 
+ 	DB::EventInfo dbei;
+ 	dbei.iTimestamp = time(0);
++ dbei.szModule=m_szModuleName;
++ dbei.flags=DBEF_UTF;
++ dbei.eventType=EVENTTYPE_AUTHREQUEST;
+ 	dbei.cbBlob = blob.size();
+ 	dbei.pBlob = blob;
+-	ProtoChainRecv(hContact, PSR_AUTH, 0, (LPARAM)&dbei);
++	Proto_AuthRecv(m_szModuleName,dbei);
+ }
+ 
+ void CKicqProto::HandleAuthReply(const bytes_t &data)
+ {
+ 	OscarReader r(data);
+-	uint32_t uin = strtoul(r.ascii8().c_str(), nullptr, 10);
++	const auto name = oscarid::key(r.ascii8());
++ if(name.empty()) return;
++ uint32_t uin = oscarid::uin(name);
+ 	bool bGranted = r.u8() == 1;
+ 	debugLogA("authorization %s by %u", bGranted ? "granted" : "denied", uin);
+ 
+-	MCONTACT hContact = FindContact(uin);
+-	if (hContact == 0 || !bGranted)
++	MCONTACT hContact = FindContact(name);
++	if(hContact && !bGranted) setByte(hContact,"Auth",1);
++ if (hContact == 0 || !bGranted)
+ 		return;
+ 
+ 	delSetting(hContact, "Auth");
+ 
+ 	mir_cslock lck(m_csRoster);
+-	if (auto *pUser = FindUser(uin))
++	if (auto *pUser = FindUser(name))
+ 		pUser->bAuthorized = true;
+ }
+ 
+ void CKicqProto::HandleYouWereAdded(const bytes_t &data)
+ {
+ 	OscarReader r(data);
+-	uint32_t uin = strtoul(r.ascii8().c_str(), nullptr, 10);
+-	if (uin == 0)
+-		return;
+-
+-	MCONTACT hContact = FindContact(uin);
++	const auto name = oscarid::key(r.ascii8());
++ if(name.empty()) return;
++ uint32_t uin = oscarid::uin(name);
++	
++
++	MCONTACT hContact = FindContact(name);
+ 	if (hContact == 0)
+-		hContact = CreateContact(uin, true);
+-
+-	char szUin[20];
+-	_itoa(uin, szUin, 10);
++		hContact = CreateContact(name, true);
++
++	if(!hContact) return;
++ const char *szUin = name.c_str();
+ 	DB::AUTH_BLOB blob(hContact, T2Utf(getMStringW(hContact, "Nick")), nullptr, nullptr, szUin, nullptr);
+ 	blob.set_uin(uin);
+ 

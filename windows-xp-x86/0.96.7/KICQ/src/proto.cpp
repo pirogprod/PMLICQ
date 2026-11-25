@@ -73,19 +73,23 @@ static int KicqExtraApply(WPARAM wParam, LPARAM)
  if (!contact) return 0;
  const char *module = Proto_GetBaseAccountName(contact);
  if (!KicqIsOurAccount(module)) return 0;
- // Do not show a cached X-status for an offline contact.
- const WORD presence = db_get_w(contact, module, "Status", ID_STATUS_OFFLINE);
- if (presence == ID_STATUS_OFFLINE) {
-  ExtraIcon_SetIcon(g_kicqExtraIcon, contact, INVALID_HANDLE_VALUE);
-  return 0;
+ // Local self-contact must read the account X-status, not remote XStatusLive.
+ const uint32_t ownUin = db_get_dw(0, module, "UIN", 0);
+ const uint32_t contactUin = db_get_dw(contact, module, "UIN", 0);
+ const bool isSelf = ownUin != 0 && ownUin == contactUin;
+ int id = 0;
+ if (isSelf)
+  id = db_get_b(0, module, "XStatusId", 0);
+ else {
+  const WORD presence = db_get_w(contact, module, "Status", ID_STATUS_OFFLINE);
+  const bool confirmed = db_get_b(contact, module, "XStatusLive", 0) != 0;
+  if (presence != ID_STATUS_OFFLINE && confirmed)
+   id = db_get_b(contact, module, "XStatusId", 0);
  }
-
- // Only display an X-status explicitly confirmed by the current OSCAR session.
- // A stale XStatusId alone must never allocate an extra-icon slot.
- const int confirmed = db_get_b(contact, module, "XStatusLive", 0);
- int id = confirmed ? db_get_b(contact, module, "XStatusId", 0) : 0;
  if (id >= 1 && id <= 35) {
-  if (g_kicqExtraImages[id - 1] && g_kicqExtraImages[id - 1] != INVALID_HANDLE_VALUE) ExtraIcon_SetIcon(g_kicqExtraIcon, contact, g_kicqExtraImages[id - 1]);
+  // ExtraIcon_AddIcon may return image index 0 (the first registered icon).
+  // Index 0 is valid; only INVALID_HANDLE_VALUE means no image.
+  if (g_kicqExtraImages[id - 1] != INVALID_HANDLE_VALUE) ExtraIcon_SetIcon(g_kicqExtraIcon, contact, g_kicqExtraImages[id - 1]);
   else ExtraIcon_SetIcon(g_kicqExtraIcon, contact, INVALID_HANDLE_VALUE);
  }
  else ExtraIcon_SetIcon(g_kicqExtraIcon, contact, INVALID_HANDLE_VALUE);
@@ -100,9 +104,22 @@ void KicqRefreshSingleXStatus(MCONTACT hContact)
   KicqExtraApply((WPARAM)hContact, 0);
 }
 
+// Only update copies of this account's own UIN; never rebuild all icons.
+static void KicqRefreshOwnXStatus(const char *module)
+{
+ if (!g_kicqExtraIcon || !module) return;
+ const uint32_t ownUin = db_get_dw(0, module, "UIN", 0);
+ if (!ownUin) return;
+ for (MCONTACT h = db_find_first(); h; h = db_find_next(h)) {
+  const char *base = Proto_GetBaseAccountName(h);
+  if (base && !mir_strcmp(base, module) && db_get_dw(h, module, "UIN", 0) == ownUin)
+   KicqRefreshSingleXStatus(h);
+ }
+}
+
 static int CompareUsers(const KicqUser *p1, const KicqUser *p2)
 {
-	return (p1->uin < p2->uin) ? -1 : (p1->uin > p2->uin) ? 1 : 0;
+	return p1->name.compare(p2->name);
 }
 
 CKicqProto::CKicqProto(const char *szModuleName, const wchar_t *wszUserName) :
@@ -126,6 +143,8 @@ CKicqProto::CKicqProto(const char *szModuleName, const wchar_t *wszUserName) :
 
 	HookProtoEvent(ME_OPT_INITIALISE, &CKicqProto::OnOptionsInit);
 	CreateProtoService("/XStatusEditor", &CKicqProto::OnMenuXStatus);
+ CreateProtoService("/RetryAuth", &CKicqProto::OnRetryAuth);
+ HookProtoEvent(ME_CLIST_PREBUILDCONTACTMENU,&CKicqProto::OnPreBuildContactMenu);
 	CreateProtoService(PS_GETAVATARCAPS, &CKicqProto::OnAvatarCaps);
 	CreateProtoService(PS_GETAVATARINFO, &CKicqProto::OnGetAvatarInfo);
 	CreateProtoService(PS_GETMYAVATAR, &CKicqProto::OnGetMyAvatar);
@@ -137,6 +156,7 @@ CKicqProto::CKicqProto(const char *szModuleName, const wchar_t *wszUserName) :
 
 CKicqProto::~CKicqProto()
 {
+ if(m_hRetryAuthMenu) Menu_RemoveItem(m_hRetryAuthMenu);
  StopBart();
  ShutdownOutgoingFiles();
 }
@@ -160,6 +180,15 @@ void CKicqProto::OnModulesLoaded()
 			if (g_kicqExtraIcon) ExtraIcon_SetIcon(g_kicqExtraIcon, h, INVALID_HANDLE_VALUE);
 		}
 	}
+ for (auto &contact : AccContacts()) {
+  auto id=ContactId(contact); if(!id.empty()) setString(contact,"ScreenName",id.c_str());
+ }
+ {auto id=AccountId();if(!id.empty()){setString("ScreenName",id.c_str());setString("LoginId",id.c_str());}}
+ if(!m_hRetryAuthMenu) {
+  CMenuItem mi(&g_plugin); mi.name.a=LPGEN("Request authorization again"); mi.position=200200;
+  CMStringA service(FORMAT,"%s/RetryAuth",m_szModuleName); mi.pszService=service.GetBuffer();
+  m_hRetryAuthMenu=Menu_AddContactMenuItem(&mi);
+ }
 	EnsureXStatusMenu();
  bool registered = false;
  for (const auto &name : g_kicqIconModules)
@@ -206,19 +235,36 @@ void CKicqProto::OnShutdown()
 /////////////////////////////////////////////////////////////////////////////////////////
 // contacts
 
-MCONTACT CKicqProto::FindContact(uint32_t uin)
+std::string CKicqProto::ContactId(MCONTACT contact)
 {
-	for (auto &hContact : AccContacts())
-		if (getDword(hContact, "UIN") == uin)
-			return hContact;
-	return 0;
+ const uint32_t uin = getDword(contact, "UIN");
+ if (uin) return std::to_string(uin);
+ return oscarid::key(getMStringA(contact, "ScreenName").c_str());
+}
+std::string CKicqProto::AccountId()
+{
+ const uint32_t uin = getDword("UIN");
+ if (uin) return std::to_string(uin);
+ return oscarid::key(getMStringA("LoginId").c_str());
+}
+MCONTACT CKicqProto::FindContact(const std::string &name)
+{
+ const auto id = oscarid::key(name);
+ if(id.empty()) return 0;
+ const auto uin=oscarid::uin(id);
+ for (auto &hContact : AccContacts())
+  if (uin ? getDword(hContact,"UIN")==uin : ContactId(hContact)==id) return hContact;
+ return 0;
 }
 
-MCONTACT CKicqProto::CreateContact(uint32_t uin, bool bTemporary)
+MCONTACT CKicqProto::CreateContact(const std::string &name, bool bTemporary)
 {
+ const auto id = oscarid::key(name);
+ if(id.empty()) return 0;
+ const auto uin = oscarid::uin(id);
 	static volatile LONG traceCount = 0;
 	LONG sequence = InterlockedIncrement(&traceCount);
-	MCONTACT hContact = FindContact(uin);
+	MCONTACT hContact = FindContact(id);
 	bool trace = sequence <= 12 || (sequence % 25) == 0;
 	if (trace) KicqDiagTrace("CreateContact ENTER");
 	if (hContact) {
@@ -227,37 +273,46 @@ MCONTACT CKicqProto::CreateContact(uint32_t uin, bool bTemporary)
     }
 
 	KicqDiagTrace("CreateContact BEFORE db_add_contact");
+	// Select the ABI from the SDK; later 0.96.7 builds require two arguments.
+#ifdef DBAC_NOTINLIST
+	hContact = db_add_contact(m_szModuleName, bTemporary ? DBAC_NOTINLIST : 0);
+#else
 	hContact = db_add_contact();
+#endif
 	KicqDiagTrace(hContact ? "CreateContact db_add_contact OK" : "ERROR CreateContact db_add_contact FAILED");
 	if (!hContact)
 		return 0;
+#ifndef DBAC_NOTINLIST
 	KicqDiagTrace("CreateContact BEFORE Proto_AddToContact");
 	Proto_AddToContact(hContact, m_szModuleName);
 	KicqDiagTrace("CreateContact AFTER Proto_AddToContact");
 	if (bTemporary)
 		db_set_b(hContact, "CList", "NotOnList", 1);
+#endif
 	const char *boundProto = Proto_GetBaseAccountName(hContact);
     bool bound = boundProto && mir_strcmp(boundProto, m_szModuleName) == 0;
     if (!bound) KicqDiagTrace("ERROR CreateContact ACCOUNT BINDING MISMATCH");
     else if (trace) KicqDiagTrace("CreateContact ACCOUNT BINDING OK");
-	setDword(hContact, "UIN", uin);
+	if(uin) setDword(hContact, "UIN", uin);
+ setString(hContact, "ScreenName", id.c_str());
+ if(!uin) setWString(hContact, "Nick", _A2T(id.c_str()).get());
 	setWord(hContact, "Status", ID_STATUS_OFFLINE);
 	if (trace) KicqDiagTrace("CreateContact EXIT (UIN/Status stored)");
 	return hContact;
 }
 
-KicqUser* CKicqProto::FindUser(uint32_t uin)
+KicqUser* CKicqProto::FindUser(const std::string &name)
 {
-	KicqUser tmp(uin, 0);
+	KicqUser tmp(oscarid::key(name), 0);
 	return m_arUsers.find(&tmp);
 }
 
-KicqUser* CKicqProto::AddUser(uint32_t uin, MCONTACT hContact)
+KicqUser* CKicqProto::AddUser(const std::string &name, MCONTACT hContact)
 {
-	if (auto *pUser = FindUser(uin))
+	if (auto *pUser = FindUser(name))
 		return pUser;
 
-	auto *pUser = new KicqUser(uin, hContact);
+	auto *pUser = new KicqUser(oscarid::key(name), hContact);
 	m_arUsers.insert(pUser);
 	return pUser;
 }
@@ -388,7 +443,7 @@ int CKicqProto::SetStatus(int iNewStatus)
 	if (IsStatusConnecting(m_iStatus))
 		return 0;
 
-	if (getDword("UIN") == 0 || getMStringA("Password").IsEmpty()) {
+	if (AccountId().empty() || getMStringA("Password").IsEmpty()) {
 		ProtoBroadcastAck(0, ACKTYPE_LOGIN, ACKRESULT_FAILED, nullptr, LOGINERR_BADUSERID);
 		return 0;
 	}
@@ -437,7 +492,7 @@ INT_PTR CKicqProto::GetCaps(int type, MCONTACT)
 {
 	switch (type) {
 	case PFLAGNUM_1:
-		return PF1_FILE | PF1_IM | PF1_SERVERCLIST | PF1_AUTHREQ | PF1_BASICSEARCH | PF1_ADDSEARCHRES | PF1_MODEMSGRECV | PF1_MODEMSGSEND | PF1_NUMERICUSERID;
+		return PF1_FILE | PF1_IM | PF1_SERVERCLIST | PF1_AUTHREQ | PF1_BASICSEARCH | PF1_ADDSEARCHRES | PF1_MODEMSGRECV | PF1_MODEMSGSEND;
 
 	case PFLAGNUM_2:
 		return PF2_ONLINE | PF2_SHORTAWAY | PF2_LONGAWAY | PF2_LIGHTDND | PF2_HEAVYDND | PF2_FREECHAT | PF2_INVISIBLE;
@@ -449,7 +504,7 @@ INT_PTR CKicqProto::GetCaps(int type, MCONTACT)
 		return PF4_SUPPORTTYPING | PF4_IMSENDOFFLINE | PF4_AVATARS;
 
 	case PFLAG_UNIQUEIDTEXT:
-		return (INT_PTR)TranslateT("UIN");
+		return (INT_PTR)TranslateT("UIN / Screen Name");
 
 	case PFLAG_MAXLENOFMESSAGE:
 		return 2048;
@@ -462,9 +517,10 @@ INT_PTR CKicqProto::GetCaps(int type, MCONTACT)
 
 int CKicqProto::SendMsg(MCONTACT hContact, MEVENT, const char *pszSrc)
 {
-	uint32_t uin = getDword(hContact, "UIN");
+	const auto peer = ContactId(hContact);
+ uint32_t uin = oscarid::uin(peer);
 	int seq = InterlockedIncrement((long *)&m_msgSeq);
-	if (!m_bOnline || uin == 0) {
+	if (!m_bOnline || peer.empty()) {
 		ProtoBroadcastAsync(hContact, ACKTYPE_MESSAGE, ACKRESULT_FAILED, (HANDLE)seq, (LPARAM)TranslateT("You are offline"));
 		return seq;
 	}
@@ -472,8 +528,7 @@ int CKicqProto::SendMsg(MCONTACT hContact, MEVENT, const char *pszSrc)
 	CMStringW text(Utf2T(pszSrc).get());
 	text.Replace(L"\n", L"\r\n");
 
-	char szUin[20];
-	_itoa(uin, szUin, 10);
+	const char *szUin = peer.c_str();
 
 	bytes_t cookie(8, 0);
 	uint64_t id = GetTickCount() ^ (uint64_t(rand()) << 32);
@@ -483,7 +538,7 @@ int CKicqProto::SendMsg(MCONTACT hContact, MEVENT, const char *pszSrc)
 	bool bRelay = false, bUtf8 = false, bOnline = false;
 	{
 		mir_cslock lck(m_csRoster);
-		if (auto *pUser = FindUser(uin)) {
+		if (auto *pUser = FindUser(peer)) {
 			bOnline = pUser->bOnline;
 			bUtf8 = pUser->bUtf8;
 			bRelay = pUser->ssiId != 0 && pUser->bAuthorized && pUser->bOnline && pUser->bServerRelay;
@@ -496,12 +551,12 @@ int CKicqProto::SendMsg(MCONTACT hContact, MEVENT, const char *pszSrc)
 		reqId = m_nextMsgReq++;
 		if (m_nextMsgReq > 0x7FFFFFF0)
 			m_nextMsgReq = 0x1000;
-		m_pendingMsgs[reqId] = { uin, seq };
+		m_pendingMsgs[reqId] = { peer, hContact, seq };
 	}
 
-	if (bRelay)
+	if (uin && getDword("UIN") && bRelay)
 		Send(OscarPackets::messageChannel2(szUin, text, bUtf8, cookie, reqId));
-	else if (!bOnline) {
+	else if (uin && getDword("UIN") && !bOnline) {
 		// kicq.ru's offline store keeps only bytes 0x01-0x7F and stops at the first 0x00:
 		// ASCII text survives as charset 0, anything else only as UCS-2 where only characters
 		// >= U+0100 get through. Spaces become EN SPACE (U+2002) so that whole Cyrillic
@@ -526,12 +581,12 @@ int CKicqProto::SendMsg(MCONTACT hContact, MEVENT, const char *pszSrc)
 
 int CKicqProto::UserIsTyping(MCONTACT hContact, int type)
 {
-	uint32_t uin = getDword(hContact, "UIN");
-	if (!m_bOnline || uin == 0 || m_iStatus == ID_STATUS_INVISIBLE)
+	const auto peer = ContactId(hContact);
+ uint32_t uin = oscarid::uin(peer);
+	if (!m_bOnline || peer.empty() || m_iStatus == ID_STATUS_INVISIBLE)
 		return 0;
 
-	char szUin[20];
-	_itoa(uin, szUin, 10);
+	const char *szUin = peer.c_str();
 	Send(OscarPackets::typingNotify(szUin, type == PROTOTYPE_SELFTYPING_ON ? 2 : 0));
 	return 0;
 }
@@ -541,9 +596,9 @@ int CKicqProto::UserIsTyping(MCONTACT hContact, int type)
 
 void CKicqProto::SsiAddContact(MCONTACT hContact, int groupId)
 {
-	uint32_t uin = getDword(hContact, "UIN");
-	char szUin[20];
-	_itoa(uin, szUin, 10);
+	const auto peer = ContactId(hContact);
+ uint32_t uin = oscarid::uin(peer);
+	const char *szUin = peer.c_str();
 
 	CMStringW wszNick(db_get_wsm(hContact, "CList", "MyHandle"));
 	if (wszNick.IsEmpty())
@@ -551,7 +606,8 @@ void CKicqProto::SsiAddContact(MCONTACT hContact, int groupId)
 	if (wszNick.IsEmpty())
 		wszNick = _A2T(szUin).get();
 
-	m_pendAdd.uin = uin;
+	if(peer.empty()) return;
+ m_pendAdd.id = peer;
 	m_pendAdd.name = wszNick;
 	m_pendAdd.groupId = groupId;
 	m_pendAdd.hContact = hContact;
@@ -567,12 +623,14 @@ void CKicqProto::SsiAddContact(MCONTACT hContact, int groupId)
 
 MCONTACT CKicqProto::AddToList(int flags, PROTOSEARCHRESULT *psr)
 {
-	uint32_t uin = (psr->flags & PSR_UNICODE) ? _wtoi(psr->id.w) : atoi(psr->id.a);
-	if (uin == 0)
+	if(!psr || ((psr->flags & PSR_UNICODE) ? psr->id.w==nullptr : psr->id.a==nullptr))return 0;
+ const auto peer = oscarid::key((psr->flags & PSR_UNICODE) ? T2Utf(psr->id.w).get() : psr->id.a);
+	if (peer.empty())
 		return 0;
 
 	bool bTemporary = (flags & PALF_TEMPORARY) != 0;
-	MCONTACT hContact = CreateContact(uin, bTemporary);
+	MCONTACT hContact = CreateContact(peer, bTemporary);
+ if(!hContact) return 0;
 	if (psr->nick.w && (psr->flags & PSR_UNICODE))
 		setWString(hContact, "Nick", psr->nick.w);
 
@@ -600,6 +658,7 @@ MCONTACT CKicqProto::AddToList(int flags, PROTOSEARCHRESULT *psr)
 			}
 		}
 	}
+	if (m_bOnline) ScheduleBartRefresh(peer, true);
 	return hContact;
 }
 
@@ -615,7 +674,7 @@ MCONTACT CKicqProto::AddToListByEvent(int flags, int, MEVENT hDbEvent)
 	if (hContact == 0)
 		return 0;
 
-	CMStringW wszUin(FORMAT, L"%u", getDword(hContact, "UIN"));
+	CMStringW wszUin(_A2T(ContactId(hContact).c_str()).get());
 	PROTOSEARCHRESULT psr = {};
 	psr.cbSize = sizeof(psr);
 	psr.flags = PSR_UNICODE;
@@ -628,11 +687,12 @@ bool CKicqProto::OnContactDeleted(MCONTACT hContact, uint32_t flags)
 	if (!(flags & CDF_DEL_CONTACT) || !m_bOnline)
 		return true;
 
-	uint32_t uin = getDword(hContact, "UIN");
+	const auto peer = ContactId(hContact);
+ uint32_t uin = oscarid::uin(peer);
 	int groupId = 0, ssiId = 0;
 	{
 		mir_cslock lck(m_csRoster);
-		if (auto *pUser = FindUser(uin)) {
+		if (auto *pUser = FindUser(peer)) {
 			groupId = pUser->groupId;
 			ssiId = pUser->ssiId;
 			m_arUsers.remove(pUser);
@@ -640,8 +700,7 @@ bool CKicqProto::OnContactDeleted(MCONTACT hContact, uint32_t flags)
 	}
 
 	if (ssiId != 0) {
-		char szUin[20];
-		_itoa(uin, szUin, 10);
+		const char *szUin = peer.c_str();
 		m_pendDel.uin = uin;
 		Send(OscarPackets::ssiEditStart());
 		Send(OscarPackets::deleteContact(szUin, groupId, ssiId));
@@ -654,6 +713,11 @@ bool CKicqProto::OnContactDeleted(MCONTACT hContact, uint32_t flags)
 int CKicqProto::OnSettingChanged(WPARAM hContact, LPARAM lParam)
 {
 	auto *cws = (DBCONTACTWRITESETTING *)lParam;
+	// The account-level X-status changes even when no buddy presence arrives.
+	if (!hContact && cws && cws->szModule && cws->szSetting &&
+		!mir_strcmp(cws->szModule, m_szModuleName) &&
+		!mir_strcmp(cws->szSetting, "XStatusId"))
+		KicqRefreshOwnXStatus(m_szModuleName);
 	// Presence transitions also invalidate the extra-icon slot. In particular,
 	// a contact can go offline without receiving a USER_OFFLINE SNAC.
 	// Do not rebuild all icons: refresh only this contact on a status change.
@@ -675,16 +739,17 @@ int CKicqProto::OnSettingChanged(WPARAM hContact, LPARAM lParam)
 	if (mir_strcmp(Proto_GetBaseAccountName(hContact), m_szModuleName))
 		return 0;
 
-	uint32_t uin = getDword(hContact, "UIN");
+	const auto peer = ContactId(hContact);
+ uint32_t uin = oscarid::uin(peer);
 	CMStringW wszNick(db_get_wsm(hContact, "CList", "MyHandle"));
 	if (wszNick.IsEmpty())
-		wszNick.Format(L"%u", uin);
+		wszNick = _A2T(peer.c_str()).get();
 
 	int groupId = 0, ssiId = 0;
 	bool bAuthorized = true;
 	{
 		mir_cslock lck(m_csRoster);
-		auto *pUser = FindUser(uin);
+		auto *pUser = FindUser(peer);
 		if (pUser == nullptr || pUser->ssiId == 0)
 			return 0;
 		groupId = pUser->groupId;
@@ -695,9 +760,8 @@ int CKicqProto::OnSettingChanged(WPARAM hContact, LPARAM lParam)
 	if (getMStringW(hContact, "SrvNick") == wszNick)
 		return 0; // the change came from the server
 
-	char szUin[20];
-	_itoa(uin, szUin, 10);
-	m_pendRename.uin = uin;
+	const char *szUin = peer.c_str();
+	m_pendRename.id = peer;
 	m_pendRename.name = wszNick;
 	Send(OscarPackets::ssiEditStart());
 	Send(OscarPackets::renameContact(szUin, wszNick, groupId, ssiId, !bAuthorized));
@@ -714,11 +778,12 @@ int CKicqProto::OnGroupChange(WPARAM hContact, LPARAM lParam)
 	if (mir_strcmp(Proto_GetBaseAccountName(hContact), m_szModuleName))
 		return 0;
 
-	uint32_t uin = getDword(hContact, "UIN");
+	const auto peer = ContactId(hContact);
+ uint32_t uin = oscarid::uin(peer);
 	int oldGroup = 0, ssiId = 0, newGroup = 0;
 	{
 		mir_cslock lck(m_csRoster);
-		auto *pUser = FindUser(uin);
+		auto *pUser = FindUser(peer);
 		if (pUser == nullptr || pUser->ssiId == 0)
 			return 0;
 
@@ -733,8 +798,7 @@ int CKicqProto::OnGroupChange(WPARAM hContact, LPARAM lParam)
 	}
 
 	// OSCAR has no "move": the item is deleted from the old group and added to the new one
-	char szUin[20];
-	_itoa(uin, szUin, 10);
+	const char *szUin = peer.c_str();
 	m_pendDel.uin = 0;
 	Send(OscarPackets::ssiEditStart());
 	Send(OscarPackets::deleteContact(szUin, oldGroup, ssiId));
@@ -753,14 +817,16 @@ int CKicqProto::AuthRecv(MCONTACT, DB::EventInfo &dbei)
 
 int CKicqProto::AuthRequest(MCONTACT hContact, const wchar_t *szMessage)
 {
-	uint32_t uin = getDword(hContact, "UIN");
-	if (!m_bOnline || uin == 0)
+	const auto peer = ContactId(hContact);
+ uint32_t uin = oscarid::uin(peer);
+	if (!m_bOnline || peer.empty())
 		return 1;
 
-	char szUin[20];
-	_itoa(uin, szUin, 10);
+	const char *szUin = peer.c_str();
 	Send(OscarPackets::futureAuthGrant(szUin));
-	Send(OscarPackets::authRequest(szUin, mir_wstrlen(szMessage) ? szMessage : TranslateT("Please authorize me")));
+	Send(OscarPackets::authRequest(szUin, szMessage && mir_wstrlen(szMessage) ? szMessage : TranslateT("Please authorize me")));
+ setByte(hContact,"Auth",1);
+ {mir_cslock lck(m_csRoster);if(auto *pUser=FindUser(peer))pUser->bAuthorized=false;}
 	return 0;
 }
 
@@ -775,26 +841,26 @@ static MCONTACT AuthEventContact(const char *szModule, MEVENT hDbEvent)
 int CKicqProto::Authorize(MEVENT hDbEvent)
 {
 	MCONTACT hContact = AuthEventContact(m_szModuleName, hDbEvent);
-	uint32_t uin = hContact ? getDword(hContact, "UIN") : 0;
-	if (!m_bOnline || uin == 0)
+	const auto peer = hContact ? ContactId(hContact) : std::string();
+	if (!m_bOnline || peer.empty())
 		return 1;
 
-	char szUin[20];
-	_itoa(uin, szUin, 10);
+	const char *szUin = peer.c_str();
 	Send(OscarPackets::authReply(szUin, true));
+ delSetting(hContact,"Grant");
 	return 0;
 }
 
 int CKicqProto::AuthDeny(MEVENT hDbEvent, const wchar_t *)
 {
 	MCONTACT hContact = AuthEventContact(m_szModuleName, hDbEvent);
-	uint32_t uin = hContact ? getDword(hContact, "UIN") : 0;
-	if (!m_bOnline || uin == 0)
+	const auto peer = hContact ? ContactId(hContact) : std::string();
+	if (!m_bOnline || peer.empty())
 		return 1;
 
-	char szUin[20];
-	_itoa(uin, szUin, 10);
+	const char *szUin = peer.c_str();
 	Send(OscarPackets::authReply(szUin, false));
+ delSetting(hContact,"Grant");
 	return 0;
 }
 
@@ -932,23 +998,36 @@ void CKicqProto::SendExtendedProfile(const char *changedKey)
 int CKicqProto::GetInfo(MCONTACT hContact, int)
 {
 	uint32_t uin = hContact ? getDword(hContact, "UIN") : getDword("UIN");
-	if (!m_bOnline || uin == 0)
+	if (!m_bOnline || uin == 0 || !getDword("UIN"))
 		return 1;
 
 	RequestUserInfo(uin, hContact, nullptr);
 	return 0;
 }
 
+struct KicqScreenSearch { std::string id; HANDLE handle; };
+void __cdecl CKicqProto::SearchScreenName(void *param)
+{
+ std::unique_ptr<KicqScreenSearch> search(static_cast<KicqScreenSearch*>(param));
+ // Direct add by exact OSCAR name; no claim that the account exists.
+ Sleep(100);
+ CMStringW id(_A2T(search->id.c_str()).get());
+ PROTOSEARCHRESULT psr = {}; psr.cbSize=sizeof(psr); psr.flags=PSR_UNICODE;
+ psr.id.w=id.GetBuffer(); psr.nick.w=id.GetBuffer();
+ ProtoBroadcastAck(0,ACKTYPE_SEARCH,ACKRESULT_DATA,search->handle,(LPARAM)&psr);
+ ProtoBroadcastAck(0,ACKTYPE_SEARCH,ACKRESULT_SUCCESS,search->handle,0);
+}
 HANDLE CKicqProto::SearchBasic(const wchar_t *id)
 {
-	uint32_t uin = _wtoi(id);
-	if (!m_bOnline || uin == 0)
-		return nullptr;
-
-	static long searchId = 0;
-	HANDLE hSearch = (HANDLE)(INT_PTR)InterlockedIncrement(&searchId);
-	RequestUserInfo(uin, 0, hSearch);
-	return hSearch;
+ if (!m_bOnline || !id) return nullptr;
+ const auto peer=oscarid::key(T2Utf(id).get());
+ if(peer.empty()) return nullptr;
+ const uint32_t uin=oscarid::uin(peer);
+ static long searchId=0;
+ HANDLE hSearch=(HANDLE)(INT_PTR)InterlockedIncrement(&searchId);
+ if(uin && getDword("UIN")) RequestUserInfo(uin,0,hSearch);
+ else ForkThread(&CKicqProto::SearchScreenName,new KicqScreenSearch{peer,hSearch});
+ return hSearch;
 }
 
 // X-status selector with bilingual names and local title/description editor.
@@ -1048,6 +1127,7 @@ INT_PTR CALLBACK CKicqProto::XStatusDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPAR
    proto->setWString("XStatusName", title);
    proto->setWString("XStatusMsg", desc);
    proto->SendXStatus();
+   KicqRefreshOwnXStatus(proto->m_szModuleName);
    // Update the protocol menu to show the selected X-status.
    if (proto->m_hXStatusMenu) {
     const wchar_t *label = id > 0 && id <= 34 ? (language == 0 ? kKicqXStatuses[id-1].nameRu : kKicqXStatuses[id-1].name) : L"X-status...";
@@ -1063,24 +1143,56 @@ INT_PTR CALLBACK CKicqProto::XStatusDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPAR
 
 // Select the IPv4 used to reach the OSCAR server; does not send any UDP data.
 // This is a local interface address, not a NAT-discovered public address.
-static uint32_t Oft2LocalIPv4()
+static uint32_t Oft2LocalIPv4(const char *host)
 {
- SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
- if (s == INVALID_SOCKET) return 0;
- sockaddr_in peer = {};
- peer.sin_family = AF_INET;
- peer.sin_port = htons(5190);
- peer.sin_addr.s_addr = inet_addr(KICQ_DEFAULT_SERVER);
+ // The earlier build used a hard-coded OSCAR address regardless of the
+ // configured server. Choose the interface route to the actual server.
+ // This is NOT public-IP discovery: NAT still requires a reachable relay.
+ if (!host || !*host) return 0;
+ addrinfo hints = {};
+ hints.ai_family = AF_INET;
+ hints.ai_socktype = SOCK_DGRAM;
+ addrinfo *addresses = nullptr;
+ if (getaddrinfo(host, "5190", &hints, &addresses) != 0 || !addresses)
+  return 0;
  uint32_t ip = 0;
- if (peer.sin_addr.s_addr != INADDR_NONE &&
-     connect(s, (const sockaddr *)&peer, sizeof(peer)) != SOCKET_ERROR) {
-  sockaddr_in local = {};
-  int len = sizeof(local);
-  if (getsockname(s, (sockaddr *)&local, &len) == 0)
-   ip = ntohl(local.sin_addr.s_addr);
+ for (addrinfo *entry = addresses; entry; entry = entry->ai_next) {
+  SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  if (sock == INVALID_SOCKET) continue;
+  if (connect(sock, entry->ai_addr, (int)entry->ai_addrlen) != SOCKET_ERROR) {
+   sockaddr_in local = {};
+   int len = sizeof(local);
+   if (getsockname(sock, (sockaddr *)&local, &len) == 0)
+    ip = ntohl(local.sin_addr.s_addr);
+  }
+  closesocket(sock);
+  if (ip) break;
  }
- closesocket(s);
+ freeaddrinfo(addresses);
  return ip;
+}
+
+// Optional direct OFT2 public IPv4 advertised to the peer. A machine behind
+// NAT needs a forwarding rule for Oft2ListenPort as well. Without an override
+// we keep legacy route selection but explicitly warn when it is non-routable.
+static uint32_t Oft2AdvertisedIPv4(const wchar_t *external, const char *server)
+{
+ if (external && *external) {
+  T2Utf utf8(external);
+  const unsigned long net = inet_addr(utf8);
+  if (net != INADDR_NONE && net != INADDR_ANY)
+   return ntohl(net);
+  return 0; // Invalid explicit override: never silently advertise another IP.
+ }
+ return Oft2LocalIPv4(server);
+}
+
+static bool Oft2IsPrivateIPv4(uint32_t ip)
+{
+ const unsigned a = ip >> 24, b = (ip >> 16) & 255;
+ return !ip || a == 0 || a == 10 || a == 127 || a >= 224 ||
+        (a == 169 && b == 254) || (a == 172 && b >= 16 && b <= 31) ||
+        (a == 192 && b == 168) || (a == 100 && b >= 64 && b <= 127);
 }
 
 // Outgoing direct OFT2 sender. The listener is created BEFORE the ICBM offer.
@@ -1090,6 +1202,70 @@ static bool Oft2SendProgress(uint64_t done, uint64_t, void *ctx)
  auto *f = (CKicqProto::OutgoingFile *)ctx;
  if (InterlockedCompareExchange(&f->cancelled, 0, 0)) return false;
  // Callback also updates the Miranda file-transfer progress dialog.
+ return true;
+}
+
+// ARS may fail before an OSCAR offer is sent. In that case try a fresh
+// direct OFT2 offer using the SAME transfer handle and cookie. Never use this
+// after the relay offer has been sent, as the peer may still accept it.
+bool CKicqProto::StartDirectFileFallback(const std::shared_ptr<OutgoingFile> &f)
+{
+ if (!f || InterlockedCompareExchange(&f->cancelled, 0, 0) || !m_bOnline)
+  return false;
+ if (!f->listener.open(INADDR_ANY, getWord("Oft2ListenPort", 0))) {
+  debugLogA("OFT2 fallback: cannot open TCP listener");
+  return false;
+ }
+ const CMStringW configuredPublicIp = getMStringW("Oft2ExternalIP");
+ const uint32_t ip = Oft2AdvertisedIPv4(configuredPublicIp.c_str(), T2Utf(m_wszServer));
+ const bytes_t cap = OscarText::unhex(CAP_FILE);
+ if (!ip || cap.size() != 16) {
+  debugLogA("OFT2 fallback: no route to OSCAR server or invalid file capability");
+  f->listener.close();
+  return false;
+ }
+ const int length = WideCharToMultiByte(CP_ACP, 0, f->filename.c_str(), -1, nullptr, 0, nullptr, nullptr);
+ if (length <= 1 || length > 61) {
+  debugLogA("OFT2 fallback: filename cannot be represented in the legacy transfer header");
+  f->listener.close();
+  return false;
+ }
+ std::string encoded(size_t(length), '\0');
+ if (!WideCharToMultiByte(CP_ACP, 0, f->filename.c_str(), -1, &encoded[0], length, nullptr, nullptr)) {
+  f->listener.close();
+  return false;
+ }
+ oft2::Rendezvous rv;
+ rv.type = 0;
+ rv.cookie = f->cookie;
+ memcpy(rv.capability.data(), cap.data(), 16);
+ rv.externalIp = ip;
+ rv.internalIp = Oft2LocalIPv4(T2Utf(m_wszServer));
+ rv.port = f->listener.port();
+ rv.requestNumber = 1;
+ rv.hasOffer = true;
+ rv.offer.kind = 1;
+ rv.offer.count = 1;
+ rv.offer.size = f->size;
+ rv.offer.name.assign(encoded.c_str());
+ bytes_t payload;
+ if (!oft2::build_rendezvous(rv, payload)) {
+  f->listener.close();
+  debugLogA("OFT2 fallback: failed to encode direct offer");
+  return false;
+ }
+ char receiver[24];
+ _itoa(f->uin, receiver, 10);
+ bytes_t cookie((const char *)f->cookie.data(), 8);
+ uint32_t req;
+ { mir_cslock lk(m_csPending); req = m_nextMsgReq++; }
+ { mir_cslock lk(m_csFiles); f->offerRequestId = req; }
+ Send(OscarPackets::fileRendezvous(receiver, cookie, payload, req));
+ ProtoBroadcastAck(f->contact, ACKTYPE_FILE, ACKRESULT_LISTENING, f.get());
+ if (Oft2IsPrivateIPv4(ip))
+  debugLogA("OFT2 DIRECT WARNING: advertised IP %s is not publicly routable; configure Oft2ExternalIP and forward Oft2ListenPort", ars::ip4(ip).c_str());
+ debugLogA("OFT2 fallback: direct file offer sent to %u, port=%u, local IP=%s (NAT may block it)",
+   (unsigned)f->uin, (unsigned)rv.port, ars::ip4(ip).c_str());
  return true;
 }
 
@@ -1128,6 +1304,14 @@ void CKicqProto::ShutdownOutgoingFiles()
 bool CKicqProto::FileProgress(OutgoingFile *file, uint64_t done)
 {
  if (InterlockedCompareExchange(&file->cancelled, 0, 0)) return false;
+ // Avoid flooding Miranda's UI with ~2000 synchronous ACKs per 60 MiB.
+ // Always report the first bytes and the exact final byte count.
+ const DWORD tick = GetTickCount();
+ if (done != file->size && file->lastUiTick &&
+     (tick - file->lastUiTick) < 250 &&
+     (done - file->lastUiBytes) < (1024ULL * 1024ULL)) return true;
+ file->lastUiTick = tick;
+ file->lastUiBytes = done;
  PROTOFILETRANSFERSTATUS status = {};
  status.flags = PFTS_SENDING;
  status.totalFiles = 1;
@@ -1150,23 +1334,57 @@ DWORD WINAPI CKicqProto::OutgoingFileThread(LPVOID arg)
  // All sockets are owned by this worker; callbacks may only call shutdown().
  if (f->viaProxy) {
   bool success = false;
+  bool offerSent = false;
   SOCKET sock = INVALID_SOCKET;
   uint32_t ip = 0;
   uint16_t port = 0;
   const std::string cap = OscarText::unhex(CAP_FILE);
   T2Utf proxyHost(proto->m_wszFileProxy);
-  if (cap.size() == 16 && ars::connectTo(proxyHost, (uint16_t)proto->m_iFileProxyPort, sock)) {
+  const uint16_t configuredProxyPort = (uint16_t)proto->m_iFileProxyPort;
+  uint16_t activeProxyPort = configuredProxyPort;
+  unsigned allocateReply = 0, allocateError = 0;
+  bool allocated = false;
+  if (cap.size() == 16 && ars::connectTo(proxyHost, configuredProxyPort, sock)) {
    { mir_cslock lk(proto->m_csFiles); f->active = sock; }
-   proto->debugLogA("ARS DIAG3: proxy TCP connected; ALLOCATE request next");
-   if (!InterlockedCompareExchange(&f->cancelled, 0, 0) &&
-       ars::handshakeAllocate(sock, proto->m_szUin.c_str(), f->cookie, cap, ip, port)) {
+   proto->debugLogA("ARS TX V6: TCP connected to configured relay port %u; ALLOCATE request next", (unsigned)configuredProxyPort);
+   if (!InterlockedCompareExchange(&f->cancelled, 0, 0))
+    allocated = ars::handshakeAllocate(sock, proto->m_szUin.c_str(), f->cookie, cap,
+      ip, port, &allocateReply, &allocateError);
+   if (!allocated)
+    proto->debugLogA("ARS TX V6: ALLOCATE not accepted on port %u (reply=%u proxyError=%u); checking classic port if applicable",
+      (unsigned)configuredProxyPort, allocateReply, allocateError);
+  }
+  // Classic OSCAR ARS normally listens on TCP/5190. When an account still
+  // uses the old 5191 default, retry 5190 only if 5191 did not allocate.
+  // Never send a second invitation: this retry occurs before any offer.
+  if (!allocated && configuredProxyPort == 5191 && !InterlockedCompareExchange(&f->cancelled, 0, 0) && cap.size() == 16) {
+   if (sock != INVALID_SOCKET) {
+    { mir_cslock lk(proto->m_csFiles); if (f->active == sock) f->active = INVALID_SOCKET; }
+    closesocket(sock); sock = INVALID_SOCKET;
+   }
+   activeProxyPort = 5190;
+   proto->debugLogA("ARS TX V6: retry ALLOCATE on classic ARS TCP port 5190");
+   allocateReply = allocateError = 0;
+   if (ars::connectTo(proxyHost, activeProxyPort, sock)) {
+    { mir_cslock lk(proto->m_csFiles); f->active = sock; }
+    allocated = ars::handshakeAllocate(sock, proto->m_szUin.c_str(), f->cookie, cap,
+      ip, port, &allocateReply, &allocateError);
+    if (!allocated)
+     proto->debugLogA("ARS TX V6: classic port did not allocate (reply=%u proxyError=%u)", allocateReply, allocateError);
+   }
+   else proto->debugLogA("ARS TX V6: classic port 5190 connection failed");
+  }
+  if (sock != INVALID_SOCKET) {
+   if (allocated && !InterlockedCompareExchange(&f->cancelled, 0, 0)) {
     proto->debugLogA("ARS DIAG3: ALLOCATE_OK, advertised relay %s:%u; sending OSCAR offer to %u", ars::ip4(ip).c_str(), (unsigned)port, f->uin);
     oft2::Rendezvous rv;
     rv.type = 0;
     rv.cookie = f->cookie;
     memcpy(rv.capability.data(), cap.data(), 16);
     rv.externalIp = ip;
-    rv.internalIp = ip;
+    // 0x0003 is the sender's local address, NOT the proxy's advertised IP.
+    // Some legacy peers use it to distinguish a proxy offer from a direct one.
+    rv.internalIp = Oft2LocalIPv4(T2Utf(proto->m_wszServer));
     rv.port = port;
     rv.proxy = true;
     rv.requestNumber = 1;
@@ -1180,15 +1398,24 @@ DWORD WINAPI CKicqProto::OutgoingFileThread(LPVOID arg)
      WideCharToMultiByte(CP_ACP, 0, f->filename.c_str(), -1, &encoded[0], bytes, nullptr, nullptr);
      rv.offer.name = encoded.c_str();
      bytes_t payload;
-     if (oft2::build_rendezvous(rv, payload)) {
+     // Legacy OSCAR peers may expect proxy TLVs in the conventional order.
+     // This serializer is used for outgoing ARS offers ONLY. Incoming and
+     // direct transfers keep their existing, tested packet format.
+     if (oft2::build_sender_proxy_offer(rv, payload)) {
       char receiver[24]; _itoa(f->uin, receiver, 10);
       bytes_t cookie((const char *)f->cookie.data(), 8);
       uint32_t req;
       { mir_cslock lk(proto->m_csPending); req = proto->m_nextMsgReq++; }
+      { mir_cslock lk(proto->m_csFiles); f->offerRequestId = req; }
       proto->Send(OscarPackets::fileRendezvous(receiver, cookie, payload, req));
+      offerSent = true;
       proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE, ACKRESULT_LISTENING, f.get());
-      proto->debugLogA("ARS DIAG3: OSCAR offer queued; now waiting for PROXY_READY. Check peer log for ARS DIAG3: incoming offer");
-      bool ready = ars::waitReady(sock);
+      proto->debugLogA("ARS TX V5: waiting for relay READY after peer accepts (recipient=%u ticket=%u)",
+        (unsigned)f->uin, (unsigned)port);
+      unsigned relayResponse = 0;
+      bool ready = ars::waitReady(sock, &relayResponse);
+      if (!ready)
+       proto->debugLogA("ARS TX V5: relay did not become ready, last response=%u (0=socket/timeout; 1=proxy error; other=unexpected)", relayResponse);
       if (!ready && InterlockedCompareExchange(&f->redirected, 0, 0) &&
           !InterlockedCompareExchange(&f->cancelled, 0, 0)) {
        uint32_t redirectIp; uint16_t redirectPort;
@@ -1208,7 +1435,7 @@ DWORD WINAPI CKicqProto::OutgoingFileThread(LPVOID arg)
          closesocket(sock); sock = INVALID_SOCKET;
         }
         // Some servers return a ticket rather than a public TCP port.
-        if (ars::connectTo(proxyHost, (uint16_t)proto->m_iFileProxyPort, sock)) {
+        if (ars::connectTo(proxyHost, activeProxyPort, sock)) {
          { mir_cslock lk(proto->m_csFiles); f->active = sock; }
          ready = ars::handshakeJoin(sock, proto->m_szUin.c_str(), f->cookie, cap, redirectPort);
         }
@@ -1228,11 +1455,57 @@ DWORD WINAPI CKicqProto::OutgoingFileThread(LPVOID arg)
         oft2::put32(prompt + 28, f->size); oft2::put32(prompt + 32, f->size);
         memcpy(prompt + 192, rv.offer.name.c_str(), rv.offer.name.size());
         proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE, ACKRESULT_CONNECTED, f.get());
+        proto->debugLogA("ARS TX: relay paired, sending OFT2 PROMPT, then awaiting ACK/data/DONE");
+        // Larger send buffer reduces needless sender stalls on high-latency relays.
+        const int socketBuffer = 256 * 1024;
+        setsockopt(sock, SOL_SOCKET, SO_SNDBUF, (const char *)&socketBuffer, sizeof(socketBuffer));
+        int transferStage = oft2::ST_VALIDATE;
+        uint64_t transferred = 0;
+        const DWORD startedAt = GetTickCount();
+        // V8: Mandarin Web can abort large transfers while the sender floods
+        // the relay at LAN speed (observed OSCAR CANCEL + WSAECONNRESET).
+        // A bounded, optional sender-side rate is used only for >=8 MiB.
+        // Preserve the already-working small ARS path byte-for-byte.
+        // V9: V8 slept at most 250 ms ONCE per block. If the sender fell
+        // behind its pacing schedule, the next block could be sent immediately,
+        // so ArsUploadKiBps was not a reliable bandwidth limit.
+        // Do not affect the already working <8 MiB transfers.
+        const uint32_t configuredKiBps = proto->getDword("ArsUploadKiBps", 512);
+        const uint32_t rateKiBps = f->size >= 8U * 1024U * 1024U ? configuredKiBps : 0;
+        struct ArsUploadContext {
+         OutgoingThreadArgs *args;
+         DWORD began;
+         uint32_t rate;
+        } upload = { ctx.get(), GetTickCount(), rateKiBps };
+        proto->debugLogA("ARS TX V9: upload limiter=%u KiB/s, file=%u bytes (0=unlimited)",
+          (unsigned)rateKiBps, (unsigned)f->size);
         success = oft2::send_one(sock, prompt, input, f->size,
-         [](uint64_t done, uint64_t, void *ctx) -> bool {
-          auto *args = (OutgoingThreadArgs *)ctx;
-          return args->proto->FileProgress(args->file.get(), done);
-         }, ctx.get());
+         [](uint64_t done, uint64_t, void *opaque) -> bool {
+          auto *upload = (ArsUploadContext *)opaque;
+          auto *args = upload->args;
+          if (done >= args->file->nextLogBytes || done == args->file->size) {
+           args->proto->debugLogA("ARS TX V9: file data progress %llu/%u bytes", (unsigned long long)done, (unsigned)args->file->size);
+           args->file->nextLogBytes = done + 8ULL * 1024ULL * 1024ULL;
+          }
+          if (!args->proto->FileProgress(args->file.get(), done)) return false;
+          if (upload->rate) {
+           // Pace the entire transfer, not just the next 250 ms slice.
+           // Both the target and multiplication use 64-bit arithmetic;
+           // GetTickCount subtraction handles 32-bit timer wraparound.
+           const uint64_t targetMs = (done * 1000ULL) / (uint64_t(upload->rate) * 1024ULL);
+           while (!InterlockedCompareExchange(&args->file->cancelled, 0, 0)) {
+            const DWORD elapsed = GetTickCount() - upload->began;
+            if ((uint64_t)elapsed >= targetMs) break;
+            const uint64_t remaining = targetMs - elapsed;
+            Sleep((DWORD)(remaining > 100 ? 100 : remaining));
+           }
+          }
+          return !InterlockedCompareExchange(&args->file->cancelled, 0, 0);
+         }, &upload, &transferStage, &transferred);
+        proto->debugLogA("ARS TX V9: OFT2 result=%s stage=%d dataSent=%llu/%u elapsedMs=%llu lastWSA=%d cancelled=%ld (stage 3=data, 4=waiting DONE)",
+          success ? "success" : "failure", transferStage,
+          (unsigned long long)transferred, (unsigned)f->size,
+          (unsigned long long)(DWORD)(GetTickCount()-startedAt), success ? 0 : WSAGetLastError(), (long)InterlockedCompareExchange(&f->cancelled, 0, 0));
         fclose(input);
        }
       }
@@ -1247,9 +1520,23 @@ DWORD WINAPI CKicqProto::OutgoingFileThread(LPVOID arg)
    { mir_cslock lk(proto->m_csFiles); if (f->active == sock) f->active = INVALID_SOCKET; }
    closesocket(sock);
   }
-  proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE,
-    success ? ACKRESULT_SUCCESS : ACKRESULT_FAILED, f.get(), 0);
-  return 0;
+  // Never send a competing direct offer once the ARS offer is visible to the peer.
+  // Such a duplicate can leave two pending dialogs and mismatched rendezvous state.
+  if (offerSent || success || InterlockedCompareExchange(&f->cancelled, 0, 0)) {
+   if (!success) proto->debugLogA("ARS sender: offer was sent but transfer failed; no duplicate direct offer");
+   if (InterlockedCompareExchange(&f->terminalAckSent, 1, 0) == 0)
+    proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE,
+      success ? ACKRESULT_SUCCESS : ACKRESULT_FAILED, f.get(), 0);
+   return 0;
+  }
+  // The relay never yielded an offer: fall back to direct TCP/OFT2.
+  proto->debugLogA("ARS sender: no relay offer sent; attempting direct OFT2 fallback");
+  f->viaProxy = false;
+  if (!proto->StartDirectFileFallback(f)) {
+   if (InterlockedCompareExchange(&f->terminalAckSent, 1, 0) == 0)
+    proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE, ACKRESULT_FAILED, f.get(), 0);
+   return 0;
+  }
  }
 
  SOCKET sock = f->listener.accept_one(120000, &f->cancelled);
@@ -1278,26 +1565,46 @@ DWORD WINAPI CKicqProto::OutgoingFileThread(LPVOID arg)
     name.resize(required);
     WideCharToMultiByte(CP_ACP, 0, f->filename.c_str(), -1, &name[0], required, nullptr, nullptr);
     memcpy(prompt + 192, name.data(), name.size());
+    const int socketBuffer = 256 * 1024;
+    setsockopt(sock, SOL_SOCKET, SO_SNDBUF, (const char *)&socketBuffer, sizeof(socketBuffer));
+    int stage = oft2::ST_VALIDATE;
+    uint64_t sentBytes = 0;
     success = oft2::send_one(sock, prompt, input, f->size, [](uint64_t done, uint64_t, void *ctx) -> bool {
       auto *args = (OutgoingThreadArgs *)ctx;
       return args->proto->FileProgress(args->file.get(), done);
-     }, ctx.get());
+     }, ctx.get(), &stage, &sentBytes);
+    proto->debugLogA("OFT2 DIRECT V7: result=%s stage=%d dataSent=%llu/%u WSA=%d",
+      success ? "success" : "failure", stage, (unsigned long long)sentBytes,
+      (unsigned)f->size, success ? 0 : WSAGetLastError());
    }
    fclose(input);
   }
   closesocket(sock);
  }
  f->listener.close();
- proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE,
-  success ? ACKRESULT_SUCCESS : ACKRESULT_FAILED, f.get(), 0);
+ if (!success)
+  proto->debugLogA("OFT2 sender: direct transport failed or recipient did not connect");
+ if (InterlockedCompareExchange(&f->terminalAckSent, 1, 0) == 0)
+  proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE,
+   success ? ACKRESULT_SUCCESS : ACKRESULT_FAILED, f.get(), 0);
  return 0;
 }
 
 HANDLE CKicqProto::SendFile(MCONTACT contact, const wchar_t *, wchar_t **files)
 {
- if (!m_bOnline || !contact || !files || !files[0] || files[1]) return nullptr;
+ if (!m_bOnline || !contact || !files || !files[0] || files[1]) {
+  debugLogA("OFT2 sender: rejected before transfer creation (offline, missing contact/file, or multiple files)");
+  return nullptr;
+ }
  const uint32_t uin = getDword(contact, "UIN");
- if (!uin) return nullptr;
+ if (!uin) { debugLogA("OFT2 sender: missing UIN on selected contact"); return nullptr; }
+ // Reject sending a file to this very same OSCAR account. Otherwise servers
+ // which echo channel-2 requests can present the offer back as an inbound file.
+ if (uin == strtoul(m_szUin.c_str(), nullptr, 10)) {
+  debugLogA("OFT2 sender: refused own UIN %u; select a contact on a different account", (unsigned)uin);
+  return nullptr;
+ }
+
  auto f = std::make_shared<OutgoingFile>();
  f->contact = contact;
  f->path = files[0];
@@ -1313,7 +1620,7 @@ HANDLE CKicqProto::SendFile(MCONTACT contact, const wchar_t *, wchar_t **files)
  f->size = (uint32_t)length;
  f->viaProxy = mir_wstrlen(m_wszFileProxy) > 0 && (int)m_iFileProxyPort > 0 && (int)m_iFileProxyPort <= 65535;
  f->uin = uin;
- if (!f->viaProxy && !f->listener.open()) return nullptr;
+ if (!f->viaProxy && !f->listener.open(INADDR_ANY, getWord("Oft2ListenPort", 0))) return nullptr;
  uint64_t randomCookie = (uint64_t(GetTickCount()) << 16) ^ (uint64_t(rand()) << 32) ^ rand();
  for (int i = 0; i < 8; ++i) f->cookie[i] = uint8_t(randomCookie >> (56 - 8 * i));
  bytes_t payload;
@@ -1326,9 +1633,12 @@ HANDLE CKicqProto::SendFile(MCONTACT contact, const wchar_t *, wchar_t **files)
  memcpy(rv.capability.data(), cap.data(), 16);
  rv.port = f->listener.port();
  rv.requestNumber = 1;
- rv.externalIp = Oft2LocalIPv4();
- rv.internalIp = rv.externalIp;
+ const CMStringW configuredPublicIp = getMStringW("Oft2ExternalIP");
+ rv.externalIp = Oft2AdvertisedIPv4(configuredPublicIp.c_str(), T2Utf(m_wszServer));
+ rv.internalIp = Oft2LocalIPv4(T2Utf(m_wszServer));
  if (!rv.externalIp) return nullptr;
+ if (Oft2IsPrivateIPv4(rv.externalIp))
+  debugLogA("OFT2 DIRECT WARNING: advertised IP %s is private/unroutable; specify Oft2ExternalIP and forward Oft2ListenPort for Internet clients", ars::ip4(rv.externalIp).c_str());
  rv.hasOffer = true;
  rv.offer.kind = 1;
  rv.offer.count = 1;
@@ -1351,7 +1661,15 @@ HANDLE CKicqProto::SendFile(MCONTACT contact, const wchar_t *, wchar_t **files)
  char recipient[20];
  _itoa(uin, recipient, 10);
  bytes_t cookie((char *)f->cookie.data(), 8);
- if (!f->viaProxy) Send(OscarPackets::fileRendezvous(recipient, cookie, payload, m_nextMsgReq++));
+ if (!f->viaProxy) {
+  debugLogA("OFT2 sender: sending initial direct OSCAR file offer to %u", (unsigned)uin);
+  uint32_t requestId;
+  { mir_cslock lk(m_csPending); requestId = m_nextMsgReq++; }
+  { mir_cslock lk(m_csFiles); f->offerRequestId = requestId; }
+  Send(OscarPackets::fileRendezvous(recipient, cookie, payload, requestId));
+  ProtoBroadcastAck(f->contact, ACKTYPE_FILE, ACKRESULT_LISTENING, f.get());
+ }
+ else debugLogA("ARS sender: starting relay allocation for %u (offer not yet sent)", (unsigned)uin);
  return f.get();
 }
 
@@ -1399,19 +1717,39 @@ DWORD WINAPI CKicqProto::IncomingFileThread(LPVOID param)
   const std::string cap = OscarText::unhex(CAP_FILE);
   const std::string host = ars::ip4(f->ip);
   bool joined = false;
-  if (cap.size() == 16 && ars::connectTo(host.c_str(), f->port, sock)) {
-   { mir_cslock lk(arg->proto->m_csFiles); f->active = sock; }
-   joined = ars::handshakeJoin(sock, arg->proto->m_szUin.c_str(), f->cookie, cap, f->port);
-   if (!joined) {
-    { mir_cslock lk(arg->proto->m_csFiles); f->active = INVALID_SOCKET; }
-    closesocket(sock); sock = INVALID_SOCKET;
+  // In a proxied channel-2 offer TLV(0x0005) is an ARS session/ticket
+  // check value, NOT the TCP listening port. Passing it to connectTo()
+  // leaves the receiver at 0% even though the invitation was accepted.
+  // Keep f->port for handshakeJoin() only. Some deployments (Mandarin)
+  // use a configured alternate proxy port; classic OSCAR uses TCP 5190.
+  const uint16_t configuredProxyPort =
+    (uint16_t)arg->proto->m_iFileProxyPort;
+  const uint16_t proxyPorts[] = { configuredProxyPort, 5190 };
+  for (unsigned portIndex = 0; portIndex < 2 && !joined; ++portIndex) {
+   const uint16_t tcpPort = proxyPorts[portIndex];
+   if (!tcpPort || (portIndex && tcpPort == proxyPorts[0])) continue;
+   arg->proto->debugLogA("ARS RX: connecting advertised proxy %s TCP:%u (ticket=%u)",
+     host.c_str(), (unsigned)tcpPort, (unsigned)f->port);
+   if (!cap.empty() && ars::connectTo(host.c_str(), tcpPort, sock)) {
+    { mir_cslock lk(arg->proto->m_csFiles); f->active = sock; }
+    joined = ars::handshakeJoin(sock, arg->proto->m_szUin.c_str(), f->cookie, cap, f->port);
+    arg->proto->debugLogA("ARS RX: advertised relay JOIN %s (TCP:%u)",
+      joined ? "READY" : "failed", (unsigned)tcpPort);
+    if (!joined) {
+     { mir_cslock lk(arg->proto->m_csFiles); f->active = INVALID_SOCKET; }
+     closesocket(sock); sock = INVALID_SOCKET;
+    }
    }
   }
   T2Utf proxyHost(arg->proto->m_wszFileProxy);
-  if (!joined && cap.size() == 16 && ars::connectTo(proxyHost,
-      (uint16_t)arg->proto->m_iFileProxyPort, sock)) {
+  // If the advertised relay address cannot be reached, try the configured
+  // hostname. Use the configured TCP port, never the invitation ticket.
+  if (!joined && cap.size() == 16 && configuredProxyPort &&
+      ars::connectTo(proxyHost, configuredProxyPort, sock)) {
    { mir_cslock lk(arg->proto->m_csFiles); f->active = sock; }
    joined = ars::handshakeJoin(sock, arg->proto->m_szUin.c_str(), f->cookie, cap, f->port);
+   arg->proto->debugLogA("ARS RX: configured relay JOIN %s (TCP:%u ticket=%u)",
+     joined ? "READY" : "failed", (unsigned)configuredProxyPort, (unsigned)f->port);
    if (!joined) {
     { mir_cslock lk(arg->proto->m_csFiles); f->active = INVALID_SOCKET; }
     closesocket(sock); sock = INVALID_SOCKET;
@@ -1451,7 +1789,9 @@ DWORD WINAPI CKicqProto::IncomingFileThread(LPVOID param)
    arg->proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE, ACKRESULT_CONNECTED, f.get());
    FILE *output = nullptr;
    if (_wfopen_s(&output, f->destination.c_str(), L"wb") == 0 && output) {
+    arg->proto->debugLogA("ARS RX: TCP paired, waiting for OFT2 PROMPT (size=%u)", (unsigned)f->size);
     ok = oft2::receive_one(sock, output, f->size, Oft2IncomingProgress, arg.get());
+    arg->proto->debugLogA("ARS RX: OFT2 transfer %s", ok ? "completed" : "failed during PROMPT/ACK/data/DONE");
     if (fclose(output)) ok = false;
     if (!ok) _wremove(f->destination.c_str());
    }
@@ -1661,6 +2001,52 @@ static bool CalcAvatarMd5(const bytes_t &data, bytes_t &digest)
  return ok;
 }
 
+// A cache entry is usable only when it is an actual non-empty file.
+static bool KicqAvatarFileReady(const wchar_t *path)
+{
+ if (!path || !*path) return false;
+ WIN32_FILE_ATTRIBUTE_DATA attributes = {};
+ if (!GetFileAttributesExW(path, GetFileExInfoStandard, &attributes)) return false;
+ return !(attributes.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+  (attributes.nFileSizeHigh != 0 || attributes.nFileSizeLow != 0);
+}
+
+// Decode only protocol-provided hex hashes. A missing disk cache can be fetched
+// again even if the server does not send another presence update.
+static bool KicqAvatarDecodeHash(const char *hex, bytes_t &raw)
+{
+ if (!hex) return false;
+ const size_t length = strlen(hex);
+ if (!length || length > 128 || (length & 1)) return false;
+ raw.clear();
+ for (size_t i = 0; i < length; i += 2) {
+  auto digit = [](char value) -> int {
+   if (value >= '0' && value <= '9') return value - '0';
+   if (value >= 'a' && value <= 'f') return value - 'a' + 10;
+   if (value >= 'A' && value <= 'F') return value - 'A' + 10;
+   return -1;
+  };
+  const int hi = digit(hex[i]), lo = digit(hex[i + 1]);
+  if (hi < 0 || lo < 0) { raw.clear(); return false; }
+  raw.push_back(char((hi << 4) | lo));
+ }
+ return !raw.empty();
+}
+
+// Use the same cache validation from proactive discovery and AVS requests.
+void CKicqProto::QueueCachedBartAvatar(MCONTACT contact)
+{
+ if (!contact) return;
+ auto announced = getMStringA(contact, "BartAdvertisedHash");
+ const auto cached = getMStringA(contact, "BartAvatarHash");
+ const auto file = getMStringW(contact, "BartAvatarPath");
+ if (announced.IsEmpty()) announced = cached; // older XP profiles saved only the verified hash
+ if (announced == cached && KicqAvatarFileReady(file.c_str())) return;
+ bytes_t raw;
+ if (KicqAvatarDecodeHash(announced.c_str(), raw))
+  QueueBartAvatar(ContactId(contact), db_get_w(contact, m_szModuleName, "BartAdvertisedType", 1), raw);
+}
+
 // Avatar Services (Miranda NG 0.96.x). Uses existing BART wire/session.
 // Called by Miranda Avatar Service to obtain an actual cached contact image.
 // An advertised hash alone is never reported as a successfully downloaded image.
@@ -1669,7 +2055,9 @@ INT_PTR MIR_CDECL CKicqProto::OnGetAvatarInfo(WPARAM, LPARAM lParam)
  auto *info = reinterpret_cast<PROTO_AVATAR_INFORMATION *>(lParam);
  if (!info || !info->hContact) return GAIR_NOAVATAR;
  const auto file = getMStringW(info->hContact, "BartAvatarPath");
- if (!file.IsEmpty() && GetFileAttributesW(file.c_str()) != INVALID_FILE_ATTRIBUTES) {
+ const auto advertisedHash = getMStringA(info->hContact, "BartAdvertisedHash");
+ const auto cachedHash = getMStringA(info->hContact, "BartAvatarHash");
+ if ((advertisedHash.IsEmpty() || advertisedHash == cachedHash) && KicqAvatarFileReady(file.c_str())) {
   const wchar_t *ext = wcsrchr(file.c_str(), L'.');
   info->format = PA_FORMAT_UNKNOWN;
   if (ext) {
@@ -1686,39 +2074,20 @@ INT_PTR MIR_CDECL CKicqProto::OnGetAvatarInfo(WPARAM, LPARAM lParam)
  // disappear between sessions. Re-request the last verified avatar hash,
  // without forcing a contact-list/Extra Icons rebuild.
  if (!m_bOnline) return GAIR_NOAVATAR;
- const auto cachedHash = getMStringA(info->hContact, "BartAvatarHash");
- const uint32_t avatarUin = getDword(info->hContact, "UIN");
- if (avatarUin && cachedHash.GetLength() == 32) {
-  bytes_t hash;
-  hash.reserve(16);
-  bool valid = true;
-  for (int i = 0; i < 32; i += 2) {
-   auto nibble = [](char c) -> int {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    return -1;
-   };
-   const int hi = nibble(cachedHash[i]);
-   const int lo = nibble(cachedHash[i + 1]);
-   if (hi < 0 || lo < 0) { valid = false; break; }
-   hash.push_back(uint8_t((hi << 4) | lo));
-  }
-  if (valid) QueueBartAvatar(avatarUin, 1, hash);
- }
- // A queued request returns WAITFOR; on completion the BART worker broadcasts
- // ACKTYPE_AVATAR for this contact, not a global Extra Icons refresh.
+ const auto peer = ContactId(info->hContact);
+ QueueCachedBartAvatar(info->hContact);
+ // Unknown hash: schedule discovery once per session, not on every AVS call.
+ ScheduleBartRefresh(peer);
  mir_cslock lock(m_csBart);
  for (const auto &pending : m_bartPending)
-  if (FindContact((uint32_t)strtoul(pending.screenName.c_str(), nullptr, 10)) == info->hContact)
-   return GAIR_WAITFOR;
+  if (pending.screenName == peer) return GAIR_WAITFOR;
  return GAIR_NOAVATAR;
 }
 
 INT_PTR MIR_CDECL CKicqProto::OnAvatarCaps(WPARAM wParam, LPARAM lParam)
 {
  switch (wParam) {
- case AF_ENABLED: return m_bOnline ? 1 : 0;
+ case AF_ENABLED: return 1;
  case AF_MAXSIZE: if (lParam) { auto *size = reinterpret_cast<POINT *>(lParam); size->x = 128; size->y = 128; } return 0;
  case AF_PROPORTION: return PIP_SQUARE;
  case AF_MAXFILESIZE: return 7168;
@@ -1782,5 +2151,18 @@ INT_PTR MIR_CDECL CKicqProto::OnSetMyAvatar(WPARAM, LPARAM lParam)
  Send(OscarSnac(0x13, deleting ? 0x0A : (existingIcon ? 0x09 : 0x08), request, record));
  Send(OscarPackets::ssiEditEnd());
  // Accepted locally. The server's SSI result, then BART's upload result decide success.
+ return 0;
+}
+
+INT_PTR __cdecl CKicqProto::OnRetryAuth(WPARAM w, LPARAM)
+{
+ MCONTACT c=(MCONTACT)w;
+ if(!c || mir_strcmp(Proto_GetBaseAccountName(c),m_szModuleName) || !getByte(c,"Auth",0)) return 1;
+ return AuthRequest(c,TranslateT("Please authorize me"));
+}
+int __cdecl CKicqProto::OnPreBuildContactMenu(WPARAM w, LPARAM)
+{
+ MCONTACT c=(MCONTACT)w;
+ if(m_hRetryAuthMenu) Menu_ShowItem(m_hRetryAuthMenu,c && m_bOnline && !mir_strcmp(Proto_GetBaseAccountName(c),m_szModuleName) && getByte(c,"Auth",0));
  return 0;
 }

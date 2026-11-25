@@ -1,0 +1,115 @@
+--- a/README.md
++++ b/README.md
+@@ -49,7 +49,7 @@
+ ## Как собрать
+ 
+ 1. Установите Visual Studio 2019 с поддержкой C++ и нужные компоненты сборки Miranda NG.
+-2. Подготовьте соответствующее исходное дерево/SDK **Miranda NG 0.96.7 либо 0.96.8**.
++2. Подготовьте исходное дерево точной ревизии установленной Miranda NG. Для 0.96.7 #28846 используйте `495fea6`, а не тег `v0.96.7`. Ветка `normal/0.96.7` теперь по умолчанию запрещает старый ABI; см. `CONTACT-API-CRASH-FIX2-RU.md`.
+ 3. Откройте проект `KICQ.vcxproj` из соответствующей папки (`normal/` или `windows-xp-x86/`). Проверьте пути к зависимостям SDK Miranda.
+ 4. Для **Win32 и Windows XP** выберите **Release | Win32**, `v141_xp`, CRT `/MD` и сохранённые проектом настройки `/Od`.
+ 5. Для **x64** используйте **Release | x64** и соответствующую 64-битную Miranda.
+--- a/normal/0.96.7/KICQ/CMakeLists.txt
++++ b/normal/0.96.7/KICQ/CMakeLists.txt
+@@ -16,10 +16,29 @@
+   message(STATUS "PMLICQ: unable to determine Miranda NG revision; use the SDK/source matching the exact installed 0.96.7 build")
+ endif()
+ 
++# Default to the modern contact ABI, including the user's #28846 build.
++# Legacy builds must opt in explicitly and use the matching legacy runtime.
++option(PMLICQ_ALLOW_LEGACY_CONTACT_API "Allow old contact ABI (NOT compatible with #28846)" OFF)
++set(PMLICQ_DB_HEADER "${CMAKE_SOURCE_DIR}/include/m_database.h")
++if(NOT EXISTS "${PMLICQ_DB_HEADER}")
++  message(FATAL_ERROR "PMLICQ: Miranda SDK m_database.h not found")
++endif()
++file(STRINGS "${PMLICQ_DB_HEADER}" PMLICQ_DBAC_DECL REGEX "^[ \t]*#[ \t]*define[ \t]+DBAC_NOTINLIST[ \t]+")
++if(PMLICQ_DBAC_DECL)
++  message(STATUS "PMLICQ contact ABI: new (module, flags)")
++elseif(PMLICQ_ALLOW_LEGACY_CONTACT_API)
++  message(WARNING "PMLICQ contact ABI: LEGACY; resulting DLL must NOT be used on #28846")
++else()
++  message(FATAL_ERROR "PMLICQ_CONTACT_ABI_MISMATCH: use Miranda revision 495fea6 for build #28846. Old SDK is not accepted by default.")
++endif()
++
+ file(GLOB SOURCES "src/*.h" "src/*.cpp" "res/*.rc")
+ set(TARGET KICQ)
+ include(${CMAKE_SOURCE_DIR}/cmake/plugin.cmake)
+ target_link_libraries(${TARGET} ws2_32.lib)
++if(PMLICQ_ALLOW_LEGACY_CONTACT_API)
++  target_compile_definitions(${TARGET} PRIVATE PMLICQ_ALLOW_LEGACY_CONTACT_API)
++endif()
+ add_subdirectory(proto_kicq)
+ 
+ # Use UTF-8 source encoding for Russian X-status names in both x86 and x64.
+--- a/normal/0.96.7/KICQ/README-PORT-0967-RU.md
++++ b/normal/0.96.7/KICQ/README-PORT-0967-RU.md
+@@ -7,7 +7,7 @@
+ 
+ Официальный тег: https://github.com/miranda-ng/miranda-ng/tree/v0.96.7
+ Официальный исходный архив: https://sourceforge.net/projects/miranda-ng.mirror/files/v0.96.7/
+-Ревизия первоначального релиза: `ebe074e`. Для более поздних сборок 0.96.7 берите точный commit установленной Miranda (например, `495fea6` для #28846), а не первоначальный тег. См. CONTACT-API-CRASH-FIX-RU.md в корне архива.
++Ревизия первоначального релиза: `ebe074e`. Для более поздних сборок 0.96.7 берите точный commit установленной Miranda (например, `495fea6` для #28846), а не первоначальный тег. См. CONTACT-API-CRASH-FIX2-RU.md в корне архива. Старый ABI теперь запрещён по умолчанию.
+ 
+ ## Сборка
+ 
+--- a/normal/0.96.7/KICQ/src/proto.cpp
++++ b/normal/0.96.7/KICQ/src/proto.cpp
+@@ -270,19 +270,27 @@
+ 	if (hContact)
+ 		return hContact;
+ 
+-	// The contact-creation ABI changed during the 0.96.7 stable cycle.
+-	// Select it from the actual Miranda SDK, not the marketing version.
+-#ifdef DBAC_NOTINLIST
++	// 0.96.7 #28846 requires the two-argument contact API. Never silently
++	// produce a legacy ABI DLL when the SDK is too old for that target.
++#if defined(DBAC_NOTINLIST)
++#if defined(_MSC_VER)
++#pragma message("PMLICQ contact ABI: new (db_add_contact(module, flags))")
++#endif
+ 	hContact = db_add_contact(m_szModuleName, bTemporary ? DBAC_NOTINLIST : 0);
+ 	if (!hContact)
+ 		return 0;
+-#else
++#elif defined(PMLICQ_ALLOW_LEGACY_CONTACT_API)
++#if defined(_MSC_VER)
++#pragma message("PMLICQ contact ABI: LEGACY -- not compatible with #28846")
++#endif
+ 	hContact = db_add_contact();
+ 	if (!hContact)
+ 		return 0;
+ 	Proto_AddToContact(hContact, m_szModuleName);
+ 	if (bTemporary)
+ 		db_set_b(hContact, "CList", "NotOnList", 1);
++#else
++#error PMLICQ_CONTACT_ABI_MISMATCH: Miranda SDK lacks DBAC_NOTINLIST. Use revision 495fea6 for build 28846.
+ #endif
+ 	if(uin) setDword(hContact, "UIN", uin);
+  setString(hContact, "ScreenName", id.c_str());
+--- a/normal/0.96.7/KICQ/src/version.h
++++ b/normal/0.96.7/KICQ/src/version.h
+@@ -1,7 +1,7 @@
+ #define __MAJOR_VERSION          0
+ #define __MINOR_VERSION          1
+ #define __RELEASE_NUM            0
+-#define __BUILD_NUM              1
++#define __BUILD_NUM              2
+ 
+ #include <stdver.h>
+ 
+--- a/tests/test_contact_api.py
++++ b/tests/test_contact_api.py
+@@ -91,6 +91,13 @@
+                     cpp.write_text(MOCK+body+CASES, encoding='utf-8')
+                     cmd = [os.environ.get('CXX','g++'),'-std=c++17','-Wall','-Wextra','-I',str(src)]
+                     if new: cmd += ['-DNEW_API']
++                    if not new and flavor == 'normal':
++                        # A stale SDK must now fail to compile by default.
++                        bad = subprocess.run(cmd+[str(cpp),'-o',str(exe)],capture_output=True,text=True)
++                        assert bad.returncode != 0 and 'PMLICQ_CONTACT_ABI_MISMATCH' in bad.stderr, bad.stderr
++                        print('normal/0.96.7: old SDK rejected by default',flush=True)
++                        # The explicit legacy opt-in remains available for legacy runtimes only.
++                        cmd += ['-DPMLICQ_ALLOW_LEGACY_CONTACT_API']
+                     subprocess.run(cmd+[str(cpp),'-o',str(exe)],check=True)
+                     subprocess.run([str(exe)],check=True)
+                     print(f'{flavor}/{version}: {"new" if new else "old"} API passed',flush=True)

@@ -1,0 +1,284 @@
+--- V7/normal/0.96.7/KICQ/src/proto.cpp
++++ V8/normal/0.96.7/KICQ/src/proto.cpp
+@@ -1176,7 +1176,7 @@
+  rv.cookie = f->cookie;
+  memcpy(rv.capability.data(), cap.data(), 16);
+  rv.externalIp = ip;
+- rv.internalIp = ip;
++ rv.internalIp = Oft2LocalIPv4(T2Utf(m_wszServer));
+  rv.port = f->listener.port();
+  rv.requestNumber = 1;
+  rv.hasOffer = true;
+@@ -1398,19 +1398,43 @@
+         int transferStage = oft2::ST_VALIDATE;
+         uint64_t transferred = 0;
+         const DWORD startedAt = GetTickCount();
++        // V8: Mandarin Web can abort large transfers while the sender floods
++        // the relay at LAN speed (observed OSCAR CANCEL + WSAECONNRESET).
++        // A bounded, optional sender-side rate is used only for >=8 MiB.
++        // Preserve the already-working small ARS path byte-for-byte.
++        const uint32_t configuredKiBps = proto->getDword("ArsUploadKiBps", 1024);
++        const uint32_t rateKiBps = f->size >= 8U * 1024U * 1024U ? configuredKiBps : 0;
++        struct ArsUploadContext {
++         OutgoingThreadArgs *args;
++         DWORD began;
++         uint32_t rate;
++        } upload = { ctx.get(), GetTickCount(), rateKiBps };
++        proto->debugLogA("ARS TX V8: upload limiter=%u KiB/s, file=%u bytes (0=unlimited)",
++          (unsigned)rateKiBps, (unsigned)f->size);
+         success = oft2::send_one(sock, prompt, input, f->size,
+-         [](uint64_t done, uint64_t, void *ctx) -> bool {
+-          auto *args = (OutgoingThreadArgs *)ctx;
++         [](uint64_t done, uint64_t, void *opaque) -> bool {
++          auto *upload = (ArsUploadContext *)opaque;
++          auto *args = upload->args;
+           if (done >= args->file->nextLogBytes || done == args->file->size) {
+-           args->proto->debugLogA("ARS TX V7: file data progress %llu/%u bytes", (unsigned long long)done, (unsigned)args->file->size);
++           args->proto->debugLogA("ARS TX V8: file data progress %llu/%u bytes", (unsigned long long)done, (unsigned)args->file->size);
+            args->file->nextLogBytes = done + 8ULL * 1024ULL * 1024ULL;
+           }
+-          return args->proto->FileProgress(args->file.get(), done);
+-         }, ctx.get(), &transferStage, &transferred);
+-        proto->debugLogA("ARS TX V7: OFT2 result=%s stage=%d dataSent=%llu/%u elapsedMs=%llu WSA=%d (stage 3=data, 4=waiting DONE)",
++          if (!args->proto->FileProgress(args->file.get(), done)) return false;
++          if (upload->rate) {
++           // Integer math is 64-bit; GetTickCount wraparound is well-defined.
++           const uint64_t targetMs = (done * 1000ULL) / (uint64_t(upload->rate) * 1024ULL);
++           const DWORD elapsed = GetTickCount() - upload->began;
++           if (targetMs > elapsed) {
++            const uint64_t remaining = targetMs - elapsed;
++            Sleep((DWORD)(remaining > 250 ? 250 : remaining));
++           }
++          }
++          return !InterlockedCompareExchange(&args->file->cancelled, 0, 0);
++         }, &upload, &transferStage, &transferred);
++        proto->debugLogA("ARS TX V8: OFT2 result=%s stage=%d dataSent=%llu/%u elapsedMs=%llu lastWSA=%d cancelled=%ld (stage 3=data, 4=waiting DONE)",
+           success ? "success" : "failure", transferStage,
+           (unsigned long long)transferred, (unsigned)f->size,
+-          (unsigned long long)(DWORD)(GetTickCount()-startedAt), success ? 0 : WSAGetLastError());
++          (unsigned long long)(DWORD)(GetTickCount()-startedAt), success ? 0 : WSAGetLastError(), (long)InterlockedCompareExchange(&f->cancelled, 0, 0));
+         fclose(input);
+        }
+       }
+@@ -1540,7 +1564,7 @@
+  rv.requestNumber = 1;
+  const CMStringW configuredPublicIp = getMStringW("Oft2ExternalIP");
+  rv.externalIp = Oft2AdvertisedIPv4(configuredPublicIp.c_str(), T2Utf(m_wszServer));
+- rv.internalIp = rv.externalIp;
++ rv.internalIp = Oft2LocalIPv4(T2Utf(m_wszServer));
+  if (!rv.externalIp) return nullptr;
+  if (Oft2IsPrivateIPv4(rv.externalIp))
+   debugLogA("OFT2 DIRECT WARNING: advertised IP %s is private/unroutable; specify Oft2ExternalIP and forward Oft2ListenPort for Internet clients", ars::ip4(rv.externalIp).c_str());
+--- V7/normal/0.96.8/KICQ/src/proto.cpp
++++ V8/normal/0.96.8/KICQ/src/proto.cpp
+@@ -1174,7 +1174,7 @@
+  rv.cookie = f->cookie;
+  memcpy(rv.capability.data(), cap.data(), 16);
+  rv.externalIp = ip;
+- rv.internalIp = ip;
++ rv.internalIp = Oft2LocalIPv4(T2Utf(m_wszServer));
+  rv.port = f->listener.port();
+  rv.requestNumber = 1;
+  rv.hasOffer = true;
+@@ -1396,19 +1396,43 @@
+         int transferStage = oft2::ST_VALIDATE;
+         uint64_t transferred = 0;
+         const DWORD startedAt = GetTickCount();
++        // V8: Mandarin Web can abort large transfers while the sender floods
++        // the relay at LAN speed (observed OSCAR CANCEL + WSAECONNRESET).
++        // A bounded, optional sender-side rate is used only for >=8 MiB.
++        // Preserve the already-working small ARS path byte-for-byte.
++        const uint32_t configuredKiBps = proto->getDword("ArsUploadKiBps", 1024);
++        const uint32_t rateKiBps = f->size >= 8U * 1024U * 1024U ? configuredKiBps : 0;
++        struct ArsUploadContext {
++         OutgoingThreadArgs *args;
++         DWORD began;
++         uint32_t rate;
++        } upload = { ctx.get(), GetTickCount(), rateKiBps };
++        proto->debugLogA("ARS TX V8: upload limiter=%u KiB/s, file=%u bytes (0=unlimited)",
++          (unsigned)rateKiBps, (unsigned)f->size);
+         success = oft2::send_one(sock, prompt, input, f->size,
+-         [](uint64_t done, uint64_t, void *ctx) -> bool {
+-          auto *args = (OutgoingThreadArgs *)ctx;
++         [](uint64_t done, uint64_t, void *opaque) -> bool {
++          auto *upload = (ArsUploadContext *)opaque;
++          auto *args = upload->args;
+           if (done >= args->file->nextLogBytes || done == args->file->size) {
+-           args->proto->debugLogA("ARS TX V7: file data progress %llu/%u bytes", (unsigned long long)done, (unsigned)args->file->size);
++           args->proto->debugLogA("ARS TX V8: file data progress %llu/%u bytes", (unsigned long long)done, (unsigned)args->file->size);
+            args->file->nextLogBytes = done + 8ULL * 1024ULL * 1024ULL;
+           }
+-          return args->proto->FileProgress(args->file.get(), done);
+-         }, ctx.get(), &transferStage, &transferred);
+-        proto->debugLogA("ARS TX V7: OFT2 result=%s stage=%d dataSent=%llu/%u elapsedMs=%llu WSA=%d (stage 3=data, 4=waiting DONE)",
++          if (!args->proto->FileProgress(args->file.get(), done)) return false;
++          if (upload->rate) {
++           // Integer math is 64-bit; GetTickCount wraparound is well-defined.
++           const uint64_t targetMs = (done * 1000ULL) / (uint64_t(upload->rate) * 1024ULL);
++           const DWORD elapsed = GetTickCount() - upload->began;
++           if (targetMs > elapsed) {
++            const uint64_t remaining = targetMs - elapsed;
++            Sleep((DWORD)(remaining > 250 ? 250 : remaining));
++           }
++          }
++          return !InterlockedCompareExchange(&args->file->cancelled, 0, 0);
++         }, &upload, &transferStage, &transferred);
++        proto->debugLogA("ARS TX V8: OFT2 result=%s stage=%d dataSent=%llu/%u elapsedMs=%llu lastWSA=%d cancelled=%ld (stage 3=data, 4=waiting DONE)",
+           success ? "success" : "failure", transferStage,
+           (unsigned long long)transferred, (unsigned)f->size,
+-          (unsigned long long)(DWORD)(GetTickCount()-startedAt), success ? 0 : WSAGetLastError());
++          (unsigned long long)(DWORD)(GetTickCount()-startedAt), success ? 0 : WSAGetLastError(), (long)InterlockedCompareExchange(&f->cancelled, 0, 0));
+         fclose(input);
+        }
+       }
+@@ -1538,7 +1562,7 @@
+  rv.requestNumber = 1;
+  const CMStringW configuredPublicIp = getMStringW("Oft2ExternalIP");
+  rv.externalIp = Oft2AdvertisedIPv4(configuredPublicIp.c_str(), T2Utf(m_wszServer));
+- rv.internalIp = rv.externalIp;
++ rv.internalIp = Oft2LocalIPv4(T2Utf(m_wszServer));
+  if (!rv.externalIp) return nullptr;
+  if (Oft2IsPrivateIPv4(rv.externalIp))
+   debugLogA("OFT2 DIRECT WARNING: advertised IP %s is private/unroutable; specify Oft2ExternalIP and forward Oft2ListenPort for Internet clients", ars::ip4(rv.externalIp).c_str());
+--- V7/windows-xp-x86/0.96.7/KICQ/src/proto.cpp
++++ V8/windows-xp-x86/0.96.7/KICQ/src/proto.cpp
+@@ -1183,7 +1183,7 @@
+  rv.cookie = f->cookie;
+  memcpy(rv.capability.data(), cap.data(), 16);
+  rv.externalIp = ip;
+- rv.internalIp = ip;
++ rv.internalIp = Oft2LocalIPv4(T2Utf(m_wszServer));
+  rv.port = f->listener.port();
+  rv.requestNumber = 1;
+  rv.hasOffer = true;
+@@ -1405,19 +1405,43 @@
+         int transferStage = oft2::ST_VALIDATE;
+         uint64_t transferred = 0;
+         const DWORD startedAt = GetTickCount();
++        // V8: Mandarin Web can abort large transfers while the sender floods
++        // the relay at LAN speed (observed OSCAR CANCEL + WSAECONNRESET).
++        // A bounded, optional sender-side rate is used only for >=8 MiB.
++        // Preserve the already-working small ARS path byte-for-byte.
++        const uint32_t configuredKiBps = proto->getDword("ArsUploadKiBps", 1024);
++        const uint32_t rateKiBps = f->size >= 8U * 1024U * 1024U ? configuredKiBps : 0;
++        struct ArsUploadContext {
++         OutgoingThreadArgs *args;
++         DWORD began;
++         uint32_t rate;
++        } upload = { ctx.get(), GetTickCount(), rateKiBps };
++        proto->debugLogA("ARS TX V8: upload limiter=%u KiB/s, file=%u bytes (0=unlimited)",
++          (unsigned)rateKiBps, (unsigned)f->size);
+         success = oft2::send_one(sock, prompt, input, f->size,
+-         [](uint64_t done, uint64_t, void *ctx) -> bool {
+-          auto *args = (OutgoingThreadArgs *)ctx;
++         [](uint64_t done, uint64_t, void *opaque) -> bool {
++          auto *upload = (ArsUploadContext *)opaque;
++          auto *args = upload->args;
+           if (done >= args->file->nextLogBytes || done == args->file->size) {
+-           args->proto->debugLogA("ARS TX V7: file data progress %llu/%u bytes", (unsigned long long)done, (unsigned)args->file->size);
++           args->proto->debugLogA("ARS TX V8: file data progress %llu/%u bytes", (unsigned long long)done, (unsigned)args->file->size);
+            args->file->nextLogBytes = done + 8ULL * 1024ULL * 1024ULL;
+           }
+-          return args->proto->FileProgress(args->file.get(), done);
+-         }, ctx.get(), &transferStage, &transferred);
+-        proto->debugLogA("ARS TX V7: OFT2 result=%s stage=%d dataSent=%llu/%u elapsedMs=%llu WSA=%d (stage 3=data, 4=waiting DONE)",
++          if (!args->proto->FileProgress(args->file.get(), done)) return false;
++          if (upload->rate) {
++           // Integer math is 64-bit; GetTickCount wraparound is well-defined.
++           const uint64_t targetMs = (done * 1000ULL) / (uint64_t(upload->rate) * 1024ULL);
++           const DWORD elapsed = GetTickCount() - upload->began;
++           if (targetMs > elapsed) {
++            const uint64_t remaining = targetMs - elapsed;
++            Sleep((DWORD)(remaining > 250 ? 250 : remaining));
++           }
++          }
++          return !InterlockedCompareExchange(&args->file->cancelled, 0, 0);
++         }, &upload, &transferStage, &transferred);
++        proto->debugLogA("ARS TX V8: OFT2 result=%s stage=%d dataSent=%llu/%u elapsedMs=%llu lastWSA=%d cancelled=%ld (stage 3=data, 4=waiting DONE)",
+           success ? "success" : "failure", transferStage,
+           (unsigned long long)transferred, (unsigned)f->size,
+-          (unsigned long long)(DWORD)(GetTickCount()-startedAt), success ? 0 : WSAGetLastError());
++          (unsigned long long)(DWORD)(GetTickCount()-startedAt), success ? 0 : WSAGetLastError(), (long)InterlockedCompareExchange(&f->cancelled, 0, 0));
+         fclose(input);
+        }
+       }
+@@ -1547,7 +1571,7 @@
+  rv.requestNumber = 1;
+  const CMStringW configuredPublicIp = getMStringW("Oft2ExternalIP");
+  rv.externalIp = Oft2AdvertisedIPv4(configuredPublicIp.c_str(), T2Utf(m_wszServer));
+- rv.internalIp = rv.externalIp;
++ rv.internalIp = Oft2LocalIPv4(T2Utf(m_wszServer));
+  if (!rv.externalIp) return nullptr;
+  if (Oft2IsPrivateIPv4(rv.externalIp))
+   debugLogA("OFT2 DIRECT WARNING: advertised IP %s is private/unroutable; specify Oft2ExternalIP and forward Oft2ListenPort for Internet clients", ars::ip4(rv.externalIp).c_str());
+--- V7/windows-xp-x86/0.96.8/KICQ/src/proto.cpp
++++ V8/windows-xp-x86/0.96.8/KICQ/src/proto.cpp
+@@ -1178,7 +1178,7 @@
+  rv.cookie = f->cookie;
+  memcpy(rv.capability.data(), cap.data(), 16);
+  rv.externalIp = ip;
+- rv.internalIp = ip;
++ rv.internalIp = Oft2LocalIPv4(T2Utf(m_wszServer));
+  rv.port = f->listener.port();
+  rv.requestNumber = 1;
+  rv.hasOffer = true;
+@@ -1400,19 +1400,43 @@
+         int transferStage = oft2::ST_VALIDATE;
+         uint64_t transferred = 0;
+         const DWORD startedAt = GetTickCount();
++        // V8: Mandarin Web can abort large transfers while the sender floods
++        // the relay at LAN speed (observed OSCAR CANCEL + WSAECONNRESET).
++        // A bounded, optional sender-side rate is used only for >=8 MiB.
++        // Preserve the already-working small ARS path byte-for-byte.
++        const uint32_t configuredKiBps = proto->getDword("ArsUploadKiBps", 1024);
++        const uint32_t rateKiBps = f->size >= 8U * 1024U * 1024U ? configuredKiBps : 0;
++        struct ArsUploadContext {
++         OutgoingThreadArgs *args;
++         DWORD began;
++         uint32_t rate;
++        } upload = { ctx.get(), GetTickCount(), rateKiBps };
++        proto->debugLogA("ARS TX V8: upload limiter=%u KiB/s, file=%u bytes (0=unlimited)",
++          (unsigned)rateKiBps, (unsigned)f->size);
+         success = oft2::send_one(sock, prompt, input, f->size,
+-         [](uint64_t done, uint64_t, void *ctx) -> bool {
+-          auto *args = (OutgoingThreadArgs *)ctx;
++         [](uint64_t done, uint64_t, void *opaque) -> bool {
++          auto *upload = (ArsUploadContext *)opaque;
++          auto *args = upload->args;
+           if (done >= args->file->nextLogBytes || done == args->file->size) {
+-           args->proto->debugLogA("ARS TX V7: file data progress %llu/%u bytes", (unsigned long long)done, (unsigned)args->file->size);
++           args->proto->debugLogA("ARS TX V8: file data progress %llu/%u bytes", (unsigned long long)done, (unsigned)args->file->size);
+            args->file->nextLogBytes = done + 8ULL * 1024ULL * 1024ULL;
+           }
+-          return args->proto->FileProgress(args->file.get(), done);
+-         }, ctx.get(), &transferStage, &transferred);
+-        proto->debugLogA("ARS TX V7: OFT2 result=%s stage=%d dataSent=%llu/%u elapsedMs=%llu WSA=%d (stage 3=data, 4=waiting DONE)",
++          if (!args->proto->FileProgress(args->file.get(), done)) return false;
++          if (upload->rate) {
++           // Integer math is 64-bit; GetTickCount wraparound is well-defined.
++           const uint64_t targetMs = (done * 1000ULL) / (uint64_t(upload->rate) * 1024ULL);
++           const DWORD elapsed = GetTickCount() - upload->began;
++           if (targetMs > elapsed) {
++            const uint64_t remaining = targetMs - elapsed;
++            Sleep((DWORD)(remaining > 250 ? 250 : remaining));
++           }
++          }
++          return !InterlockedCompareExchange(&args->file->cancelled, 0, 0);
++         }, &upload, &transferStage, &transferred);
++        proto->debugLogA("ARS TX V8: OFT2 result=%s stage=%d dataSent=%llu/%u elapsedMs=%llu lastWSA=%d cancelled=%ld (stage 3=data, 4=waiting DONE)",
+           success ? "success" : "failure", transferStage,
+           (unsigned long long)transferred, (unsigned)f->size,
+-          (unsigned long long)(DWORD)(GetTickCount()-startedAt), success ? 0 : WSAGetLastError());
++          (unsigned long long)(DWORD)(GetTickCount()-startedAt), success ? 0 : WSAGetLastError(), (long)InterlockedCompareExchange(&f->cancelled, 0, 0));
+         fclose(input);
+        }
+       }
+@@ -1542,7 +1566,7 @@
+  rv.requestNumber = 1;
+  const CMStringW configuredPublicIp = getMStringW("Oft2ExternalIP");
+  rv.externalIp = Oft2AdvertisedIPv4(configuredPublicIp.c_str(), T2Utf(m_wszServer));
+- rv.internalIp = rv.externalIp;
++ rv.internalIp = Oft2LocalIPv4(T2Utf(m_wszServer));
+  if (!rv.externalIp) return nullptr;
+  if (Oft2IsPrivateIPv4(rv.externalIp))
+   debugLogA("OFT2 DIRECT WARNING: advertised IP %s is private/unroutable; specify Oft2ExternalIP and forward Oft2ListenPort for Internet clients", ars::ip4(rv.externalIp).c_str());

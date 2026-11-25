@@ -1,0 +1,864 @@
+--- a/normal/0.96.7/KICQ/src/proto.cpp
++++ b/normal/0.96.7/KICQ/src/proto.cpp
+@@ -1108,6 +1108,29 @@
+  return ip;
+ }
+ 
++// Optional direct OFT2 public IPv4 advertised to the peer. A machine behind
++// NAT needs a forwarding rule for Oft2ListenPort as well. Without an override
++// we keep legacy route selection but explicitly warn when it is non-routable.
++static uint32_t Oft2AdvertisedIPv4(const wchar_t *external, const char *server)
++{
++ if (external && *external) {
++  T2Utf utf8(external);
++  const unsigned long net = inet_addr(utf8);
++  if (net != INADDR_NONE && net != INADDR_ANY)
++   return ntohl(net);
++  return 0; // Invalid explicit override: never silently advertise another IP.
++ }
++ return Oft2LocalIPv4(server);
++}
++
++static bool Oft2IsPrivateIPv4(uint32_t ip)
++{
++ const unsigned a = ip >> 24, b = (ip >> 16) & 255;
++ return !ip || a == 0 || a == 10 || a == 127 || a >= 224 ||
++        (a == 169 && b == 254) || (a == 172 && b >= 16 && b <= 31) ||
++        (a == 192 && b == 168) || (a == 100 && b >= 64 && b <= 127);
++}
++
+ // Outgoing direct OFT2 sender. The listener is created BEFORE the ICBM offer.
+ // OSCAR clients behind NAT may require proxy/relay negotiation, not available here.
+ static bool Oft2SendProgress(uint64_t done, uint64_t, void *ctx)
+@@ -1125,11 +1148,12 @@
+ {
+  if (!f || InterlockedCompareExchange(&f->cancelled, 0, 0) || !m_bOnline)
+   return false;
+- if (!f->listener.open()) {
++ if (!f->listener.open(INADDR_ANY, getWord("Oft2ListenPort", 0))) {
+   debugLogA("OFT2 fallback: cannot open TCP listener");
+   return false;
+  }
+- const uint32_t ip = Oft2LocalIPv4(T2Utf(m_wszServer));
++ const CMStringW configuredPublicIp = getMStringW("Oft2ExternalIP");
++ const uint32_t ip = Oft2AdvertisedIPv4(configuredPublicIp.c_str(), T2Utf(m_wszServer));
+  const bytes_t cap = OscarText::unhex(CAP_FILE);
+  if (!ip || cap.size() != 16) {
+   debugLogA("OFT2 fallback: no route to OSCAR server or invalid file capability");
+@@ -1174,6 +1198,8 @@
+  { mir_cslock lk(m_csFiles); f->offerRequestId = req; }
+  Send(OscarPackets::fileRendezvous(receiver, cookie, payload, req));
+  ProtoBroadcastAck(f->contact, ACKTYPE_FILE, ACKRESULT_LISTENING, f.get());
++ if (Oft2IsPrivateIPv4(ip))
++  debugLogA("OFT2 DIRECT WARNING: advertised IP %s is not publicly routable; configure Oft2ExternalIP and forward Oft2ListenPort", ars::ip4(ip).c_str());
+  debugLogA("OFT2 fallback: direct file offer sent to %u, port=%u, local IP=%s (NAT may block it)",
+    (unsigned)f->uin, (unsigned)rv.port, ars::ip4(ip).c_str());
+  return true;
+@@ -1214,6 +1240,14 @@
+ bool CKicqProto::FileProgress(OutgoingFile *file, uint64_t done)
+ {
+  if (InterlockedCompareExchange(&file->cancelled, 0, 0)) return false;
++ // Avoid flooding Miranda's UI with ~2000 synchronous ACKs per 60 MiB.
++ // Always report the first bytes and the exact final byte count.
++ const DWORD tick = GetTickCount();
++ if (done != file->size && file->lastUiTick &&
++     (tick - file->lastUiTick) < 250 &&
++     (done - file->lastUiBytes) < (1024ULL * 1024ULL)) return true;
++ file->lastUiTick = tick;
++ file->lastUiBytes = done;
+  PROTOFILETRANSFERSTATUS status = {};
+  status.flags = PFTS_SENDING;
+  status.totalFiles = 1;
+@@ -1358,14 +1392,25 @@
+         memcpy(prompt + 192, rv.offer.name.c_str(), rv.offer.name.size());
+         proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE, ACKRESULT_CONNECTED, f.get());
+         proto->debugLogA("ARS TX: relay paired, sending OFT2 PROMPT, then awaiting ACK/data/DONE");
++        // Larger send buffer reduces needless sender stalls on high-latency relays.
++        const int socketBuffer = 256 * 1024;
++        setsockopt(sock, SOL_SOCKET, SO_SNDBUF, (const char *)&socketBuffer, sizeof(socketBuffer));
+         int transferStage = oft2::ST_VALIDATE;
++        uint64_t transferred = 0;
++        const DWORD startedAt = GetTickCount();
+         success = oft2::send_one(sock, prompt, input, f->size,
+          [](uint64_t done, uint64_t, void *ctx) -> bool {
+           auto *args = (OutgoingThreadArgs *)ctx;
++          if (done >= args->file->nextLogBytes || done == args->file->size) {
++           args->proto->debugLogA("ARS TX V7: file data progress %llu/%u bytes", (unsigned long long)done, (unsigned)args->file->size);
++           args->file->nextLogBytes = done + 8ULL * 1024ULL * 1024ULL;
++          }
+           return args->proto->FileProgress(args->file.get(), done);
+-         }, ctx.get(), &transferStage);
+-        proto->debugLogA("ARS TX V5: OFT2 result=%s stage=%d (0=validate 1=PROMPT 2=ACK 3=data 4=DONE 5=finished)",
+-          success ? "success" : "failure", transferStage);
++         }, ctx.get(), &transferStage, &transferred);
++        proto->debugLogA("ARS TX V7: OFT2 result=%s stage=%d dataSent=%llu/%u elapsedMs=%llu WSA=%d (stage 3=data, 4=waiting DONE)",
++          success ? "success" : "failure", transferStage,
++          (unsigned long long)transferred, (unsigned)f->size,
++          (unsigned long long)(DWORD)(GetTickCount()-startedAt), success ? 0 : WSAGetLastError());
+         fclose(input);
+        }
+       }
+@@ -1425,10 +1470,17 @@
+     name.resize(required);
+     WideCharToMultiByte(CP_ACP, 0, f->filename.c_str(), -1, &name[0], required, nullptr, nullptr);
+     memcpy(prompt + 192, name.data(), name.size());
++    const int socketBuffer = 256 * 1024;
++    setsockopt(sock, SOL_SOCKET, SO_SNDBUF, (const char *)&socketBuffer, sizeof(socketBuffer));
++    int stage = oft2::ST_VALIDATE;
++    uint64_t sentBytes = 0;
+     success = oft2::send_one(sock, prompt, input, f->size, [](uint64_t done, uint64_t, void *ctx) -> bool {
+       auto *args = (OutgoingThreadArgs *)ctx;
+       return args->proto->FileProgress(args->file.get(), done);
+-     }, ctx.get());
++     }, ctx.get(), &stage, &sentBytes);
++    proto->debugLogA("OFT2 DIRECT V7: result=%s stage=%d dataSent=%llu/%u WSA=%d",
++      success ? "success" : "failure", stage, (unsigned long long)sentBytes,
++      (unsigned)f->size, success ? 0 : WSAGetLastError());
+    }
+    fclose(input);
+   }
+@@ -1473,7 +1525,7 @@
+  f->size = (uint32_t)length;
+  f->viaProxy = mir_wstrlen(m_wszFileProxy) > 0 && (int)m_iFileProxyPort > 0 && (int)m_iFileProxyPort <= 65535;
+  f->uin = uin;
+- if (!f->viaProxy && !f->listener.open()) return nullptr;
++ if (!f->viaProxy && !f->listener.open(INADDR_ANY, getWord("Oft2ListenPort", 0))) return nullptr;
+  uint64_t randomCookie = (uint64_t(GetTickCount64()) << 16) ^ (uint64_t(rand()) << 32) ^ rand();
+  for (int i = 0; i < 8; ++i) f->cookie[i] = uint8_t(randomCookie >> (56 - 8 * i));
+  bytes_t payload;
+@@ -1486,9 +1538,12 @@
+  memcpy(rv.capability.data(), cap.data(), 16);
+  rv.port = f->listener.port();
+  rv.requestNumber = 1;
+- rv.externalIp = Oft2LocalIPv4(T2Utf(m_wszServer));
++ const CMStringW configuredPublicIp = getMStringW("Oft2ExternalIP");
++ rv.externalIp = Oft2AdvertisedIPv4(configuredPublicIp.c_str(), T2Utf(m_wszServer));
+  rv.internalIp = rv.externalIp;
+  if (!rv.externalIp) return nullptr;
++ if (Oft2IsPrivateIPv4(rv.externalIp))
++  debugLogA("OFT2 DIRECT WARNING: advertised IP %s is private/unroutable; specify Oft2ExternalIP and forward Oft2ListenPort for Internet clients", ars::ip4(rv.externalIp).c_str());
+  rv.hasOffer = true;
+  rv.offer.kind = 1;
+  rv.offer.count = 1;
+--- a/normal/0.96.7/KICQ/src/proto.h
++++ b/normal/0.96.7/KICQ/src/proto.h
+@@ -85,6 +85,9 @@
+ 		MCONTACT contact = 0;
+ 		std::wstring path, filename;
+ 		uint32_t size = 0;
++        DWORD lastUiTick = 0;
++        uint64_t lastUiBytes = 0;
++        uint64_t nextLogBytes = 8ULL * 1024ULL * 1024ULL;
+ 		std::array<unsigned char, 8> cookie{};
+ 		oft2::TcpListener listener;
+ 		volatile LONG cancelled = 0;
+--- a/normal/0.96.7/KICQ/src/oft2_transport.h
++++ b/normal/0.96.7/KICQ/src/oft2_transport.h
+@@ -51,14 +51,16 @@
+ // Transfer exactly 'size' bytes; never treat a short read/write as success.
+ // progress may be nullptr. A callback returning false cancels the transfer.
+ typedef bool (*Progress)(uint64_t transferred, uint64_t total, void *context);
+-static inline bool send_file(SOCKET s, FILE *f, uint64_t size, Progress progress, void *context) {
++static inline bool send_file(SOCKET s, FILE *f, uint64_t size, Progress progress, void *context, uint64_t *sentBytes = nullptr) {
++ if (sentBytes) *sentBytes = 0;
+  if (!f) return false;
+- uint8_t buffer[32768]; uint64_t done = 0;
++ uint8_t buffer[65536]; uint64_t done = 0;
+  while (done < size) {
+   size_t wanted = (size_t)((size - done) < sizeof(buffer) ? (size - done) : sizeof(buffer));
+   size_t got = fread(buffer, 1, wanted, f);
+   if (got != wanted || !send_all(s, buffer, got)) return false;
+   done += got;
++  if (sentBytes) *sentBytes = done;
+   if (progress && !progress(done, size, context)) return false;
+  }
+  return true;
+--- a/normal/0.96.7/KICQ/src/oft2_socket_transfer.h
++++ b/normal/0.96.7/KICQ/src/oft2_socket_transfer.h
+@@ -15,8 +15,9 @@
+ // Sending raw data before ACK is forbidden. A successful return requires DONE.
+ static inline bool send_one(SOCKET socket, const uint8_t (&prompt)[HEADER_SIZE],
+                             FILE *input, uint64_t length, Progress progress = nullptr,
+-                            void *ctx = nullptr, int *stage = nullptr) {
++                            void *ctx = nullptr, int *stage = nullptr, uint64_t *dataSent = nullptr) {
+  if (stage) *stage = ST_VALIDATE;
++ if (dataSent) *dataSent = 0;
+  Header h, ack;
+  uint8_t response[HEADER_SIZE];
+  if (!decode(prompt, HEADER_SIZE, h) || h.type != 0x0101 ||
+@@ -31,7 +32,7 @@
+      ack.size != h.size || ack.totalFiles != h.totalFiles ||
+      ack.filesLeft != h.filesLeft || ack.received != 0) return false;
+  if (stage) *stage = ST_DATA;
+- if (!send_file(socket, input, length, progress, ctx)) return false;
++ if (!send_file(socket, input, length, progress, ctx, dataSent)) return false;
+  Header done;
+  if (stage) *stage = ST_DONE;
+  if (!recv_expected(socket, 0x0204, response, done)) return false;
+--- a/normal/0.96.7/KICQ/src/oft2_listener.h
++++ b/normal/0.96.7/KICQ/src/oft2_listener.h
+@@ -16,14 +16,14 @@
+  TcpListener& operator=(const TcpListener&) = delete;
+  ~TcpListener() { close(); }
+  uint16_t port() const { return port_; }
+- bool open(uint32_t address = INADDR_ANY) {
++ bool open(uint32_t address = INADDR_ANY, uint16_t listenPort = 0) {
+   close();
+   SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+   if (s == INVALID_SOCKET) return false;
+   sockaddr_in addr = {};
+   addr.sin_family = AF_INET;
+   addr.sin_addr.s_addr = htonl(address);
+-  addr.sin_port = 0; // let OS allocate an unused port
++  addr.sin_port = htons(listenPort); // 0=ephemeral; fixed port allows explicit NAT forwarding
+   if (bind(s, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) == SOCKET_ERROR ||
+       listen(s, 1) == SOCKET_ERROR) {
+    closesocket(s); return false;
+--- a/normal/0.96.8/KICQ/src/proto.cpp
++++ b/normal/0.96.8/KICQ/src/proto.cpp
+@@ -1106,6 +1106,29 @@
+  return ip;
+ }
+ 
++// Optional direct OFT2 public IPv4 advertised to the peer. A machine behind
++// NAT needs a forwarding rule for Oft2ListenPort as well. Without an override
++// we keep legacy route selection but explicitly warn when it is non-routable.
++static uint32_t Oft2AdvertisedIPv4(const wchar_t *external, const char *server)
++{
++ if (external && *external) {
++  T2Utf utf8(external);
++  const unsigned long net = inet_addr(utf8);
++  if (net != INADDR_NONE && net != INADDR_ANY)
++   return ntohl(net);
++  return 0; // Invalid explicit override: never silently advertise another IP.
++ }
++ return Oft2LocalIPv4(server);
++}
++
++static bool Oft2IsPrivateIPv4(uint32_t ip)
++{
++ const unsigned a = ip >> 24, b = (ip >> 16) & 255;
++ return !ip || a == 0 || a == 10 || a == 127 || a >= 224 ||
++        (a == 169 && b == 254) || (a == 172 && b >= 16 && b <= 31) ||
++        (a == 192 && b == 168) || (a == 100 && b >= 64 && b <= 127);
++}
++
+ // Outgoing direct OFT2 sender. The listener is created BEFORE the ICBM offer.
+ // OSCAR clients behind NAT may require proxy/relay negotiation, not available here.
+ static bool Oft2SendProgress(uint64_t done, uint64_t, void *ctx)
+@@ -1123,11 +1146,12 @@
+ {
+  if (!f || InterlockedCompareExchange(&f->cancelled, 0, 0) || !m_bOnline)
+   return false;
+- if (!f->listener.open()) {
++ if (!f->listener.open(INADDR_ANY, getWord("Oft2ListenPort", 0))) {
+   debugLogA("OFT2 fallback: cannot open TCP listener");
+   return false;
+  }
+- const uint32_t ip = Oft2LocalIPv4(T2Utf(m_wszServer));
++ const CMStringW configuredPublicIp = getMStringW("Oft2ExternalIP");
++ const uint32_t ip = Oft2AdvertisedIPv4(configuredPublicIp.c_str(), T2Utf(m_wszServer));
+  const bytes_t cap = OscarText::unhex(CAP_FILE);
+  if (!ip || cap.size() != 16) {
+   debugLogA("OFT2 fallback: no route to OSCAR server or invalid file capability");
+@@ -1172,6 +1196,8 @@
+  { mir_cslock lk(m_csFiles); f->offerRequestId = req; }
+  Send(OscarPackets::fileRendezvous(receiver, cookie, payload, req));
+  ProtoBroadcastAck(f->contact, ACKTYPE_FILE, ACKRESULT_LISTENING, f.get());
++ if (Oft2IsPrivateIPv4(ip))
++  debugLogA("OFT2 DIRECT WARNING: advertised IP %s is not publicly routable; configure Oft2ExternalIP and forward Oft2ListenPort", ars::ip4(ip).c_str());
+  debugLogA("OFT2 fallback: direct file offer sent to %u, port=%u, local IP=%s (NAT may block it)",
+    (unsigned)f->uin, (unsigned)rv.port, ars::ip4(ip).c_str());
+  return true;
+@@ -1212,6 +1238,14 @@
+ bool CKicqProto::FileProgress(OutgoingFile *file, uint64_t done)
+ {
+  if (InterlockedCompareExchange(&file->cancelled, 0, 0)) return false;
++ // Avoid flooding Miranda's UI with ~2000 synchronous ACKs per 60 MiB.
++ // Always report the first bytes and the exact final byte count.
++ const DWORD tick = GetTickCount();
++ if (done != file->size && file->lastUiTick &&
++     (tick - file->lastUiTick) < 250 &&
++     (done - file->lastUiBytes) < (1024ULL * 1024ULL)) return true;
++ file->lastUiTick = tick;
++ file->lastUiBytes = done;
+  PROTOFILETRANSFERSTATUS status = {};
+  status.flags = PFTS_SENDING;
+  status.totalFiles = 1;
+@@ -1356,14 +1390,25 @@
+         memcpy(prompt + 192, rv.offer.name.c_str(), rv.offer.name.size());
+         proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE, ACKRESULT_CONNECTED, f.get());
+         proto->debugLogA("ARS TX: relay paired, sending OFT2 PROMPT, then awaiting ACK/data/DONE");
++        // Larger send buffer reduces needless sender stalls on high-latency relays.
++        const int socketBuffer = 256 * 1024;
++        setsockopt(sock, SOL_SOCKET, SO_SNDBUF, (const char *)&socketBuffer, sizeof(socketBuffer));
+         int transferStage = oft2::ST_VALIDATE;
++        uint64_t transferred = 0;
++        const DWORD startedAt = GetTickCount();
+         success = oft2::send_one(sock, prompt, input, f->size,
+          [](uint64_t done, uint64_t, void *ctx) -> bool {
+           auto *args = (OutgoingThreadArgs *)ctx;
++          if (done >= args->file->nextLogBytes || done == args->file->size) {
++           args->proto->debugLogA("ARS TX V7: file data progress %llu/%u bytes", (unsigned long long)done, (unsigned)args->file->size);
++           args->file->nextLogBytes = done + 8ULL * 1024ULL * 1024ULL;
++          }
+           return args->proto->FileProgress(args->file.get(), done);
+-         }, ctx.get(), &transferStage);
+-        proto->debugLogA("ARS TX V5: OFT2 result=%s stage=%d (0=validate 1=PROMPT 2=ACK 3=data 4=DONE 5=finished)",
+-          success ? "success" : "failure", transferStage);
++         }, ctx.get(), &transferStage, &transferred);
++        proto->debugLogA("ARS TX V7: OFT2 result=%s stage=%d dataSent=%llu/%u elapsedMs=%llu WSA=%d (stage 3=data, 4=waiting DONE)",
++          success ? "success" : "failure", transferStage,
++          (unsigned long long)transferred, (unsigned)f->size,
++          (unsigned long long)(DWORD)(GetTickCount()-startedAt), success ? 0 : WSAGetLastError());
+         fclose(input);
+        }
+       }
+@@ -1423,10 +1468,17 @@
+     name.resize(required);
+     WideCharToMultiByte(CP_ACP, 0, f->filename.c_str(), -1, &name[0], required, nullptr, nullptr);
+     memcpy(prompt + 192, name.data(), name.size());
++    const int socketBuffer = 256 * 1024;
++    setsockopt(sock, SOL_SOCKET, SO_SNDBUF, (const char *)&socketBuffer, sizeof(socketBuffer));
++    int stage = oft2::ST_VALIDATE;
++    uint64_t sentBytes = 0;
+     success = oft2::send_one(sock, prompt, input, f->size, [](uint64_t done, uint64_t, void *ctx) -> bool {
+       auto *args = (OutgoingThreadArgs *)ctx;
+       return args->proto->FileProgress(args->file.get(), done);
+-     }, ctx.get());
++     }, ctx.get(), &stage, &sentBytes);
++    proto->debugLogA("OFT2 DIRECT V7: result=%s stage=%d dataSent=%llu/%u WSA=%d",
++      success ? "success" : "failure", stage, (unsigned long long)sentBytes,
++      (unsigned)f->size, success ? 0 : WSAGetLastError());
+    }
+    fclose(input);
+   }
+@@ -1471,7 +1523,7 @@
+  f->size = (uint32_t)length;
+  f->viaProxy = mir_wstrlen(m_wszFileProxy) > 0 && (int)m_iFileProxyPort > 0 && (int)m_iFileProxyPort <= 65535;
+  f->uin = uin;
+- if (!f->viaProxy && !f->listener.open()) return nullptr;
++ if (!f->viaProxy && !f->listener.open(INADDR_ANY, getWord("Oft2ListenPort", 0))) return nullptr;
+  uint64_t randomCookie = (uint64_t(GetTickCount64()) << 16) ^ (uint64_t(rand()) << 32) ^ rand();
+  for (int i = 0; i < 8; ++i) f->cookie[i] = uint8_t(randomCookie >> (56 - 8 * i));
+  bytes_t payload;
+@@ -1484,9 +1536,12 @@
+  memcpy(rv.capability.data(), cap.data(), 16);
+  rv.port = f->listener.port();
+  rv.requestNumber = 1;
+- rv.externalIp = Oft2LocalIPv4(T2Utf(m_wszServer));
++ const CMStringW configuredPublicIp = getMStringW("Oft2ExternalIP");
++ rv.externalIp = Oft2AdvertisedIPv4(configuredPublicIp.c_str(), T2Utf(m_wszServer));
+  rv.internalIp = rv.externalIp;
+  if (!rv.externalIp) return nullptr;
++ if (Oft2IsPrivateIPv4(rv.externalIp))
++  debugLogA("OFT2 DIRECT WARNING: advertised IP %s is private/unroutable; specify Oft2ExternalIP and forward Oft2ListenPort for Internet clients", ars::ip4(rv.externalIp).c_str());
+  rv.hasOffer = true;
+  rv.offer.kind = 1;
+  rv.offer.count = 1;
+--- a/normal/0.96.8/KICQ/src/proto.h
++++ b/normal/0.96.8/KICQ/src/proto.h
+@@ -85,6 +85,9 @@
+ 		MCONTACT contact = 0;
+ 		std::wstring path, filename;
+ 		uint32_t size = 0;
++        DWORD lastUiTick = 0;
++        uint64_t lastUiBytes = 0;
++        uint64_t nextLogBytes = 8ULL * 1024ULL * 1024ULL;
+ 		std::array<unsigned char, 8> cookie{};
+ 		oft2::TcpListener listener;
+ 		volatile LONG cancelled = 0;
+--- a/normal/0.96.8/KICQ/src/oft2_transport.h
++++ b/normal/0.96.8/KICQ/src/oft2_transport.h
+@@ -51,14 +51,16 @@
+ // Transfer exactly 'size' bytes; never treat a short read/write as success.
+ // progress may be nullptr. A callback returning false cancels the transfer.
+ typedef bool (*Progress)(uint64_t transferred, uint64_t total, void *context);
+-static inline bool send_file(SOCKET s, FILE *f, uint64_t size, Progress progress, void *context) {
++static inline bool send_file(SOCKET s, FILE *f, uint64_t size, Progress progress, void *context, uint64_t *sentBytes = nullptr) {
++ if (sentBytes) *sentBytes = 0;
+  if (!f) return false;
+- uint8_t buffer[32768]; uint64_t done = 0;
++ uint8_t buffer[65536]; uint64_t done = 0;
+  while (done < size) {
+   size_t wanted = (size_t)((size - done) < sizeof(buffer) ? (size - done) : sizeof(buffer));
+   size_t got = fread(buffer, 1, wanted, f);
+   if (got != wanted || !send_all(s, buffer, got)) return false;
+   done += got;
++  if (sentBytes) *sentBytes = done;
+   if (progress && !progress(done, size, context)) return false;
+  }
+  return true;
+--- a/normal/0.96.8/KICQ/src/oft2_socket_transfer.h
++++ b/normal/0.96.8/KICQ/src/oft2_socket_transfer.h
+@@ -15,8 +15,9 @@
+ // Sending raw data before ACK is forbidden. A successful return requires DONE.
+ static inline bool send_one(SOCKET socket, const uint8_t (&prompt)[HEADER_SIZE],
+                             FILE *input, uint64_t length, Progress progress = nullptr,
+-                            void *ctx = nullptr, int *stage = nullptr) {
++                            void *ctx = nullptr, int *stage = nullptr, uint64_t *dataSent = nullptr) {
+  if (stage) *stage = ST_VALIDATE;
++ if (dataSent) *dataSent = 0;
+  Header h, ack;
+  uint8_t response[HEADER_SIZE];
+  if (!decode(prompt, HEADER_SIZE, h) || h.type != 0x0101 ||
+@@ -31,7 +32,7 @@
+      ack.size != h.size || ack.totalFiles != h.totalFiles ||
+      ack.filesLeft != h.filesLeft || ack.received != 0) return false;
+  if (stage) *stage = ST_DATA;
+- if (!send_file(socket, input, length, progress, ctx)) return false;
++ if (!send_file(socket, input, length, progress, ctx, dataSent)) return false;
+  Header done;
+  if (stage) *stage = ST_DONE;
+  if (!recv_expected(socket, 0x0204, response, done)) return false;
+--- a/normal/0.96.8/KICQ/src/oft2_listener.h
++++ b/normal/0.96.8/KICQ/src/oft2_listener.h
+@@ -16,14 +16,14 @@
+  TcpListener& operator=(const TcpListener&) = delete;
+  ~TcpListener() { close(); }
+  uint16_t port() const { return port_; }
+- bool open(uint32_t address = INADDR_ANY) {
++ bool open(uint32_t address = INADDR_ANY, uint16_t listenPort = 0) {
+   close();
+   SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+   if (s == INVALID_SOCKET) return false;
+   sockaddr_in addr = {};
+   addr.sin_family = AF_INET;
+   addr.sin_addr.s_addr = htonl(address);
+-  addr.sin_port = 0; // let OS allocate an unused port
++  addr.sin_port = htons(listenPort); // 0=ephemeral; fixed port allows explicit NAT forwarding
+   if (bind(s, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) == SOCKET_ERROR ||
+       listen(s, 1) == SOCKET_ERROR) {
+    closesocket(s); return false;
+--- a/windows-xp-x86/0.96.7/KICQ/src/proto.cpp
++++ b/windows-xp-x86/0.96.7/KICQ/src/proto.cpp
+@@ -1115,6 +1115,29 @@
+  return ip;
+ }
+ 
++// Optional direct OFT2 public IPv4 advertised to the peer. A machine behind
++// NAT needs a forwarding rule for Oft2ListenPort as well. Without an override
++// we keep legacy route selection but explicitly warn when it is non-routable.
++static uint32_t Oft2AdvertisedIPv4(const wchar_t *external, const char *server)
++{
++ if (external && *external) {
++  T2Utf utf8(external);
++  const unsigned long net = inet_addr(utf8);
++  if (net != INADDR_NONE && net != INADDR_ANY)
++   return ntohl(net);
++  return 0; // Invalid explicit override: never silently advertise another IP.
++ }
++ return Oft2LocalIPv4(server);
++}
++
++static bool Oft2IsPrivateIPv4(uint32_t ip)
++{
++ const unsigned a = ip >> 24, b = (ip >> 16) & 255;
++ return !ip || a == 0 || a == 10 || a == 127 || a >= 224 ||
++        (a == 169 && b == 254) || (a == 172 && b >= 16 && b <= 31) ||
++        (a == 192 && b == 168) || (a == 100 && b >= 64 && b <= 127);
++}
++
+ // Outgoing direct OFT2 sender. The listener is created BEFORE the ICBM offer.
+ // OSCAR clients behind NAT may require proxy/relay negotiation, not available here.
+ static bool Oft2SendProgress(uint64_t done, uint64_t, void *ctx)
+@@ -1132,11 +1155,12 @@
+ {
+  if (!f || InterlockedCompareExchange(&f->cancelled, 0, 0) || !m_bOnline)
+   return false;
+- if (!f->listener.open()) {
++ if (!f->listener.open(INADDR_ANY, getWord("Oft2ListenPort", 0))) {
+   debugLogA("OFT2 fallback: cannot open TCP listener");
+   return false;
+  }
+- const uint32_t ip = Oft2LocalIPv4(T2Utf(m_wszServer));
++ const CMStringW configuredPublicIp = getMStringW("Oft2ExternalIP");
++ const uint32_t ip = Oft2AdvertisedIPv4(configuredPublicIp.c_str(), T2Utf(m_wszServer));
+  const bytes_t cap = OscarText::unhex(CAP_FILE);
+  if (!ip || cap.size() != 16) {
+   debugLogA("OFT2 fallback: no route to OSCAR server or invalid file capability");
+@@ -1181,6 +1205,8 @@
+  { mir_cslock lk(m_csFiles); f->offerRequestId = req; }
+  Send(OscarPackets::fileRendezvous(receiver, cookie, payload, req));
+  ProtoBroadcastAck(f->contact, ACKTYPE_FILE, ACKRESULT_LISTENING, f.get());
++ if (Oft2IsPrivateIPv4(ip))
++  debugLogA("OFT2 DIRECT WARNING: advertised IP %s is not publicly routable; configure Oft2ExternalIP and forward Oft2ListenPort", ars::ip4(ip).c_str());
+  debugLogA("OFT2 fallback: direct file offer sent to %u, port=%u, local IP=%s (NAT may block it)",
+    (unsigned)f->uin, (unsigned)rv.port, ars::ip4(ip).c_str());
+  return true;
+@@ -1221,6 +1247,14 @@
+ bool CKicqProto::FileProgress(OutgoingFile *file, uint64_t done)
+ {
+  if (InterlockedCompareExchange(&file->cancelled, 0, 0)) return false;
++ // Avoid flooding Miranda's UI with ~2000 synchronous ACKs per 60 MiB.
++ // Always report the first bytes and the exact final byte count.
++ const DWORD tick = GetTickCount();
++ if (done != file->size && file->lastUiTick &&
++     (tick - file->lastUiTick) < 250 &&
++     (done - file->lastUiBytes) < (1024ULL * 1024ULL)) return true;
++ file->lastUiTick = tick;
++ file->lastUiBytes = done;
+  PROTOFILETRANSFERSTATUS status = {};
+  status.flags = PFTS_SENDING;
+  status.totalFiles = 1;
+@@ -1365,14 +1399,25 @@
+         memcpy(prompt + 192, rv.offer.name.c_str(), rv.offer.name.size());
+         proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE, ACKRESULT_CONNECTED, f.get());
+         proto->debugLogA("ARS TX: relay paired, sending OFT2 PROMPT, then awaiting ACK/data/DONE");
++        // Larger send buffer reduces needless sender stalls on high-latency relays.
++        const int socketBuffer = 256 * 1024;
++        setsockopt(sock, SOL_SOCKET, SO_SNDBUF, (const char *)&socketBuffer, sizeof(socketBuffer));
+         int transferStage = oft2::ST_VALIDATE;
++        uint64_t transferred = 0;
++        const DWORD startedAt = GetTickCount();
+         success = oft2::send_one(sock, prompt, input, f->size,
+          [](uint64_t done, uint64_t, void *ctx) -> bool {
+           auto *args = (OutgoingThreadArgs *)ctx;
++          if (done >= args->file->nextLogBytes || done == args->file->size) {
++           args->proto->debugLogA("ARS TX V7: file data progress %llu/%u bytes", (unsigned long long)done, (unsigned)args->file->size);
++           args->file->nextLogBytes = done + 8ULL * 1024ULL * 1024ULL;
++          }
+           return args->proto->FileProgress(args->file.get(), done);
+-         }, ctx.get(), &transferStage);
+-        proto->debugLogA("ARS TX V5: OFT2 result=%s stage=%d (0=validate 1=PROMPT 2=ACK 3=data 4=DONE 5=finished)",
+-          success ? "success" : "failure", transferStage);
++         }, ctx.get(), &transferStage, &transferred);
++        proto->debugLogA("ARS TX V7: OFT2 result=%s stage=%d dataSent=%llu/%u elapsedMs=%llu WSA=%d (stage 3=data, 4=waiting DONE)",
++          success ? "success" : "failure", transferStage,
++          (unsigned long long)transferred, (unsigned)f->size,
++          (unsigned long long)(DWORD)(GetTickCount()-startedAt), success ? 0 : WSAGetLastError());
+         fclose(input);
+        }
+       }
+@@ -1432,10 +1477,17 @@
+     name.resize(required);
+     WideCharToMultiByte(CP_ACP, 0, f->filename.c_str(), -1, &name[0], required, nullptr, nullptr);
+     memcpy(prompt + 192, name.data(), name.size());
++    const int socketBuffer = 256 * 1024;
++    setsockopt(sock, SOL_SOCKET, SO_SNDBUF, (const char *)&socketBuffer, sizeof(socketBuffer));
++    int stage = oft2::ST_VALIDATE;
++    uint64_t sentBytes = 0;
+     success = oft2::send_one(sock, prompt, input, f->size, [](uint64_t done, uint64_t, void *ctx) -> bool {
+       auto *args = (OutgoingThreadArgs *)ctx;
+       return args->proto->FileProgress(args->file.get(), done);
+-     }, ctx.get());
++     }, ctx.get(), &stage, &sentBytes);
++    proto->debugLogA("OFT2 DIRECT V7: result=%s stage=%d dataSent=%llu/%u WSA=%d",
++      success ? "success" : "failure", stage, (unsigned long long)sentBytes,
++      (unsigned)f->size, success ? 0 : WSAGetLastError());
+    }
+    fclose(input);
+   }
+@@ -1480,7 +1532,7 @@
+  f->size = (uint32_t)length;
+  f->viaProxy = mir_wstrlen(m_wszFileProxy) > 0 && (int)m_iFileProxyPort > 0 && (int)m_iFileProxyPort <= 65535;
+  f->uin = uin;
+- if (!f->viaProxy && !f->listener.open()) return nullptr;
++ if (!f->viaProxy && !f->listener.open(INADDR_ANY, getWord("Oft2ListenPort", 0))) return nullptr;
+  uint64_t randomCookie = (uint64_t(GetTickCount()) << 16) ^ (uint64_t(rand()) << 32) ^ rand();
+  for (int i = 0; i < 8; ++i) f->cookie[i] = uint8_t(randomCookie >> (56 - 8 * i));
+  bytes_t payload;
+@@ -1493,9 +1545,12 @@
+  memcpy(rv.capability.data(), cap.data(), 16);
+  rv.port = f->listener.port();
+  rv.requestNumber = 1;
+- rv.externalIp = Oft2LocalIPv4(T2Utf(m_wszServer));
++ const CMStringW configuredPublicIp = getMStringW("Oft2ExternalIP");
++ rv.externalIp = Oft2AdvertisedIPv4(configuredPublicIp.c_str(), T2Utf(m_wszServer));
+  rv.internalIp = rv.externalIp;
+  if (!rv.externalIp) return nullptr;
++ if (Oft2IsPrivateIPv4(rv.externalIp))
++  debugLogA("OFT2 DIRECT WARNING: advertised IP %s is private/unroutable; specify Oft2ExternalIP and forward Oft2ListenPort for Internet clients", ars::ip4(rv.externalIp).c_str());
+  rv.hasOffer = true;
+  rv.offer.kind = 1;
+  rv.offer.count = 1;
+--- a/windows-xp-x86/0.96.7/KICQ/src/proto.h
++++ b/windows-xp-x86/0.96.7/KICQ/src/proto.h
+@@ -85,6 +85,9 @@
+ 		MCONTACT contact = 0;
+ 		std::wstring path, filename;
+ 		uint32_t size = 0;
++        DWORD lastUiTick = 0;
++        uint64_t lastUiBytes = 0;
++        uint64_t nextLogBytes = 8ULL * 1024ULL * 1024ULL;
+ 		std::array<unsigned char, 8> cookie{};
+ 		oft2::TcpListener listener;
+ 		volatile LONG cancelled = 0;
+--- a/windows-xp-x86/0.96.7/KICQ/src/oft2_transport.h
++++ b/windows-xp-x86/0.96.7/KICQ/src/oft2_transport.h
+@@ -51,14 +51,16 @@
+ // Transfer exactly 'size' bytes; never treat a short read/write as success.
+ // progress may be nullptr. A callback returning false cancels the transfer.
+ typedef bool (*Progress)(uint64_t transferred, uint64_t total, void *context);
+-static inline bool send_file(SOCKET s, FILE *f, uint64_t size, Progress progress, void *context) {
++static inline bool send_file(SOCKET s, FILE *f, uint64_t size, Progress progress, void *context, uint64_t *sentBytes = nullptr) {
++ if (sentBytes) *sentBytes = 0;
+  if (!f) return false;
+- uint8_t buffer[32768]; uint64_t done = 0;
++ uint8_t buffer[65536]; uint64_t done = 0;
+  while (done < size) {
+   size_t wanted = (size_t)((size - done) < sizeof(buffer) ? (size - done) : sizeof(buffer));
+   size_t got = fread(buffer, 1, wanted, f);
+   if (got != wanted || !send_all(s, buffer, got)) return false;
+   done += got;
++  if (sentBytes) *sentBytes = done;
+   if (progress && !progress(done, size, context)) return false;
+  }
+  return true;
+--- a/windows-xp-x86/0.96.7/KICQ/src/oft2_socket_transfer.h
++++ b/windows-xp-x86/0.96.7/KICQ/src/oft2_socket_transfer.h
+@@ -15,8 +15,9 @@
+ // Sending raw data before ACK is forbidden. A successful return requires DONE.
+ static inline bool send_one(SOCKET socket, const uint8_t (&prompt)[HEADER_SIZE],
+                             FILE *input, uint64_t length, Progress progress = nullptr,
+-                            void *ctx = nullptr, int *stage = nullptr) {
++                            void *ctx = nullptr, int *stage = nullptr, uint64_t *dataSent = nullptr) {
+  if (stage) *stage = ST_VALIDATE;
++ if (dataSent) *dataSent = 0;
+  Header h, ack;
+  uint8_t response[HEADER_SIZE];
+  if (!decode(prompt, HEADER_SIZE, h) || h.type != 0x0101 ||
+@@ -31,7 +32,7 @@
+      ack.size != h.size || ack.totalFiles != h.totalFiles ||
+      ack.filesLeft != h.filesLeft || ack.received != 0) return false;
+  if (stage) *stage = ST_DATA;
+- if (!send_file(socket, input, length, progress, ctx)) return false;
++ if (!send_file(socket, input, length, progress, ctx, dataSent)) return false;
+  Header done;
+  if (stage) *stage = ST_DONE;
+  if (!recv_expected(socket, 0x0204, response, done)) return false;
+--- a/windows-xp-x86/0.96.7/KICQ/src/oft2_listener.h
++++ b/windows-xp-x86/0.96.7/KICQ/src/oft2_listener.h
+@@ -16,14 +16,14 @@
+  TcpListener& operator=(const TcpListener&) = delete;
+  ~TcpListener() { close(); }
+  uint16_t port() const { return port_; }
+- bool open(uint32_t address = INADDR_ANY) {
++ bool open(uint32_t address = INADDR_ANY, uint16_t listenPort = 0) {
+   close();
+   SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+   if (s == INVALID_SOCKET) return false;
+   sockaddr_in addr = {};
+   addr.sin_family = AF_INET;
+   addr.sin_addr.s_addr = htonl(address);
+-  addr.sin_port = 0; // let OS allocate an unused port
++  addr.sin_port = htons(listenPort); // 0=ephemeral; fixed port allows explicit NAT forwarding
+   if (bind(s, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) == SOCKET_ERROR ||
+       listen(s, 1) == SOCKET_ERROR) {
+    closesocket(s); return false;
+--- a/windows-xp-x86/0.96.8/KICQ/src/proto.cpp
++++ b/windows-xp-x86/0.96.8/KICQ/src/proto.cpp
+@@ -1110,6 +1110,29 @@
+  return ip;
+ }
+ 
++// Optional direct OFT2 public IPv4 advertised to the peer. A machine behind
++// NAT needs a forwarding rule for Oft2ListenPort as well. Without an override
++// we keep legacy route selection but explicitly warn when it is non-routable.
++static uint32_t Oft2AdvertisedIPv4(const wchar_t *external, const char *server)
++{
++ if (external && *external) {
++  T2Utf utf8(external);
++  const unsigned long net = inet_addr(utf8);
++  if (net != INADDR_NONE && net != INADDR_ANY)
++   return ntohl(net);
++  return 0; // Invalid explicit override: never silently advertise another IP.
++ }
++ return Oft2LocalIPv4(server);
++}
++
++static bool Oft2IsPrivateIPv4(uint32_t ip)
++{
++ const unsigned a = ip >> 24, b = (ip >> 16) & 255;
++ return !ip || a == 0 || a == 10 || a == 127 || a >= 224 ||
++        (a == 169 && b == 254) || (a == 172 && b >= 16 && b <= 31) ||
++        (a == 192 && b == 168) || (a == 100 && b >= 64 && b <= 127);
++}
++
+ // Outgoing direct OFT2 sender. The listener is created BEFORE the ICBM offer.
+ // OSCAR clients behind NAT may require proxy/relay negotiation, not available here.
+ static bool Oft2SendProgress(uint64_t done, uint64_t, void *ctx)
+@@ -1127,11 +1150,12 @@
+ {
+  if (!f || InterlockedCompareExchange(&f->cancelled, 0, 0) || !m_bOnline)
+   return false;
+- if (!f->listener.open()) {
++ if (!f->listener.open(INADDR_ANY, getWord("Oft2ListenPort", 0))) {
+   debugLogA("OFT2 fallback: cannot open TCP listener");
+   return false;
+  }
+- const uint32_t ip = Oft2LocalIPv4(T2Utf(m_wszServer));
++ const CMStringW configuredPublicIp = getMStringW("Oft2ExternalIP");
++ const uint32_t ip = Oft2AdvertisedIPv4(configuredPublicIp.c_str(), T2Utf(m_wszServer));
+  const bytes_t cap = OscarText::unhex(CAP_FILE);
+  if (!ip || cap.size() != 16) {
+   debugLogA("OFT2 fallback: no route to OSCAR server or invalid file capability");
+@@ -1176,6 +1200,8 @@
+  { mir_cslock lk(m_csFiles); f->offerRequestId = req; }
+  Send(OscarPackets::fileRendezvous(receiver, cookie, payload, req));
+  ProtoBroadcastAck(f->contact, ACKTYPE_FILE, ACKRESULT_LISTENING, f.get());
++ if (Oft2IsPrivateIPv4(ip))
++  debugLogA("OFT2 DIRECT WARNING: advertised IP %s is not publicly routable; configure Oft2ExternalIP and forward Oft2ListenPort", ars::ip4(ip).c_str());
+  debugLogA("OFT2 fallback: direct file offer sent to %u, port=%u, local IP=%s (NAT may block it)",
+    (unsigned)f->uin, (unsigned)rv.port, ars::ip4(ip).c_str());
+  return true;
+@@ -1216,6 +1242,14 @@
+ bool CKicqProto::FileProgress(OutgoingFile *file, uint64_t done)
+ {
+  if (InterlockedCompareExchange(&file->cancelled, 0, 0)) return false;
++ // Avoid flooding Miranda's UI with ~2000 synchronous ACKs per 60 MiB.
++ // Always report the first bytes and the exact final byte count.
++ const DWORD tick = GetTickCount();
++ if (done != file->size && file->lastUiTick &&
++     (tick - file->lastUiTick) < 250 &&
++     (done - file->lastUiBytes) < (1024ULL * 1024ULL)) return true;
++ file->lastUiTick = tick;
++ file->lastUiBytes = done;
+  PROTOFILETRANSFERSTATUS status = {};
+  status.flags = PFTS_SENDING;
+  status.totalFiles = 1;
+@@ -1360,14 +1394,25 @@
+         memcpy(prompt + 192, rv.offer.name.c_str(), rv.offer.name.size());
+         proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE, ACKRESULT_CONNECTED, f.get());
+         proto->debugLogA("ARS TX: relay paired, sending OFT2 PROMPT, then awaiting ACK/data/DONE");
++        // Larger send buffer reduces needless sender stalls on high-latency relays.
++        const int socketBuffer = 256 * 1024;
++        setsockopt(sock, SOL_SOCKET, SO_SNDBUF, (const char *)&socketBuffer, sizeof(socketBuffer));
+         int transferStage = oft2::ST_VALIDATE;
++        uint64_t transferred = 0;
++        const DWORD startedAt = GetTickCount();
+         success = oft2::send_one(sock, prompt, input, f->size,
+          [](uint64_t done, uint64_t, void *ctx) -> bool {
+           auto *args = (OutgoingThreadArgs *)ctx;
++          if (done >= args->file->nextLogBytes || done == args->file->size) {
++           args->proto->debugLogA("ARS TX V7: file data progress %llu/%u bytes", (unsigned long long)done, (unsigned)args->file->size);
++           args->file->nextLogBytes = done + 8ULL * 1024ULL * 1024ULL;
++          }
+           return args->proto->FileProgress(args->file.get(), done);
+-         }, ctx.get(), &transferStage);
+-        proto->debugLogA("ARS TX V5: OFT2 result=%s stage=%d (0=validate 1=PROMPT 2=ACK 3=data 4=DONE 5=finished)",
+-          success ? "success" : "failure", transferStage);
++         }, ctx.get(), &transferStage, &transferred);
++        proto->debugLogA("ARS TX V7: OFT2 result=%s stage=%d dataSent=%llu/%u elapsedMs=%llu WSA=%d (stage 3=data, 4=waiting DONE)",
++          success ? "success" : "failure", transferStage,
++          (unsigned long long)transferred, (unsigned)f->size,
++          (unsigned long long)(DWORD)(GetTickCount()-startedAt), success ? 0 : WSAGetLastError());
+         fclose(input);
+        }
+       }
+@@ -1427,10 +1472,17 @@
+     name.resize(required);
+     WideCharToMultiByte(CP_ACP, 0, f->filename.c_str(), -1, &name[0], required, nullptr, nullptr);
+     memcpy(prompt + 192, name.data(), name.size());
++    const int socketBuffer = 256 * 1024;
++    setsockopt(sock, SOL_SOCKET, SO_SNDBUF, (const char *)&socketBuffer, sizeof(socketBuffer));
++    int stage = oft2::ST_VALIDATE;
++    uint64_t sentBytes = 0;
+     success = oft2::send_one(sock, prompt, input, f->size, [](uint64_t done, uint64_t, void *ctx) -> bool {
+       auto *args = (OutgoingThreadArgs *)ctx;
+       return args->proto->FileProgress(args->file.get(), done);
+-     }, ctx.get());
++     }, ctx.get(), &stage, &sentBytes);
++    proto->debugLogA("OFT2 DIRECT V7: result=%s stage=%d dataSent=%llu/%u WSA=%d",
++      success ? "success" : "failure", stage, (unsigned long long)sentBytes,
++      (unsigned)f->size, success ? 0 : WSAGetLastError());
+    }
+    fclose(input);
+   }
+@@ -1475,7 +1527,7 @@
+  f->size = (uint32_t)length;
+  f->viaProxy = mir_wstrlen(m_wszFileProxy) > 0 && (int)m_iFileProxyPort > 0 && (int)m_iFileProxyPort <= 65535;
+  f->uin = uin;
+- if (!f->viaProxy && !f->listener.open()) return nullptr;
++ if (!f->viaProxy && !f->listener.open(INADDR_ANY, getWord("Oft2ListenPort", 0))) return nullptr;
+  uint64_t randomCookie = (uint64_t(GetTickCount()) << 16) ^ (uint64_t(rand()) << 32) ^ rand();
+  for (int i = 0; i < 8; ++i) f->cookie[i] = uint8_t(randomCookie >> (56 - 8 * i));
+  bytes_t payload;
+@@ -1488,9 +1540,12 @@
+  memcpy(rv.capability.data(), cap.data(), 16);
+  rv.port = f->listener.port();
+  rv.requestNumber = 1;
+- rv.externalIp = Oft2LocalIPv4(T2Utf(m_wszServer));
++ const CMStringW configuredPublicIp = getMStringW("Oft2ExternalIP");
++ rv.externalIp = Oft2AdvertisedIPv4(configuredPublicIp.c_str(), T2Utf(m_wszServer));
+  rv.internalIp = rv.externalIp;
+  if (!rv.externalIp) return nullptr;
++ if (Oft2IsPrivateIPv4(rv.externalIp))
++  debugLogA("OFT2 DIRECT WARNING: advertised IP %s is private/unroutable; specify Oft2ExternalIP and forward Oft2ListenPort for Internet clients", ars::ip4(rv.externalIp).c_str());
+  rv.hasOffer = true;
+  rv.offer.kind = 1;
+  rv.offer.count = 1;
+--- a/windows-xp-x86/0.96.8/KICQ/src/proto.h
++++ b/windows-xp-x86/0.96.8/KICQ/src/proto.h
+@@ -85,6 +85,9 @@
+ 		MCONTACT contact = 0;
+ 		std::wstring path, filename;
+ 		uint32_t size = 0;
++        DWORD lastUiTick = 0;
++        uint64_t lastUiBytes = 0;
++        uint64_t nextLogBytes = 8ULL * 1024ULL * 1024ULL;
+ 		std::array<unsigned char, 8> cookie{};
+ 		oft2::TcpListener listener;
+ 		volatile LONG cancelled = 0;
+--- a/windows-xp-x86/0.96.8/KICQ/src/oft2_transport.h
++++ b/windows-xp-x86/0.96.8/KICQ/src/oft2_transport.h
+@@ -51,14 +51,16 @@
+ // Transfer exactly 'size' bytes; never treat a short read/write as success.
+ // progress may be nullptr. A callback returning false cancels the transfer.
+ typedef bool (*Progress)(uint64_t transferred, uint64_t total, void *context);
+-static inline bool send_file(SOCKET s, FILE *f, uint64_t size, Progress progress, void *context) {
++static inline bool send_file(SOCKET s, FILE *f, uint64_t size, Progress progress, void *context, uint64_t *sentBytes = nullptr) {
++ if (sentBytes) *sentBytes = 0;
+  if (!f) return false;
+- uint8_t buffer[32768]; uint64_t done = 0;
++ uint8_t buffer[65536]; uint64_t done = 0;
+  while (done < size) {
+   size_t wanted = (size_t)((size - done) < sizeof(buffer) ? (size - done) : sizeof(buffer));
+   size_t got = fread(buffer, 1, wanted, f);
+   if (got != wanted || !send_all(s, buffer, got)) return false;
+   done += got;
++  if (sentBytes) *sentBytes = done;
+   if (progress && !progress(done, size, context)) return false;
+  }
+  return true;
+--- a/windows-xp-x86/0.96.8/KICQ/src/oft2_socket_transfer.h
++++ b/windows-xp-x86/0.96.8/KICQ/src/oft2_socket_transfer.h
+@@ -15,8 +15,9 @@
+ // Sending raw data before ACK is forbidden. A successful return requires DONE.
+ static inline bool send_one(SOCKET socket, const uint8_t (&prompt)[HEADER_SIZE],
+                             FILE *input, uint64_t length, Progress progress = nullptr,
+-                            void *ctx = nullptr, int *stage = nullptr) {
++                            void *ctx = nullptr, int *stage = nullptr, uint64_t *dataSent = nullptr) {
+  if (stage) *stage = ST_VALIDATE;
++ if (dataSent) *dataSent = 0;
+  Header h, ack;
+  uint8_t response[HEADER_SIZE];
+  if (!decode(prompt, HEADER_SIZE, h) || h.type != 0x0101 ||
+@@ -31,7 +32,7 @@
+      ack.size != h.size || ack.totalFiles != h.totalFiles ||
+      ack.filesLeft != h.filesLeft || ack.received != 0) return false;
+  if (stage) *stage = ST_DATA;
+- if (!send_file(socket, input, length, progress, ctx)) return false;
++ if (!send_file(socket, input, length, progress, ctx, dataSent)) return false;
+  Header done;
+  if (stage) *stage = ST_DONE;
+  if (!recv_expected(socket, 0x0204, response, done)) return false;
+--- a/windows-xp-x86/0.96.8/KICQ/src/oft2_listener.h
++++ b/windows-xp-x86/0.96.8/KICQ/src/oft2_listener.h
+@@ -16,14 +16,14 @@
+  TcpListener& operator=(const TcpListener&) = delete;
+  ~TcpListener() { close(); }
+  uint16_t port() const { return port_; }
+- bool open(uint32_t address = INADDR_ANY) {
++ bool open(uint32_t address = INADDR_ANY, uint16_t listenPort = 0) {
+   close();
+   SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+   if (s == INVALID_SOCKET) return false;
+   sockaddr_in addr = {};
+   addr.sin_family = AF_INET;
+   addr.sin_addr.s_addr = htonl(address);
+-  addr.sin_port = 0; // let OS allocate an unused port
++  addr.sin_port = htons(listenPort); // 0=ephemeral; fixed port allows explicit NAT forwarding
+   if (bind(s, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) == SOCKET_ERROR ||
+       listen(s, 1) == SOCKET_ERROR) {
+    closesocket(s); return false;

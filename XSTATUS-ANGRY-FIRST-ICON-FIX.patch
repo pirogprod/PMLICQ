@@ -1,0 +1,52 @@
+--- a/normal/0.96.7/KICQ/src/proto.cpp
++++ b/normal/0.96.7/KICQ/src/proto.cpp
+@@ -91,7 +91,9 @@
+    id = db_get_b(contact, module, "XStatusId", 0);
+  }
+  if (id >= 1 && id <= 35) {
+-  if (g_kicqExtraImages[id - 1] && g_kicqExtraImages[id - 1] != INVALID_HANDLE_VALUE) ExtraIcon_SetIcon(g_kicqExtraIcon, contact, g_kicqExtraImages[id - 1]);
++  // ExtraIcon_AddIcon may return image index 0 (the first registered icon).
++  // Index 0 is valid; only INVALID_HANDLE_VALUE means no image.
++  if (g_kicqExtraImages[id - 1] != INVALID_HANDLE_VALUE) ExtraIcon_SetIcon(g_kicqExtraIcon, contact, g_kicqExtraImages[id - 1]);
+   else ExtraIcon_SetIcon(g_kicqExtraIcon, contact, INVALID_HANDLE_VALUE);
+  }
+  else ExtraIcon_SetIcon(g_kicqExtraIcon, contact, INVALID_HANDLE_VALUE);
+--- a/normal/0.96.8/KICQ/src/proto.cpp
++++ b/normal/0.96.8/KICQ/src/proto.cpp
+@@ -91,7 +91,9 @@
+    id = db_get_b(contact, module, "XStatusId", 0);
+  }
+  if (id >= 1 && id <= 35) {
+-  if (g_kicqExtraImages[id - 1] && g_kicqExtraImages[id - 1] != INVALID_HANDLE_VALUE) ExtraIcon_SetIcon(g_kicqExtraIcon, contact, g_kicqExtraImages[id - 1]);
++  // ExtraIcon_AddIcon may return image index 0 (the first registered icon).
++  // Index 0 is valid; only INVALID_HANDLE_VALUE means no image.
++  if (g_kicqExtraImages[id - 1] != INVALID_HANDLE_VALUE) ExtraIcon_SetIcon(g_kicqExtraIcon, contact, g_kicqExtraImages[id - 1]);
+   else ExtraIcon_SetIcon(g_kicqExtraIcon, contact, INVALID_HANDLE_VALUE);
+  }
+  else ExtraIcon_SetIcon(g_kicqExtraIcon, contact, INVALID_HANDLE_VALUE);
+--- a/windows-xp-x86/0.96.7/KICQ/src/proto.cpp
++++ b/windows-xp-x86/0.96.7/KICQ/src/proto.cpp
+@@ -87,7 +87,9 @@
+    id = db_get_b(contact, module, "XStatusId", 0);
+  }
+  if (id >= 1 && id <= 35) {
+-  if (g_kicqExtraImages[id - 1] && g_kicqExtraImages[id - 1] != INVALID_HANDLE_VALUE) ExtraIcon_SetIcon(g_kicqExtraIcon, contact, g_kicqExtraImages[id - 1]);
++  // ExtraIcon_AddIcon may return image index 0 (the first registered icon).
++  // Index 0 is valid; only INVALID_HANDLE_VALUE means no image.
++  if (g_kicqExtraImages[id - 1] != INVALID_HANDLE_VALUE) ExtraIcon_SetIcon(g_kicqExtraIcon, contact, g_kicqExtraImages[id - 1]);
+   else ExtraIcon_SetIcon(g_kicqExtraIcon, contact, INVALID_HANDLE_VALUE);
+  }
+  else ExtraIcon_SetIcon(g_kicqExtraIcon, contact, INVALID_HANDLE_VALUE);
+--- a/windows-xp-x86/0.96.8/KICQ/src/proto.cpp
++++ b/windows-xp-x86/0.96.8/KICQ/src/proto.cpp
+@@ -87,7 +87,9 @@
+    id = db_get_b(contact, module, "XStatusId", 0);
+  }
+  if (id >= 1 && id <= 35) {
+-  if (g_kicqExtraImages[id - 1] && g_kicqExtraImages[id - 1] != INVALID_HANDLE_VALUE) ExtraIcon_SetIcon(g_kicqExtraIcon, contact, g_kicqExtraImages[id - 1]);
++  // ExtraIcon_AddIcon may return image index 0 (the first registered icon).
++  // Index 0 is valid; only INVALID_HANDLE_VALUE means no image.
++  if (g_kicqExtraImages[id - 1] != INVALID_HANDLE_VALUE) ExtraIcon_SetIcon(g_kicqExtraIcon, contact, g_kicqExtraImages[id - 1]);
+   else ExtraIcon_SetIcon(g_kicqExtraIcon, contact, INVALID_HANDLE_VALUE);
+  }
+  else ExtraIcon_SetIcon(g_kicqExtraIcon, contact, INVALID_HANDLE_VALUE);

@@ -35,7 +35,8 @@ public:
         edtFileProxyPort(this, IDC_FILEPROXY_PORT),
 		cmbClientId(this, IDC_CLIENT_ID), m_account(ppro)
 	{
-		CreateLink(edtUin, "UIN", DBVT_DWORD, 0);
+		// LoginId is applied explicitly to preserve the legacy DWORD UIN.
+		CreateLink(edtUin, "LoginId", L"");
 		CreateLink(edtPassword, "Password", L"");
 		CreateLink(edtServer, ppro->m_wszServer);
 		CreateLink(edtPort, ppro->m_iPort);
@@ -48,7 +49,9 @@ public:
 	{
 		// the XOR login of that ICQ era only uses the first 8 characters
 		edtPassword.SendMsg(EM_LIMITTEXT, 8, 0);
-		edtUin.SendMsg(EM_LIMITTEXT, 10, 0);
+		edtUin.SendMsg(EM_LIMITTEXT, 97, 0);
+ auto login=m_account->AccountId();
+ SetDlgItemTextW(m_hwnd,IDC_UIN,_A2T(login.c_str()).get());
 		static const wchar_t* const choices[] = {
 			L"PMLICQ (default)", L"Miranda NG (actual EXE version)", L"Miranda IM",
 			L"QIP 2005", L"QIP 2010", L"QIP Infium", L"QIP 2012",
@@ -62,7 +65,13 @@ public:
 
 	bool OnApply() override
 	{
-		if (!CKicqDlgBase::OnApply()) return false;
+		wchar_t raw[98]={}; GetDlgItemTextW(m_hwnd,IDC_UIN,raw,_countof(raw));
+ const auto id=oscarid::key(T2Utf(raw).get());
+ if(id.empty() && raw[0]) return false;
+ if (!CKicqDlgBase::OnApply()) return false;
+ m_account->setDword("UIN",oscarid::uin(id));
+ m_account->setString("LoginId",id.c_str());
+ m_account->setString("ScreenName",id.c_str());
 		const LPARAM preset = cmbClientId.GetCurData();
 		if (preset < 0 || preset > 10) return false;
 		m_account->setByte("ClientIdPreset", BYTE(preset));

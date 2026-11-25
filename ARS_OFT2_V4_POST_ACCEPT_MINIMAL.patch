@@ -1,0 +1,296 @@
+--- a/normal/0.96.7/KICQ/src/proto.cpp
++++ b/normal/0.96.7/KICQ/src/proto.cpp
+@@ -1317,11 +1317,13 @@
+         oft2::put32(prompt + 28, f->size); oft2::put32(prompt + 32, f->size);
+         memcpy(prompt + 192, rv.offer.name.c_str(), rv.offer.name.size());
+         proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE, ACKRESULT_CONNECTED, f.get());
++        proto->debugLogA("ARS TX: relay paired, sending OFT2 PROMPT, then awaiting ACK/data/DONE");
+         success = oft2::send_one(sock, prompt, input, f->size,
+          [](uint64_t done, uint64_t, void *ctx) -> bool {
+           auto *args = (OutgoingThreadArgs *)ctx;
+           return args->proto->FileProgress(args->file.get(), done);
+          }, ctx.get());
++        proto->debugLogA("ARS TX: OFT2 send %s", success ? "completed" : "failed during PROMPT/ACK/data/DONE");
+         fclose(input);
+        }
+       }
+@@ -1523,19 +1525,39 @@
+   const std::string cap = OscarText::unhex(CAP_FILE);
+   const std::string host = ars::ip4(f->ip);
+   bool joined = false;
+-  if (cap.size() == 16 && ars::connectTo(host.c_str(), f->port, sock)) {
+-   { mir_cslock lk(arg->proto->m_csFiles); f->active = sock; }
+-   joined = ars::handshakeJoin(sock, arg->proto->m_szUin.c_str(), f->cookie, cap, f->port);
+-   if (!joined) {
+-    { mir_cslock lk(arg->proto->m_csFiles); f->active = INVALID_SOCKET; }
+-    closesocket(sock); sock = INVALID_SOCKET;
++  // In a proxied channel-2 offer TLV(0x0005) is an ARS session/ticket
++  // check value, NOT the TCP listening port. Passing it to connectTo()
++  // leaves the receiver at 0% even though the invitation was accepted.
++  // Keep f->port for handshakeJoin() only. Some deployments (Mandarin)
++  // use a configured alternate proxy port; classic OSCAR uses TCP 5190.
++  const uint16_t configuredProxyPort =
++    (uint16_t)arg->proto->m_iFileProxyPort;
++  const uint16_t proxyPorts[] = { configuredProxyPort, 5190 };
++  for (unsigned portIndex = 0; portIndex < 2 && !joined; ++portIndex) {
++   const uint16_t tcpPort = proxyPorts[portIndex];
++   if (!tcpPort || (portIndex && tcpPort == proxyPorts[0])) continue;
++   arg->proto->debugLogA("ARS RX: connecting advertised proxy %s TCP:%u (ticket=%u)",
++     host.c_str(), (unsigned)tcpPort, (unsigned)f->port);
++   if (!cap.empty() && ars::connectTo(host.c_str(), tcpPort, sock)) {
++    { mir_cslock lk(arg->proto->m_csFiles); f->active = sock; }
++    joined = ars::handshakeJoin(sock, arg->proto->m_szUin.c_str(), f->cookie, cap, f->port);
++    arg->proto->debugLogA("ARS RX: advertised relay JOIN %s (TCP:%u)",
++      joined ? "READY" : "failed", (unsigned)tcpPort);
++    if (!joined) {
++     { mir_cslock lk(arg->proto->m_csFiles); f->active = INVALID_SOCKET; }
++     closesocket(sock); sock = INVALID_SOCKET;
++    }
+    }
+   }
+   T2Utf proxyHost(arg->proto->m_wszFileProxy);
+-  if (!joined && cap.size() == 16 && ars::connectTo(proxyHost,
+-      (uint16_t)arg->proto->m_iFileProxyPort, sock)) {
++  // If the advertised relay address cannot be reached, try the configured
++  // hostname. Use the configured TCP port, never the invitation ticket.
++  if (!joined && cap.size() == 16 && configuredProxyPort &&
++      ars::connectTo(proxyHost, configuredProxyPort, sock)) {
+    { mir_cslock lk(arg->proto->m_csFiles); f->active = sock; }
+    joined = ars::handshakeJoin(sock, arg->proto->m_szUin.c_str(), f->cookie, cap, f->port);
++   arg->proto->debugLogA("ARS RX: configured relay JOIN %s (TCP:%u ticket=%u)",
++     joined ? "READY" : "failed", (unsigned)configuredProxyPort, (unsigned)f->port);
+    if (!joined) {
+     { mir_cslock lk(arg->proto->m_csFiles); f->active = INVALID_SOCKET; }
+     closesocket(sock); sock = INVALID_SOCKET;
+@@ -1575,7 +1597,9 @@
+    arg->proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE, ACKRESULT_CONNECTED, f.get());
+    FILE *output = nullptr;
+    if (_wfopen_s(&output, f->destination.c_str(), L"wb") == 0 && output) {
++    arg->proto->debugLogA("ARS RX: TCP paired, waiting for OFT2 PROMPT (size=%u)", (unsigned)f->size);
+     ok = oft2::receive_one(sock, output, f->size, Oft2IncomingProgress, arg.get());
++    arg->proto->debugLogA("ARS RX: OFT2 transfer %s", ok ? "completed" : "failed during PROMPT/ACK/data/DONE");
+     if (fclose(output)) ok = false;
+     if (!ok) _wremove(f->destination.c_str());
+    }
+--- a/normal/0.96.8/KICQ/src/proto.cpp
++++ b/normal/0.96.8/KICQ/src/proto.cpp
+@@ -1315,11 +1315,13 @@
+         oft2::put32(prompt + 28, f->size); oft2::put32(prompt + 32, f->size);
+         memcpy(prompt + 192, rv.offer.name.c_str(), rv.offer.name.size());
+         proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE, ACKRESULT_CONNECTED, f.get());
++        proto->debugLogA("ARS TX: relay paired, sending OFT2 PROMPT, then awaiting ACK/data/DONE");
+         success = oft2::send_one(sock, prompt, input, f->size,
+          [](uint64_t done, uint64_t, void *ctx) -> bool {
+           auto *args = (OutgoingThreadArgs *)ctx;
+           return args->proto->FileProgress(args->file.get(), done);
+          }, ctx.get());
++        proto->debugLogA("ARS TX: OFT2 send %s", success ? "completed" : "failed during PROMPT/ACK/data/DONE");
+         fclose(input);
+        }
+       }
+@@ -1521,19 +1523,39 @@
+   const std::string cap = OscarText::unhex(CAP_FILE);
+   const std::string host = ars::ip4(f->ip);
+   bool joined = false;
+-  if (cap.size() == 16 && ars::connectTo(host.c_str(), f->port, sock)) {
+-   { mir_cslock lk(arg->proto->m_csFiles); f->active = sock; }
+-   joined = ars::handshakeJoin(sock, arg->proto->m_szUin.c_str(), f->cookie, cap, f->port);
+-   if (!joined) {
+-    { mir_cslock lk(arg->proto->m_csFiles); f->active = INVALID_SOCKET; }
+-    closesocket(sock); sock = INVALID_SOCKET;
++  // In a proxied channel-2 offer TLV(0x0005) is an ARS session/ticket
++  // check value, NOT the TCP listening port. Passing it to connectTo()
++  // leaves the receiver at 0% even though the invitation was accepted.
++  // Keep f->port for handshakeJoin() only. Some deployments (Mandarin)
++  // use a configured alternate proxy port; classic OSCAR uses TCP 5190.
++  const uint16_t configuredProxyPort =
++    (uint16_t)arg->proto->m_iFileProxyPort;
++  const uint16_t proxyPorts[] = { configuredProxyPort, 5190 };
++  for (unsigned portIndex = 0; portIndex < 2 && !joined; ++portIndex) {
++   const uint16_t tcpPort = proxyPorts[portIndex];
++   if (!tcpPort || (portIndex && tcpPort == proxyPorts[0])) continue;
++   arg->proto->debugLogA("ARS RX: connecting advertised proxy %s TCP:%u (ticket=%u)",
++     host.c_str(), (unsigned)tcpPort, (unsigned)f->port);
++   if (!cap.empty() && ars::connectTo(host.c_str(), tcpPort, sock)) {
++    { mir_cslock lk(arg->proto->m_csFiles); f->active = sock; }
++    joined = ars::handshakeJoin(sock, arg->proto->m_szUin.c_str(), f->cookie, cap, f->port);
++    arg->proto->debugLogA("ARS RX: advertised relay JOIN %s (TCP:%u)",
++      joined ? "READY" : "failed", (unsigned)tcpPort);
++    if (!joined) {
++     { mir_cslock lk(arg->proto->m_csFiles); f->active = INVALID_SOCKET; }
++     closesocket(sock); sock = INVALID_SOCKET;
++    }
+    }
+   }
+   T2Utf proxyHost(arg->proto->m_wszFileProxy);
+-  if (!joined && cap.size() == 16 && ars::connectTo(proxyHost,
+-      (uint16_t)arg->proto->m_iFileProxyPort, sock)) {
++  // If the advertised relay address cannot be reached, try the configured
++  // hostname. Use the configured TCP port, never the invitation ticket.
++  if (!joined && cap.size() == 16 && configuredProxyPort &&
++      ars::connectTo(proxyHost, configuredProxyPort, sock)) {
+    { mir_cslock lk(arg->proto->m_csFiles); f->active = sock; }
+    joined = ars::handshakeJoin(sock, arg->proto->m_szUin.c_str(), f->cookie, cap, f->port);
++   arg->proto->debugLogA("ARS RX: configured relay JOIN %s (TCP:%u ticket=%u)",
++     joined ? "READY" : "failed", (unsigned)configuredProxyPort, (unsigned)f->port);
+    if (!joined) {
+     { mir_cslock lk(arg->proto->m_csFiles); f->active = INVALID_SOCKET; }
+     closesocket(sock); sock = INVALID_SOCKET;
+@@ -1573,7 +1595,9 @@
+    arg->proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE, ACKRESULT_CONNECTED, f.get());
+    FILE *output = nullptr;
+    if (_wfopen_s(&output, f->destination.c_str(), L"wb") == 0 && output) {
++    arg->proto->debugLogA("ARS RX: TCP paired, waiting for OFT2 PROMPT (size=%u)", (unsigned)f->size);
+     ok = oft2::receive_one(sock, output, f->size, Oft2IncomingProgress, arg.get());
++    arg->proto->debugLogA("ARS RX: OFT2 transfer %s", ok ? "completed" : "failed during PROMPT/ACK/data/DONE");
+     if (fclose(output)) ok = false;
+     if (!ok) _wremove(f->destination.c_str());
+    }
+--- a/windows-xp-x86/0.96.7/KICQ/src/proto.cpp
++++ b/windows-xp-x86/0.96.7/KICQ/src/proto.cpp
+@@ -1324,11 +1324,13 @@
+         oft2::put32(prompt + 28, f->size); oft2::put32(prompt + 32, f->size);
+         memcpy(prompt + 192, rv.offer.name.c_str(), rv.offer.name.size());
+         proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE, ACKRESULT_CONNECTED, f.get());
++        proto->debugLogA("ARS TX: relay paired, sending OFT2 PROMPT, then awaiting ACK/data/DONE");
+         success = oft2::send_one(sock, prompt, input, f->size,
+          [](uint64_t done, uint64_t, void *ctx) -> bool {
+           auto *args = (OutgoingThreadArgs *)ctx;
+           return args->proto->FileProgress(args->file.get(), done);
+          }, ctx.get());
++        proto->debugLogA("ARS TX: OFT2 send %s", success ? "completed" : "failed during PROMPT/ACK/data/DONE");
+         fclose(input);
+        }
+       }
+@@ -1530,19 +1532,39 @@
+   const std::string cap = OscarText::unhex(CAP_FILE);
+   const std::string host = ars::ip4(f->ip);
+   bool joined = false;
+-  if (cap.size() == 16 && ars::connectTo(host.c_str(), f->port, sock)) {
+-   { mir_cslock lk(arg->proto->m_csFiles); f->active = sock; }
+-   joined = ars::handshakeJoin(sock, arg->proto->m_szUin.c_str(), f->cookie, cap, f->port);
+-   if (!joined) {
+-    { mir_cslock lk(arg->proto->m_csFiles); f->active = INVALID_SOCKET; }
+-    closesocket(sock); sock = INVALID_SOCKET;
++  // In a proxied channel-2 offer TLV(0x0005) is an ARS session/ticket
++  // check value, NOT the TCP listening port. Passing it to connectTo()
++  // leaves the receiver at 0% even though the invitation was accepted.
++  // Keep f->port for handshakeJoin() only. Some deployments (Mandarin)
++  // use a configured alternate proxy port; classic OSCAR uses TCP 5190.
++  const uint16_t configuredProxyPort =
++    (uint16_t)arg->proto->m_iFileProxyPort;
++  const uint16_t proxyPorts[] = { configuredProxyPort, 5190 };
++  for (unsigned portIndex = 0; portIndex < 2 && !joined; ++portIndex) {
++   const uint16_t tcpPort = proxyPorts[portIndex];
++   if (!tcpPort || (portIndex && tcpPort == proxyPorts[0])) continue;
++   arg->proto->debugLogA("ARS RX: connecting advertised proxy %s TCP:%u (ticket=%u)",
++     host.c_str(), (unsigned)tcpPort, (unsigned)f->port);
++   if (!cap.empty() && ars::connectTo(host.c_str(), tcpPort, sock)) {
++    { mir_cslock lk(arg->proto->m_csFiles); f->active = sock; }
++    joined = ars::handshakeJoin(sock, arg->proto->m_szUin.c_str(), f->cookie, cap, f->port);
++    arg->proto->debugLogA("ARS RX: advertised relay JOIN %s (TCP:%u)",
++      joined ? "READY" : "failed", (unsigned)tcpPort);
++    if (!joined) {
++     { mir_cslock lk(arg->proto->m_csFiles); f->active = INVALID_SOCKET; }
++     closesocket(sock); sock = INVALID_SOCKET;
++    }
+    }
+   }
+   T2Utf proxyHost(arg->proto->m_wszFileProxy);
+-  if (!joined && cap.size() == 16 && ars::connectTo(proxyHost,
+-      (uint16_t)arg->proto->m_iFileProxyPort, sock)) {
++  // If the advertised relay address cannot be reached, try the configured
++  // hostname. Use the configured TCP port, never the invitation ticket.
++  if (!joined && cap.size() == 16 && configuredProxyPort &&
++      ars::connectTo(proxyHost, configuredProxyPort, sock)) {
+    { mir_cslock lk(arg->proto->m_csFiles); f->active = sock; }
+    joined = ars::handshakeJoin(sock, arg->proto->m_szUin.c_str(), f->cookie, cap, f->port);
++   arg->proto->debugLogA("ARS RX: configured relay JOIN %s (TCP:%u ticket=%u)",
++     joined ? "READY" : "failed", (unsigned)configuredProxyPort, (unsigned)f->port);
+    if (!joined) {
+     { mir_cslock lk(arg->proto->m_csFiles); f->active = INVALID_SOCKET; }
+     closesocket(sock); sock = INVALID_SOCKET;
+@@ -1582,7 +1604,9 @@
+    arg->proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE, ACKRESULT_CONNECTED, f.get());
+    FILE *output = nullptr;
+    if (_wfopen_s(&output, f->destination.c_str(), L"wb") == 0 && output) {
++    arg->proto->debugLogA("ARS RX: TCP paired, waiting for OFT2 PROMPT (size=%u)", (unsigned)f->size);
+     ok = oft2::receive_one(sock, output, f->size, Oft2IncomingProgress, arg.get());
++    arg->proto->debugLogA("ARS RX: OFT2 transfer %s", ok ? "completed" : "failed during PROMPT/ACK/data/DONE");
+     if (fclose(output)) ok = false;
+     if (!ok) _wremove(f->destination.c_str());
+    }
+--- a/windows-xp-x86/0.96.8/KICQ/src/proto.cpp
++++ b/windows-xp-x86/0.96.8/KICQ/src/proto.cpp
+@@ -1319,11 +1319,13 @@
+         oft2::put32(prompt + 28, f->size); oft2::put32(prompt + 32, f->size);
+         memcpy(prompt + 192, rv.offer.name.c_str(), rv.offer.name.size());
+         proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE, ACKRESULT_CONNECTED, f.get());
++        proto->debugLogA("ARS TX: relay paired, sending OFT2 PROMPT, then awaiting ACK/data/DONE");
+         success = oft2::send_one(sock, prompt, input, f->size,
+          [](uint64_t done, uint64_t, void *ctx) -> bool {
+           auto *args = (OutgoingThreadArgs *)ctx;
+           return args->proto->FileProgress(args->file.get(), done);
+          }, ctx.get());
++        proto->debugLogA("ARS TX: OFT2 send %s", success ? "completed" : "failed during PROMPT/ACK/data/DONE");
+         fclose(input);
+        }
+       }
+@@ -1525,19 +1527,39 @@
+   const std::string cap = OscarText::unhex(CAP_FILE);
+   const std::string host = ars::ip4(f->ip);
+   bool joined = false;
+-  if (cap.size() == 16 && ars::connectTo(host.c_str(), f->port, sock)) {
+-   { mir_cslock lk(arg->proto->m_csFiles); f->active = sock; }
+-   joined = ars::handshakeJoin(sock, arg->proto->m_szUin.c_str(), f->cookie, cap, f->port);
+-   if (!joined) {
+-    { mir_cslock lk(arg->proto->m_csFiles); f->active = INVALID_SOCKET; }
+-    closesocket(sock); sock = INVALID_SOCKET;
++  // In a proxied channel-2 offer TLV(0x0005) is an ARS session/ticket
++  // check value, NOT the TCP listening port. Passing it to connectTo()
++  // leaves the receiver at 0% even though the invitation was accepted.
++  // Keep f->port for handshakeJoin() only. Some deployments (Mandarin)
++  // use a configured alternate proxy port; classic OSCAR uses TCP 5190.
++  const uint16_t configuredProxyPort =
++    (uint16_t)arg->proto->m_iFileProxyPort;
++  const uint16_t proxyPorts[] = { configuredProxyPort, 5190 };
++  for (unsigned portIndex = 0; portIndex < 2 && !joined; ++portIndex) {
++   const uint16_t tcpPort = proxyPorts[portIndex];
++   if (!tcpPort || (portIndex && tcpPort == proxyPorts[0])) continue;
++   arg->proto->debugLogA("ARS RX: connecting advertised proxy %s TCP:%u (ticket=%u)",
++     host.c_str(), (unsigned)tcpPort, (unsigned)f->port);
++   if (!cap.empty() && ars::connectTo(host.c_str(), tcpPort, sock)) {
++    { mir_cslock lk(arg->proto->m_csFiles); f->active = sock; }
++    joined = ars::handshakeJoin(sock, arg->proto->m_szUin.c_str(), f->cookie, cap, f->port);
++    arg->proto->debugLogA("ARS RX: advertised relay JOIN %s (TCP:%u)",
++      joined ? "READY" : "failed", (unsigned)tcpPort);
++    if (!joined) {
++     { mir_cslock lk(arg->proto->m_csFiles); f->active = INVALID_SOCKET; }
++     closesocket(sock); sock = INVALID_SOCKET;
++    }
+    }
+   }
+   T2Utf proxyHost(arg->proto->m_wszFileProxy);
+-  if (!joined && cap.size() == 16 && ars::connectTo(proxyHost,
+-      (uint16_t)arg->proto->m_iFileProxyPort, sock)) {
++  // If the advertised relay address cannot be reached, try the configured
++  // hostname. Use the configured TCP port, never the invitation ticket.
++  if (!joined && cap.size() == 16 && configuredProxyPort &&
++      ars::connectTo(proxyHost, configuredProxyPort, sock)) {
+    { mir_cslock lk(arg->proto->m_csFiles); f->active = sock; }
+    joined = ars::handshakeJoin(sock, arg->proto->m_szUin.c_str(), f->cookie, cap, f->port);
++   arg->proto->debugLogA("ARS RX: configured relay JOIN %s (TCP:%u ticket=%u)",
++     joined ? "READY" : "failed", (unsigned)configuredProxyPort, (unsigned)f->port);
+    if (!joined) {
+     { mir_cslock lk(arg->proto->m_csFiles); f->active = INVALID_SOCKET; }
+     closesocket(sock); sock = INVALID_SOCKET;
+@@ -1577,7 +1599,9 @@
+    arg->proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE, ACKRESULT_CONNECTED, f.get());
+    FILE *output = nullptr;
+    if (_wfopen_s(&output, f->destination.c_str(), L"wb") == 0 && output) {
++    arg->proto->debugLogA("ARS RX: TCP paired, waiting for OFT2 PROMPT (size=%u)", (unsigned)f->size);
+     ok = oft2::receive_one(sock, output, f->size, Oft2IncomingProgress, arg.get());
++    arg->proto->debugLogA("ARS RX: OFT2 transfer %s", ok ? "completed" : "failed during PROMPT/ACK/data/DONE");
+     if (fclose(output)) ok = false;
+     if (!ok) _wremove(f->destination.c_str());
+    }

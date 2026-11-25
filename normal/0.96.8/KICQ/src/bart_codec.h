@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 #include <limits>
+#include <utility>
 
 namespace bart {
 using Bytes = std::string;
@@ -36,6 +37,71 @@ inline bool makeDownload(const std::string &screenName, const AssetId &id, Bytes
  if (screenName.empty() || screenName.size()>255) return false;
  Bytes b; b.push_back(char(screenName.size())); b+=screenName; b.push_back('\x01');
  if (!appendId(b,id)) return false;
+ payload.swap(b); return true;
+}
+// LOCATE 02/15: basic USERINFO plus capabilities, with a length-prefixed name.
+// No BART download can be constructed until a real asset ID is advertised.
+inline bool makeUserInfoQuery(const std::string &name, Bytes &payload) {
+ if (name.empty() || name.size()>255) return false;
+ Bytes b; put16(b,0); put16(b,4); b.push_back(char(name.size())); b+=name;
+ payload.swap(b); return true;
+}
+struct UserInfoBart {
+ std::string name;
+ std::vector<Bytes> metadata;
+ bool offline = false;
+};
+// USERINFO can be followed by unrelated LOCATE response TLVs. Only consume
+// the counted presence TLVs, and commit nothing if any counted TLV is truncated.
+inline bool parseUserInfoBartAt(const Bytes &b, size_t &offset, UserInfoBart &out) {
+ size_t p=offset; uint8_t n; uint16_t warning, count;
+ UserInfoBart r;
+ if (!get8(b,p,n) || !n || b.size()-p<n) return false;
+ r.name=b.substr(p,n); p+=n;
+ if (!get16(b,p,warning) || !get16(b,p,count)) return false;
+ bool zeroFlags=false, hasStatus=false, offlineStatus=false;
+ for (unsigned i=0;i<count;++i) {
+  uint16_t tag,len;
+  if (!get16(b,p,tag) || !get16(b,p,len) || b.size()-p<len) return false;
+  if (tag==0x001d) r.metadata.push_back(b.substr(p,len));
+  if (tag==1 && len==2) zeroFlags=(b[p]==0 && b[p+1]==0);
+  if (tag==6 && len==4) { hasStatus=true; offlineStatus=(uint8_t(b[p+2])==255 && uint8_t(b[p+3])==255); }
+  p+=len;
+ }
+ // Standard OSCAR offline BART notifications may arrive as 03/0B. Do not
+ // override an explicit ICQ online status on servers using zero user flags.
+ bool hasIcon=false;
+ for (const auto &raw:r.metadata) {
+  size_t at=0; AssetId id;
+  while (at<raw.size() && parseId(raw,at,id)) {
+   if (id.type==1 && !id.hash.empty()) { hasIcon=true; break; }
+  }
+ }
+ r.offline=offlineStatus || (zeroFlags && !hasStatus && hasIcon);
+ offset=p; out=std::move(r); return true;
+}
+inline bool parseUserInfoBart(const Bytes &b, UserInfoBart &out) {
+ size_t offset=0; return parseUserInfoBartAt(b,offset,out);
+}
+// BUDDY ARRIVED/DEPARTED may contain multiple consecutive USERINFO blocks.
+// Only split an exactly framed packet; preserve the old single-block path
+// for legacy servers that append other fields or send a name-only DEPART.
+inline bool splitBuddyUserInfo(const Bytes &b, std::vector<Bytes> &out) {
+ std::vector<Bytes> blocks;
+ size_t p=0;
+ while (p<b.size()) {
+  const size_t start=p; UserInfoBart info;
+  if (!parseUserInfoBartAt(b,p,info)) return false;
+  blocks.push_back(b.substr(start,p-start));
+ }
+ if (blocks.empty()) return false;
+ out.swap(blocks); return true;
+}
+// Older ICQ servers implement 02/05 (16-bit request type 2 = short info),
+// not 02/15. Its reply is also 02/06. Neither request invents a BART ID.
+inline bool makeLegacyUserInfoQuery(const std::string &name, Bytes &payload) {
+ if (name.empty() || name.size()>255) return false;
+ Bytes b; put16(b,2); b.push_back(char(name.size())); b+=name;
  payload.swap(b); return true;
 }
 // BART__UPLOAD_QUERY (10/02): type + 16-bit length + image bytes.

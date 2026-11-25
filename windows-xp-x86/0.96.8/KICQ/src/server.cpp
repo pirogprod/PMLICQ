@@ -1,4 +1,4 @@
-﻿/*
+/*
 #include <string>
 Copyright (C) 2026 Miranda NG team
 
@@ -121,11 +121,26 @@ void CKicqProto::ServerThread(void *)
 {
 	KicqXpTrace("ServerThread begin");
 	m_iLoginError = 0;
+#if defined(_WIN32) && !defined(_WIN64)
+	m_x86PresenceRetryAt = 0;
+#endif
 	m_cookie.clear();
-	m_szUin.Format("%u", getDword("UIN"));
+	StopBart(); // previous BOS session may have left an exited BART worker
+	m_szUin = AccountId().c_str();
+	{
+		mir_cslock lock(m_csBart);
+		m_bartPending.clear();
+		m_bartOutgoing.clear();
+		m_bartRefreshPending.clear();
+		m_bartRefreshUrgent.clear();
+		m_bartRefreshDone.clear();
+		m_bartOfflineRetry.clear();
+		m_lastBartRefresh = 0;
+	}
 	{
 		mir_cslock lck(m_csRoster);
 		m_arUsers.destroy();
+  m_pendAdd.id.clear();m_pendRename.id.clear();
 		m_arGroups.destroy();
 		m_offlineSeen.clear();
 	}
@@ -303,6 +318,13 @@ void CKicqProto::Send(const OscarSnac &snac)
 void CKicqProto::CheckTimeouts()
 {
 	time_t now = time(0);
+#if defined(_WIN32) && !defined(_WIN64)
+	if (m_bOnline && m_x86PresenceRetryAt && now >= m_x86PresenceRetryAt) {
+		m_x86PresenceRetryAt = 0; // no periodic polling or retry storm
+		SendX86PresenceSubscriptions(true);
+	}
+#endif
+	if (m_bOnline) PumpBartRefresh(now);
 
 	if (m_bOnline && now - m_lastProbe >= KEEPALIVE_INTERVAL) {
 		// OSCAR transport keepalive is FLAP channel 5 (empty payload).
@@ -383,7 +405,7 @@ CKicqProto::ConnResult CKicqProto::HandleFlap(int channel, const bytes_t &data, 
 		if (bLogin) {
 			debugLogA("login server hello, sending XOR login");
 			ptrA szPassword(getStringA("Password"));
-			Send(1, OscarPackets::xorLogin(m_szUin, szPassword ? szPassword.get() : "", getByte("ClientIdPreset", 0)));
+			Send(1, OscarPackets::xorLogin(m_szUin, szPassword ? szPassword.get() : "", getByte("ClientIdPreset", 0) ? getByte("ClientIdPreset", 0) : (getDword("UIN") ? 0 : 10)));
 		}
 		else {
 			debugLogA("BOS hello, sending cookie");
@@ -461,6 +483,7 @@ void CKicqProto::HandleSnac(const bytes_t &data)
 	case 0x01:
 		switch (subtype) {
 		case 0x05: HandleBartRedirect(body); break;
+		case 0x0F: HandleBartUserInfoUpdate(body); break; // BOS userinfo refresh
         case 0x21: { // Server requests own BART upload after SSI publication.
          bart::AssetId id; size_t offset = 0;
          if (bart::parseId(body, offset, id) && id.type == 1 && (id.flags & 0x40)) {
@@ -479,11 +502,33 @@ void CKicqProto::HandleSnac(const bytes_t &data)
 		}
 		break;
 
+	case 0x02:
+		if (subtype == 0x06) {
+   bart::UserInfoBart info;
+   if (bart::parseUserInfoBart(body, info)) {
+    unsigned icons = 0;
+    for (const auto &raw : info.metadata) {
+     size_t pos = 0; bart::AssetId id;
+     while (pos < raw.size() && bart::parseId(raw, pos, id))
+      if (id.type == 1 && !id.hash.empty() && id.hash.size() <= 64) ++icons;
+    }
+    debugLogA("BART: LOCATE 02/06 for %s, icon IDs=%u", info.name.c_str(), icons);
+   } else debugLogA("BART: malformed LOCATE 02/06 (%u bytes)", (unsigned)body.size());
+   HandleBartUserInfoUpdate(body); // existing metadata handler
+  }
+		else if (subtype == 0x01 && body.size() >= 2) {
+			OscarReader error(body);
+			debugLogA("BART: LOCATE error 02/01 code=%u req=%u", (unsigned)error.u16(), (unsigned)reqId);
+		}
+		break;
+
 	case 0x03:
-		if (subtype == 0x0B)
-			HandleUserOnline(body);
-		else if (subtype == 0x0C)
-			HandleUserOffline(body);
+		if (subtype == 0x0B || subtype == 0x0C)
+			HandleBuddyPresence(body, subtype == 0x0C);
+#if defined(_WIN32) && !defined(_WIN64)
+		else if (subtype == 0x0A)
+			debugLogA("PRESENCE x86: server rejected client-side buddy subscription (%u bytes)", (unsigned)body.size());
+#endif
 		break;
 
 	case 0x04:
@@ -550,6 +595,7 @@ void CKicqProto::HandleBartRedirect(const bytes_t &data)
   m_hBartThread = nullptr;
   debugLogA("BART: previous service worker finished; restarting");
  }
+ mir_cslock lifecycle(m_csBartLifecycle);
  if (!m_hBartThread && !m_bTerminated) {
   InterlockedExchange(&m_bartStop, 0);
   m_hBartThread = CreateThread(nullptr, 0, BartThreadEntry, this, 0, nullptr);
@@ -578,7 +624,7 @@ void CKicqProto::HandleRates(const bytes_t &data)
 // roster
 
 // mirrors one server-side contact into the contact list
-void CKicqProto::ApplyRosterItem(uint32_t uin, int groupId, int ssiId, const OscarTlvList &tlvs, bool bFromLogin)
+void CKicqProto::ApplyRosterItem(const std::string &name, int groupId, int ssiId, const OscarTlvList &tlvs, bool bFromLogin)
 {
 	static volatile LONG rosterCount = 0;
     LONG seq = InterlockedIncrement(&rosterCount);
@@ -594,10 +640,11 @@ void CKicqProto::ApplyRosterItem(uint32_t uin, int groupId, int ssiId, const Osc
 			wszGroup = pGroup->name;
 	}
 
-	MCONTACT hContact = FindContact(uin);
+	MCONTACT hContact = FindContact(name);
 	bool bNew = (hContact == 0);
 	if (bNew)
-        hContact = CreateContact(uin, bTemporary);
+        hContact = CreateContact(name, bTemporary);
+ if(!hContact) return;
     if (!hContact) {
         KicqDiagTrace("ERROR ApplyRosterItem contact handle is NULL");
         return;
@@ -618,7 +665,7 @@ void CKicqProto::ApplyRosterItem(uint32_t uin, int groupId, int ssiId, const Osc
 	bool bAuthorized = !tlvs.has(0x66);
 	{
 		mir_cslock lck(m_csRoster);
-		auto *pUser = AddUser(uin, hContact);
+		auto *pUser = AddUser(name, hContact);
 		pUser->hContact = hContact;
 		pUser->groupId = groupId;
 		pUser->ssiId = bTemporary ? 0 : ssiId;
@@ -633,6 +680,10 @@ void CKicqProto::ApplyRosterItem(uint32_t uin, int groupId, int ssiId, const Osc
 	else if (getByte(hContact, "Auth", 0) != 1)
 		setByte(hContact, "Auth", 1);
 
+	if (!bFromLogin && m_bOnline) {
+        if (bNew) { OscarWriter buddy; buddy.ascii8(name.c_str()); Send(OscarSnac(3, 4, 0, buddy.data())); }
+        ScheduleBartRefresh(name);
+    }
 	if (bTemporary) {
         if (trace) KicqDiagTrace("ApplyRosterItem RETURN temporary");
         return;
@@ -728,7 +779,7 @@ void CKicqProto::HandleRoster(const bytes_t &data, int flags)
                         GetFileAttributesW(oldPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
                         delSetting("BartOwnAvatarPath");
                         ReportSelfAvatarChanged();
-                        QueueBartAvatar(uint32_t(atoi(m_szUin)), 1, hash);
+                        QueueBartAvatar(getDword("UIN"), 1, hash);
                     }
                 }
             }
@@ -751,9 +802,9 @@ void CKicqProto::HandleRoster(const bytes_t &data, int flags)
 	size_t xpRosterIndex = 0;
 	for (auto &it : contacts) {
 		if ((xpRosterIndex++ % 25) == 0) KicqXpTrace("HandleRoster contacts batch begin");
-		uint32_t uin = strtoul(it.name, nullptr, 10);
-		if (uin)
-			ApplyRosterItem(uin, it.groupId, it.itemId, OscarTlvList(it.extra), true);
+		const auto name = oscarid::key(it.name.c_str());
+		if (!name.empty())
+			ApplyRosterItem(name, it.groupId, it.itemId, OscarTlvList(it.extra), true);
 	}
 
 	KicqXpTrace("HandleRoster contacts applied");
@@ -764,6 +815,46 @@ void CKicqProto::HandleRoster(const bytes_t &data, int flags)
 	}
 }
 
+#if defined(_WIN32) && !defined(_WIN64)
+void CKicqProto::SendX86PresenceSubscriptions(bool missingOnly)
+{
+	// Keep SSI as the authority for presence. Never bypass pending auth,
+	// and never use the client-side buddy path for AIM -> ICQ on OOS.
+	const bool aimAccount = oscarid::uin(AccountId()) == 0;
+	std::vector<std::string> names;
+	unsigned feedbagOnly = 0, pendingAuth = 0;
+	{
+		mir_cslock lock(m_csRoster);
+		for (auto &user : m_arUsers) {
+			if (!user->hContact || user->name.empty() || !user->ssiId)
+				continue;
+			if (!user->bAuthorized) { ++pendingAuth; continue; }
+			if (aimAccount && oscarid::uin(user->name)) { ++feedbagOnly; continue; }
+			if (missingOnly && user->bOnline)
+				continue;
+			names.push_back(user->name);
+		}
+	}
+	// Release roster lock before any potentially blocking network sends.
+	OscarWriter batch;
+	unsigned count = 0;
+	for (const auto &name : names) {
+		if (count && (count >= 50 || batch.size() + int(name.size()) + 1 > 3500)) {
+			Send(OscarSnac(3, 4, 0, batch.data()));
+			batch = OscarWriter();
+			count = 0;
+		}
+		batch.ascii8(name.c_str());
+		++count;
+	}
+	if (count)
+		Send(OscarSnac(3, 4, 0, batch.data()));
+	debugLogA("PRESENCE x86: %s account=%s subscribed=%u feedbag-only=%u pending-auth=%u",
+		missingOnly ? "post-ready retry" : "initial", aimAccount ? "AIM" : "ICQ",
+		(unsigned)names.size(), feedbagOnly, pendingAuth);
+}
+
+#endif
 void CKicqProto::FinishLogin()
 {
 	KicqXpTrace("FinishLogin begin");
@@ -773,27 +864,36 @@ void CKicqProto::FinishLogin()
 		m_iStatus = ID_STATUS_ONLINE;
 
 	auto *pVer = &pluginInfoEx.version;
-	Send(OscarPackets::setUserInfo(HIBYTE(HIWORD(*pVer)), LOBYTE(HIWORD(*pVer)), HIBYTE(LOWORD(*pVer)), nullptr, getByte("ClientIdPreset", 0)));
+	Send(OscarPackets::setUserInfo(HIBYTE(HIWORD(*pVer)), LOBYTE(HIWORD(*pVer)), HIBYTE(LOWORD(*pVer)), nullptr, getByte("ClientIdPreset", 0) ? getByte("ClientIdPreset", 0) : (getDword("UIN") ? 0 : 10)));
 	Send(OscarPackets::setIcbmParams());
+#if defined(_WIN32) && !defined(_WIN64)
+	// Activate the feedbag BEFORE ClientOnline. OOS performs its initial
+	// visibility broadcast at ClientOnline for AIM and most ICQ clients.
+	// An AIM account cannot subscribe to ICQ UINs through 03/04; these
+	// contacts must receive presence via the activated, authorized SSI list.
+	Send(OscarPackets::rosterActivate());
+	SendX86PresenceSubscriptions(false);
+	Send(OscarPackets::clientReady());
+	debugLogA("PRESENCE x86: SSI activated before ClientOnline");
+#else
 	// Subscribe to presence for SSI contacts. The server sends 03/0B and
 	// 03/0C updates to clients registered via BuddyAddBuddies (03/04).
 	// Keep packets small to avoid exceeding server-side SNAC limits.
 	// Snapshot UINs under the roster lock, but never perform blocking
 	// Netlib_Send while that lock is held. On Windows XP, synchronous
 	// sends can pause roster/UI updates for the socket timeout period.
-	std::vector<uint32_t> buddyUins;
+	std::vector<std::string> buddyUins;
 	{
 		mir_cslock lck(m_csRoster);
 		for (auto &it : m_arUsers)
-			if (it->uin)
-				buddyUins.push_back(it->uin);
+			if (!it->name.empty())
+				buddyUins.push_back(it->name);
 	}
 	{
 		OscarWriter buddies;
 		int count = 0;
-		for (uint32_t buddyUin : buddyUins) {
-			CMStringA uin;
-			uin.Format("%u", buddyUin);
+		for (const auto &buddyUin : buddyUins) {
+			CMStringA uin(buddyUin.c_str());
 			if (buddies.size() + uin.GetLength() + 1 > 3500 && count) {
 				Send(OscarSnac(3, 4, 0, buddies.data()));
 				buddies = OscarWriter();
@@ -810,12 +910,21 @@ void CKicqProto::FinishLogin()
 	Send(OscarPackets::clientReady());
 	// Activate SSI before publishing our initial presence.
 	Send(OscarPackets::rosterActivate());
+#endif
 	// Send only a 4-byte status TLV. The legacy DC-info/away-text
 	// extensions are not needed for Open OSCAR Server presence.
 	Send(OscarPackets::setStatus(MirandaToIcqStatus(m_iStatus), 256));
-	Send(OscarPackets::offlineMsgsRequest(atoi(m_szUin), m_seq));
+	if(getDword("UIN")) Send(OscarPackets::offlineMsgsRequest(atoi(m_szUin), m_seq));
 
 	m_bOnline = true;
+#if defined(_WIN32) && !defined(_WIN64)
+	// Give initial BUDDY notifications time to arrive, then retry only
+	// authorized, still-offline contacts once on the BOS network thread.
+	m_x86PresenceRetryAt = time(0) + 4;
+#endif
+	// Include local contacts too, not just the online subset of the SSI roster.
+	// Discovery is deliberately queued, after the BOS client-ready sequence.
+	for (auto &contact : AccContacts()) ScheduleBartRefresh(ContactId(contact));
 	if (getByte("XStatusId", 0)) SendXStatus();
 	m_bProbeAnswered = true;
 	m_lastProbe = time(0);
@@ -852,7 +961,7 @@ void CKicqProto::HandleSsiItem(const bytes_t &data, bool bDeleted)
                     path.IsEmpty() || GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) {
                     delSetting("BartOwnAvatarPath");
                     ReportSelfAvatarChanged();
-                    QueueBartAvatar(uint32_t(atoi(m_szUin)), 1, hash);
+                    QueueBartAvatar(getDword("UIN"), 1, hash);
                 }
             }
         }
@@ -874,19 +983,19 @@ void CKicqProto::HandleSsiItem(const bytes_t &data, bool bDeleted)
 		return;
 	}
 
-	uint32_t uin = strtoul(rawName.c_str(), nullptr, 10);
-	if (type != 0 || uin == 0)
+	const auto name = oscarid::key(rawName);
+	if (type != 0 || name.empty())
 		return;
 
 	if (bDeleted) {
 		mir_cslock lck(m_csRoster);
-		if (auto *pUser = FindUser(uin))
+		if (auto *pUser = FindUser(name))
 			if (pUser->ssiId == itemId)
 				pUser->ssiId = pUser->groupId = 0;
 		return;
 	}
 
-	ApplyRosterItem(uin, groupId, itemId, tlvs, false);
+	ApplyRosterItem(name, groupId, itemId, tlvs, false);
 }
 
 void CKicqProto::HandleSsiResult(const bytes_t &data, uint32_t reqId)
@@ -897,20 +1006,20 @@ void CKicqProto::HandleSsiResult(const bytes_t &data, uint32_t reqId)
 
 	switch (reqId) {
 	case REQ_ADD_CONTACT:
-		if (m_pendAdd.uin == 0)
+		if (m_pendAdd.id.empty())
 			break;
 
 		if (result == 0 || result == 0x0E) {
-			char szUin[20];
-			_itoa(m_pendAdd.uin, szUin, 10);
+			const char *szUin = m_pendAdd.id.c_str();
 			{
 				mir_cslock lck(m_csRoster);
-				auto *pUser = AddUser(m_pendAdd.uin, m_pendAdd.hContact);
+				auto *pUser = AddUser(m_pendAdd.id, m_pendAdd.hContact);
 				pUser->groupId = m_pendAdd.groupId;
 				pUser->ssiId = m_pendAdd.ssiId;
 				pUser->bAuthorized = (result == 0);
 			}
 			setWString(m_pendAdd.hContact, "SrvNick", m_pendAdd.name);
+ if(result==0)delSetting(m_pendAdd.hContact,"Auth");
 
 			if (result == 0x0E) {
 				// the contact requires authorization: add it flagged, then ask
@@ -921,11 +1030,15 @@ void CKicqProto::HandleSsiResult(const bytes_t &data, uint32_t reqId)
 				Send(OscarPackets::futureAuthGrant(szUin));
 				Send(OscarPackets::authRequest(szUin, TranslateT("Please authorize me")));
 			}
-			m_pendAdd.uin = 0;
+			// Both numeric UIN and AIM SN need an explicit presence subscription.
+			OscarWriter buddy; buddy.ascii8(szUin);
+			Send(OscarSnac(3, 4, 0, buddy.data()));
+			ScheduleBartRefresh(m_pendAdd.id, true);
+			m_pendAdd.id.clear();
 		}
 		else {
-			debugLogA("adding %u failed, code %d", m_pendAdd.uin, result);
-			m_pendAdd.uin = 0;
+			debugLogA("adding %s failed, code %d", m_pendAdd.id.c_str(), result);
+			m_pendAdd.id.clear();
 		}
 		break;
 
@@ -934,10 +1047,10 @@ void CKicqProto::HandleSsiResult(const bytes_t &data, uint32_t reqId)
 		break;
 
 	case REQ_RENAME:
-		if (result == 0 && m_pendRename.uin)
-			if (MCONTACT hContact = FindContact(m_pendRename.uin))
+		if (result == 0 && !m_pendRename.id.empty())
+			if (MCONTACT hContact = FindContact(m_pendRename.id))
 				setWString(hContact, "SrvNick", m_pendRename.name);
-		m_pendRename.uin = 0;
+		m_pendRename.id.clear();
 		break;
 
 	case REQ_ADD_GROUP:
@@ -1016,14 +1129,106 @@ static int FindQipXStatus(const bytes_t &caps)
 	return 0;
 }
 
+// Live ICQ mood (TLV 0x001D / item 0x000E) -> the same icon IDs as
+// legacy QIP capability GUIDs. Mapping verified against OSCAR mood catalog.
+// Returns -2 when absent/invalid, -1 for an unsupported mood, 0 when
+// explicitly cleared, or 1..35 for a known X-status.
+static int KicqMoodToXStatus(const bytes_t &presenceNote)
+{
+ OscarReader r(presenceNote);
+ while (r.remaining() >= 4) {
+  const unsigned kind = r.u16();
+  r.u8(); // flags
+  const unsigned length = r.u8();
+  if (length > r.remaining()) return -2; // malformed; do not touch the icon
+  const bytes_t value = r.bytes(length);
+  if (kind != 0x000E) continue;
+  if (value.empty()) return 0; // explicit mood removal
+  static const char prefix[] = "0icqmood";
+  if (value.size() <= sizeof(prefix)-1 ||
+      value.compare(0, sizeof(prefix)-1, prefix) != 0)
+   return -1; // unknown mood; don't destroy a valid capability status
+  unsigned number = 0;
+  for (size_t i = sizeof(prefix)-1; i < value.size(); ++i) {
+   const unsigned char ch = (unsigned char)value[i];
+   if (ch < '0' || ch > '9') return -1;
+   number = number * 10 + (ch - '0');
+   if (number > 999) return -1;
+  }
+  struct Mood { unsigned number; int id; };
+  static const Mood mapped[] = {
+		{ 0, 18 },
+		{ 1, 2 },
+		{ 2, 3 },
+		{ 3, 4 },
+		{ 4, 5 },
+		{ 5, 6 },
+		{ 6, 7 },
+		{ 7, 8 },
+		{ 8, 9 },
+		{ 9, 10 },
+		{ 10, 11 },
+		{ 11, 31 },
+		{ 12, 13 },
+		{ 14, 15 },
+		{ 15, 16 },
+		{ 16, 17 },
+		{ 17, 19 },
+		{ 18, 20 },
+		{ 19, 21 },
+		{ 20, 22 },
+		{ 21, 23 },
+		{ 22, 25 },
+		{ 23, 1 },
+		{ 68, 29 },
+		{ 70, 20 },
+		{ 71, 27 },
+		{ 76, 32 },
+		{ 77, 30 },
+		{ 81, 16 },
+		{ 84, 35 },
+		{ 85, 33 }
+  };
+  for (const Mood &entry : mapped)
+   if (entry.number == number) return entry.id;
+  return -1;
+ }
+ return -2;
+}
+
 void CKicqProto::HandleUserOnline(const bytes_t &data)
 {
 	OscarReader r(data);
-	uint32_t uin = strtoul(r.ascii8().c_str(), nullptr, 10);
+	const auto name = oscarid::key(r.ascii8());
+ if(name.empty()) return;
+ uint32_t uin = oscarid::uin(name);
 	r.skip(2); // warning level
 	r.skip(2); // TLV count
 	OscarTlvList tlvs(r);
-	if (const auto *bartId = tlvs.find(0x1D)) ObserveBartPresence(uin, bartId->data);
+ // Process offline BART metadata without marking the buddy online or
+ // modifying its fingerprint/X-status. AIM names use the same discovery path.
+ bart::UserInfoBart avatarInfo;
+ if (bart::parseUserInfoBart(data, avatarInfo)) {
+  if (avatarInfo.offline) { HandleUserOffline(data); return; }
+  for (const auto &raw : avatarInfo.metadata) ObserveBartPresence(name, raw);
+ }
+#if defined(_WIN32) && !defined(_WIN64)
+ if (!uin) {
+  MCONTACT c=0; bool changed=false;
+  { mir_cslock lock(m_csRoster); if (auto *u=FindUser(name)) { changed=!u->bOnline; u->bOnline=true; c=u->hContact; } }
+  if (c) {
+   const auto *flags=tlvs.find(1);
+   const WORD status=flags && (flags->u16()&0x20)?ID_STATUS_AWAY:ID_STATUS_ONLINE;
+   if (getWord(c,"Status",ID_STATUS_OFFLINE)!=status) setWord(c,"Status",status);
+   if (changed) debugLogA("PRESENCE x86: AIM arrived %s status=%u",name.c_str(),(unsigned)status);
+  } else debugLogA("PRESENCE x86: AIM arrival not in session roster: %s",name.c_str());
+  return;
+ }
+#else
+ if(!uin){MCONTACT c=0;{mir_cslock lock(m_csRoster);if(auto *u=FindUser(name)){u->bOnline=true;c=u->hContact;}}
+  if(c){const auto *flags=tlvs.find(1);setWord(c,"Status",flags && (flags->u16()&0x20)?ID_STATUS_AWAY:ID_STATUS_ONLINE);}return;}
+#endif
+
 
     // Only trace changes for the target Jimm Multi UIN. A presence refresh can
     // repeat hundreds of times; logging each repeat hid the relevant packets.
@@ -1066,12 +1271,19 @@ void CKicqProto::HandleUserOnline(const bytes_t &data)
 	MCONTACT hContact;
 	bool bFull;
 	bool xstatusChanged = false;
-	bool clientIconChanged = false;
 	{
 		mir_cslock lck(m_csRoster);
-		auto *pUser = FindUser(uin);
+		auto *pUser = FindUser(name);
+#if defined(_WIN32) && !defined(_WIN64)
+		if (pUser == nullptr || !pUser->hContact) {
+			debugLogA("PRESENCE x86: ICQ arrival not in session roster: %s", name.c_str());
+			return;
+		}
+		if (!pUser->bOnline) debugLogA("PRESENCE x86: ICQ arrived %s", name.c_str());
+#else
 		if (pUser == nullptr)
 			return;
+#endif
 
 		hContact = pUser->hContact;
 		pUser->bOnline = true;
@@ -1082,9 +1294,12 @@ void CKicqProto::HandleUserOnline(const bytes_t &data)
 		if (bFull) {
 			// A full capability update replaces the previously advertised X-status.
 			// Do not clear it on abbreviated online updates.
-			int xstatus = caps ? FindQipXStatus(caps->data) : 0;
-			if (caps) xstatusChanged = (getByte(hContact, "XStatusId", 0) != xstatus || (xstatus && !getByte(hContact, "XStatusLive", 0)));
-			if (caps && xstatus)
+			int xstatus = caps ? FindQipXStatus(caps->data) : getByte(hContact, "XStatusId", 0);
+			// Compact capabilities do not encode the legacy X-status GUID.
+			// Do not clear a valid icon on a short-caps-only update.
+			xstatusChanged = (getByte(hContact, "XStatusId", 0) != xstatus ||
+				(xstatus && !getByte(hContact, "XStatusLive", 0)));
+			if (xstatus)
 				{
     setByte(hContact, "XStatusId", (uint8_t)xstatus);
     setByte(hContact, "XStatusLive", 1);
@@ -1100,7 +1315,7 @@ void CKicqProto::HandleUserOnline(const bytes_t &data)
      // Keep the last genuine status text until a replacement arrives.
     }
    }
-			else if (caps)
+			else
 				{ db_unset(hContact, m_szModuleName, "XStatusId"); db_unset(hContact, m_szModuleName, "XStatusName"); db_unset(hContact, m_szModuleName, "XStatusLive"); db_unset(hContact, m_szModuleName, "XStatusMsg"); db_unset(hContact, m_szModuleName, "XStatusTextReceived"); db_unset(hContact, "CList", "StatusMsg"); db_unset(hContact, m_szModuleName, "XStatusQueryTS"); }
 			/* Refresh after roster lock is released below. */
 			pUser->bUtf8 = pUser->bServerRelay = false;
@@ -1200,7 +1415,6 @@ void CKicqProto::HandleUserOnline(const bytes_t &data)
 				ptrA previous(db_get_sa(hContact, m_szModuleName, "MirVer"));
 				if (!previous || mir_strcmp(previous, szMirVer.c_str())) {
 					setString(hContact, "MirVer", szMirVer);
-					clientIconChanged = true;
 				}
 				setByte(hContact, "ClientDetectKnown", 1);
 			}
@@ -1211,8 +1425,7 @@ void CKicqProto::HandleUserOnline(const bytes_t &data)
 					ptrA previous(db_get_sa(hContact, m_szModuleName, "MirVer"));
 					if (!previous || mir_strcmp(previous, unknown)) {
 						setString(hContact, "MirVer", unknown);
-						clientIconChanged = true;
-					}
+						}
 				}
 			}
 			if (caps) {
@@ -1231,6 +1444,37 @@ void CKicqProto::HandleUserOnline(const bytes_t &data)
 		}
 	}
 
+
+ // Live X-status update: ICQ/Jimm may send only TLV 0x1D item 0x000E
+ // without repeating TLV 0x000D capabilities. Apply after releasing the
+ // roster lock and override a stale capability GUID in the same packet.
+ if (const OscarTlv *moodTlv = tlvs.find(0x1D)) {
+  const int moodId = KicqMoodToXStatus(moodTlv->data);
+  if (moodId >= 0) {
+   const int previousId = getByte(hContact, "XStatusId", 0);
+   const bool wasLive = getByte(hContact, "XStatusLive", 0) != 0;
+   if (previousId != moodId || (moodId > 0 && !wasLive)) {
+    xstatusChanged = true;
+    if (moodId > 0) {
+     setByte(hContact, "XStatusId", (uint8_t)moodId);
+     setByte(hContact, "XStatusLive", 1);
+     setWString(hContact, "XStatusName", kKicqXStatuses[moodId - 1].nameRu);
+     db_unset(hContact, m_szModuleName, "XStatusMsg");
+     db_unset(hContact, m_szModuleName, "XStatusTextReceived");
+     db_unset(hContact, m_szModuleName, "XStatusQueryTS");
+    }
+    else {
+     db_unset(hContact, m_szModuleName, "XStatusId");
+     db_unset(hContact, m_szModuleName, "XStatusName");
+     db_unset(hContact, m_szModuleName, "XStatusLive");
+     db_unset(hContact, m_szModuleName, "XStatusMsg");
+     db_unset(hContact, m_szModuleName, "XStatusTextReceived");
+     db_unset(hContact, m_szModuleName, "XStatusQueryTS");
+    }
+   }
+  }
+ }
+
 	auto *st = tlvs.find(6);
 	int iStatus = st ? OscarReader(st->data, 2).u16() : ICQ_STATUS_ONLINE;
 	// Diagnostic counters: log every 100th presence notification, without UINs.
@@ -1246,10 +1490,8 @@ void CKicqProto::HandleUserOnline(const bytes_t &data)
 	const bool presenceChanged = getWord(hContact, "Status", ID_STATUS_OFFLINE) != newStatus;
 	if (presenceChanged)
 		setWord(hContact, "Status", newStatus);
-	// Refresh only when the visible client name has actually changed.
+	// Update X-status independently of MirVer / Fingerprint.
 	// Keep ExtraIcons calls outside the roster critical section.
-	if (clientIconChanged)
-
 	// Apply the registered extra icon after releasing the roster lock.
 	// A short capability update must not clear an existing X-status.
 	if (xstatusChanged || presenceChanged)
@@ -1317,10 +1559,33 @@ void CKicqProto::HandleUserOnline(const bytes_t &data)
     // to clear a previously received genuine text (Xtraz or standard note).
 }
 
+// Keep the existing single-contact handlers unchanged. Batched BUDDY
+// notifications previously passed every trailing block as if it were TLVs
+// of the first contact, silently losing the remaining avatar hashes.
+void CKicqProto::HandleBuddyPresence(const bytes_t &data, bool departed)
+{
+ std::vector<bytes_t> blocks;
+ if (bart::splitBuddyUserInfo(data, blocks) && blocks.size() > 1) {
+  debugLogA("BART: received %u batched BUDDY records", (unsigned)blocks.size());
+  for (const auto &block : blocks) {
+   if (departed) HandleUserOffline(block);
+   else HandleUserOnline(block);
+  }
+  return;
+ }
+ if (departed) HandleUserOffline(data);
+ else HandleUserOnline(data);
+}
+
 void CKicqProto::HandleUserOffline(const bytes_t &data)
 {
+ // Some servers attach full USERINFO to an offline notification; a bare
+ // screen name remains valid and does not erase the cached avatar.
+ HandleBartUserInfoUpdate(data);
 	OscarReader r(data);
-	uint32_t uin = strtoul(r.ascii8().c_str(), nullptr, 10);
+	const auto name = oscarid::key(r.ascii8());
+ if(name.empty()) return;
+ uint32_t uin = oscarid::uin(name);
 
     {
         char line[96];
@@ -1331,7 +1596,7 @@ void CKicqProto::HandleUserOffline(const bytes_t &data)
 	MCONTACT hContact;
 	{
 		mir_cslock lck(m_csRoster);
-		auto *pUser = FindUser(uin);
+		auto *pUser = FindUser(name);
 		if (pUser == nullptr)
 			return;
 		pUser->bOnline = false;
@@ -1353,12 +1618,13 @@ void CKicqProto::HandleUserOffline(const bytes_t &data)
 /////////////////////////////////////////////////////////////////////////////////////////
 // messages
 
-void CKicqProto::DeliverMessage(uint32_t uin, const CMStringW &text, time_t when)
+void CKicqProto::DeliverMessage(const std::string &name, const CMStringW &text, time_t when)
 {
     KicqDiagTrace("DeliverMessage ENTER (content omitted)");
-	MCONTACT hContact = FindContact(uin);
+	MCONTACT hContact = FindContact(name);
 	if (hContact == 0)
-        hContact = CreateContact(uin, true);
+        hContact = CreateContact(name, true);
+ if(!hContact) return;
     if (!hContact) {
         KicqDiagTrace("ERROR DeliverMessage no contact handle");
         return;
@@ -1366,7 +1632,7 @@ void CKicqProto::DeliverMessage(uint32_t uin, const CMStringW &text, time_t when
     KicqDiagTrace("DeliverMessage contact handle OK");
 	{
 		mir_cslock lck(m_csRoster);
-		AddUser(uin, hContact);
+		AddUser(name, hContact);
 	}
 
 	CallService(MS_PROTO_CONTACTISTYPING, hContact, PROTOTYPE_CONTACTTYPING_OFF);
@@ -1392,11 +1658,9 @@ void CKicqProto::HandleIncomingMessage(const bytes_t &data)
 	OscarTlvList info(r, infoCount);     // sender's presence TLVs
 	OscarTlvList msgTlvs(r);
 
-	uint32_t uin = strtoul(sender.c_str(), nullptr, 10);
-	if (uin == 0) {
-        KicqDiagTrace("HandleIncomingMessage invalid sender id");
-        return;
-    }
+	const auto name = oscarid::key(sender);
+ if(name.empty()) return;
+ uint32_t uin = oscarid::uin(name);
     {
         char line[96];
         mir_snprintf(line, "HandleIncomingMessage channel=%d bytes=%u", channel, (unsigned)data.size());
@@ -1431,6 +1695,7 @@ void CKicqProto::HandleIncomingMessage(const bytes_t &data)
 		}
 	}
 	else if (channel == 2) {
+        if(!uin) return; // legacy ICQ relay/OFT2 is UIN-only
 		auto *t5 = msgTlvs.find(5);
 		if (!t5) {
 			debugLogA("ARS RX DIAG4: channel-2 ICBM received WITHOUT TLV(5); sender=%u", (unsigned)uin);
@@ -1484,6 +1749,28 @@ void CKicqProto::HandleIncomingMessage(const bytes_t &data)
 				}
 			}
 			   if (validated.type == 0 && validated.hasOffer) {
+    // A relay or OSCAR server may echo an offer to its sender. This is not a
+    // new incoming file; detect both own-UIN frames and our own live cookie.
+    // In particular, do NOT create a Miranda file event for the outgoing file.
+    bool ourOutgoingCookie = false;
+    {
+     mir_cslock lk(m_csFiles);
+     for (const auto &pending : m_outgoingFiles) {
+      if (pending.second &&
+          memcmp(pending.second->cookie.data(), validated.cookie.data(), 8) == 0) {
+       ourOutgoingCookie = true;
+       break;
+      }
+     }
+    }
+    const bool ownSenderUin = (uin == oscarid::uin(m_szUin.c_str()));
+    if (ownSenderUin || ourOutgoingCookie) {
+     debugLogA("OFT2 RX: discarded outgoing offer reflected by server; sender=%u own=%s cookieMatch=%d",
+       (unsigned)uin, m_szUin.c_str(), (int)ourOutgoingCookie);
+     return;
+    }
+    debugLogA("OFT2 RX: accepted remote invitation sender=%u own=%s", (unsigned)uin, m_szUin.c_str());
+
     MCONTACT hContact = FindContact(uin);
     if (!hContact) hContact = CreateContact(uin, true);
     HandleFileOffer(hContact, validated);
@@ -1596,7 +1883,7 @@ void CKicqProto::HandleIncomingMessage(const bytes_t &data)
     KicqDiagTrace("HandleIncomingMessage decoded plain text (content omitted)");
 	if (!bOffline)
 		Send(OscarPackets::messageAck(cookie, sender.c_str()));
-	DeliverMessage(uin, text, when);
+	DeliverMessage(name, text, when);
 }
 
 void CKicqProto::HandleOfflineMessage(const bytes_t &data)
@@ -1639,10 +1926,11 @@ void CKicqProto::HandleOfflineMessage(const bytes_t &data)
 			tmMsg.tm_isdst = -1;
 			when = mktime(&tmMsg);
 		}
-		DeliverMessage(uin, text, when);
+		if(uin) DeliverMessage(std::to_string(uin), text, when);
 	}
 	else if (type == 0x4200) {
-		Send(OscarPackets::deleteOfflineMsgs(atoi(m_szUin), m_seq));
+		if(!getDword("UIN"))return;
+  Send(OscarPackets::deleteOfflineMsgs(atoi(m_szUin), m_seq));
 		Send(OscarPackets::anotherOfflineMsgsRequest());
 	}
 }
@@ -1700,7 +1988,9 @@ void CKicqProto::HandleMessageAck(const bytes_t &data)
 	OscarReader r(data);
 	r.skip(8);                              // cookie
 	r.u16();                                // channel
-	uint32_t uin = strtoul(r.ascii8().c_str(), nullptr, 10);
+	const auto name = oscarid::key(r.ascii8());
+ if(name.empty()) return;
+ uint32_t uin = oscarid::uin(name);
 
 	// A channel-2 message ACK may carry an Xtraz AwayStat response.
  // Never turn it into an ordinary chat message or acknowledge a pending chat.
@@ -1729,7 +2019,7 @@ void CKicqProto::HandleMessageAck(const bytes_t &data)
   const bytes_t title = KicqXmlField(xml, "title");
   const bytes_t desc = KicqXmlField(xml, "desc");
   if ((!title.empty() || !desc.empty()) && uin != 0) {
-   if (MCONTACT hContact = FindContact(uin)) {
+   if (MCONTACT hContact = FindContact(name)) {
     if (getByte(hContact, "XStatusLive", 0)) {
      setWString(hContact, "XStatusName", OscarText::fromUtf8(KicqUnescapeXml(title)));
      setWString(hContact, "XStatusMsg", OscarText::fromUtf8(KicqUnescapeXml(desc)));
@@ -1805,7 +2095,7 @@ void CKicqProto::HandleMessageAck(const bytes_t &data)
 	{
 		mir_cslock lck(m_csPending);
 		for (auto it = m_pendingMsgs.begin(); it != m_pendingMsgs.end(); ++it) {
-			if (it->second.uin == uin) {
+			if (it->second.name == name) {
 				seq = it->second.seq;
 				m_pendingMsgs.erase(it);
 				break;
@@ -1814,7 +2104,7 @@ void CKicqProto::HandleMessageAck(const bytes_t &data)
 	}
 
 	if (seq)
-		if (MCONTACT hContact = FindContact(uin))
+		if (MCONTACT hContact = FindContact(name))
 			ProtoBroadcastAck(hContact, ACKTYPE_MESSAGE, ACKRESULT_SUCCESS, (HANDLE)seq, 0);
 }
 
@@ -1823,6 +2113,31 @@ void CKicqProto::HandleMessageAck(const bytes_t &data)
 void CKicqProto::HandleMessageError(const bytes_t &data, uint32_t reqId)
 {
 	int code = OscarReader(data).u16();
+
+ // File rendezvous messages are not tracked in m_pendingMsgs. Match the
+ // OSCAR request ID so an explicit server rejection is not silently ignored.
+ std::shared_ptr<OutgoingFile> rejectedFile;
+ {
+  mir_cslock lock(m_csFiles);
+  for (auto &entry : m_outgoingFiles) {
+   auto &file = entry.second;
+   if (file->offerRequestId == reqId && reqId != 0 &&
+       InterlockedCompareExchange(&file->terminalAckSent, 0, 0) == 0) {
+    rejectedFile = file;
+    InterlockedExchange(&file->cancelled, 1);
+    if (file->active != INVALID_SOCKET) shutdown(file->active, SD_BOTH);
+    file->listener.close();
+    break;
+   }
+  }
+ }
+ if (rejectedFile) {
+  debugLogA("OFT2 OSCAR server refused file invitation: reqId=%u error=%d uin=%u",
+    (unsigned)reqId, code, (unsigned)rejectedFile->uin);
+  if (InterlockedCompareExchange(&rejectedFile->terminalAckSent, 1, 0) == 0)
+   ProtoBroadcastAck(rejectedFile->contact, ACKTYPE_FILE, ACKRESULT_FAILED, rejectedFile.get(), 0);
+  return;
+ }
 
 	KicqPendingMsg msg;
 	{
@@ -1834,8 +2149,8 @@ void CKicqProto::HandleMessageError(const bytes_t &data, uint32_t reqId)
 		m_pendingMsgs.erase(it);
 	}
 
-	debugLogA("message to %u failed, error %d", msg.uin, code);
-	if (MCONTACT hContact = FindContact(msg.uin)) {
+	debugLogA("message to %s failed, error %d", msg.name.c_str(), code);
+	if (MCONTACT hContact = FindContact(msg.name)) {
 		CMStringW wszError(FORMAT, TranslateT("The server refused the message (error %d)"), code);
 		ProtoBroadcastAck(hContact, ACKTYPE_MESSAGE, ACKRESULT_FAILED, (HANDLE)msg.seq, (LPARAM)wszError.c_str());
 	}
@@ -1845,10 +2160,12 @@ void CKicqProto::HandleTyping(const bytes_t &data)
 {
 	OscarReader r(data);
 	r.skip(10);
-	uint32_t uin = strtoul(r.ascii8().c_str(), nullptr, 10);
+	const auto name = oscarid::key(r.ascii8());
+ if(name.empty()) return;
+ uint32_t uin = oscarid::uin(name);
 	int type = r.u16();
 
-	if (MCONTACT hContact = FindContact(uin))
+	if (MCONTACT hContact = FindContact(name))
 		CallService(MS_PROTO_CONTACTISTYPING, hContact, type == 2 ? PROTOTYPE_CONTACTTYPING_INFINITE : PROTOTYPE_CONTACTTYPING_OFF);
 }
 
@@ -1990,58 +2307,67 @@ void CKicqProto::HandleUserInfo(const bytes_t &data, uint32_t reqId)
 void CKicqProto::HandleAuthRequest(const bytes_t &data)
 {
 	OscarReader r(data);
-	uint32_t uin = strtoul(r.ascii8().c_str(), nullptr, 10);
+	const auto name = oscarid::key(r.ascii8());
+ if(name.empty()) return;
+ uint32_t uin = oscarid::uin(name);
 	CMStringW reason(OscarText::textOrCp1251(r.bytes(r.u16())));
-	if (uin == 0)
-		return;
+	
 
-	MCONTACT hContact = FindContact(uin);
+	MCONTACT hContact = FindContact(name);
 	if (hContact == 0)
-		hContact = CreateContact(uin, true);
+		hContact = CreateContact(name, true);
 
-	char szUin[20];
-	_itoa(uin, szUin, 10);
+	if(!hContact) return;
+ setByte(hContact,"Grant",1);
+ const char *szUin = name.c_str();
 	DB::AUTH_BLOB blob(hContact, T2Utf(getMStringW(hContact, "Nick")), nullptr, nullptr, szUin, T2Utf(reason));
 	blob.set_uin(uin);
 
 	DB::EventInfo dbei;
 	dbei.iTimestamp = time(0);
+ dbei.szModule=m_szModuleName;
+ dbei.flags=DBEF_UTF;
+ dbei.eventType=EVENTTYPE_AUTHREQUEST;
 	dbei.cbBlob = blob.size();
 	dbei.pBlob = blob;
-	ProtoChainRecv(hContact, PSR_AUTH, 0, (LPARAM)&dbei);
+	Proto_AuthRecv(m_szModuleName,dbei);
 }
 
 void CKicqProto::HandleAuthReply(const bytes_t &data)
 {
 	OscarReader r(data);
-	uint32_t uin = strtoul(r.ascii8().c_str(), nullptr, 10);
+	const auto name = oscarid::key(r.ascii8());
+ if(name.empty()) return;
+ uint32_t uin = oscarid::uin(name);
 	bool bGranted = r.u8() == 1;
 	debugLogA("authorization %s by %u", bGranted ? "granted" : "denied", uin);
 
-	MCONTACT hContact = FindContact(uin);
-	if (hContact == 0 || !bGranted)
+	MCONTACT hContact = FindContact(name);
+	if(hContact && !bGranted) setByte(hContact,"Auth",1);
+ if (hContact == 0 || !bGranted)
 		return;
 
 	delSetting(hContact, "Auth");
 
 	mir_cslock lck(m_csRoster);
-	if (auto *pUser = FindUser(uin))
+	if (auto *pUser = FindUser(name))
 		pUser->bAuthorized = true;
 }
 
 void CKicqProto::HandleYouWereAdded(const bytes_t &data)
 {
 	OscarReader r(data);
-	uint32_t uin = strtoul(r.ascii8().c_str(), nullptr, 10);
-	if (uin == 0)
-		return;
+	const auto name = oscarid::key(r.ascii8());
+ if(name.empty()) return;
+ uint32_t uin = oscarid::uin(name);
+	
 
-	MCONTACT hContact = FindContact(uin);
+	MCONTACT hContact = FindContact(name);
 	if (hContact == 0)
-		hContact = CreateContact(uin, true);
+		hContact = CreateContact(name, true);
 
-	char szUin[20];
-	_itoa(uin, szUin, 10);
+	if(!hContact) return;
+ const char *szUin = name.c_str();
 	DB::AUTH_BLOB blob(hContact, T2Utf(getMStringW(hContact, "Nick")), nullptr, nullptr, szUin, nullptr);
 	blob.set_uin(uin);
 
@@ -2077,36 +2403,114 @@ bool CKicqProto::BartSend(HNETLIBCONN connection, uint8_t channel,
  return true;
 }
 
-// Requests stay queued until the BART connection can send them.
-void CKicqProto::ObserveBartPresence(uint32_t uin, const bytes_t &raw)
+// Refresh BART metadata from the OSCAR userinfo block, not just BUDDY ARRIVED.
+// The server can notify an already-online buddy via OSERVICE 01/0F; LOCATE
+// 02/06 may also include TLV 0x001D.  Do not alter status/X-status here.
+void CKicqProto::HandleBartUserInfoUpdate(const bytes_t &body)
 {
- if (!uin || raw.empty()) return;
- MCONTACT contact = FindContact(uin);
+ bart::UserInfoBart info;
+ if (!bart::parseUserInfoBart(body, info)) return;
+ const auto name = oscarid::key(info.name);
+ if (name.empty()) return;
+ for (const auto &raw : info.metadata) ObserveBartPresence(name, raw);
+}
+
+void CKicqProto::ScheduleBartRefresh(const std::string &name, bool force)
+{
+ if (name.empty() || name == AccountId() || !m_bOnline) return;
+ mir_cslock lock(m_csBart);
+ if (force) {
+  m_bartOfflineRetry.erase(name);
+  m_bartRefreshDone.erase(name);
+  m_bartRefreshPending.erase(name);
+  m_bartRefreshUrgent.insert(name);
+ } else if (!m_bartRefreshDone.count(name) && !m_bartRefreshUrgent.count(name))
+  m_bartRefreshPending.insert(name);
+}
+
+void CKicqProto::PumpBartRefresh(time_t now)
+{
+ std::vector<std::string> batch, retry;
+ {
+  mir_cslock lock(m_csBart);
+  if (m_lastBartRefresh == now) return;
+  m_lastBartRefresh = now;
+  // Preserve priority for new contacts and the existing four-per-second budget.
+  while ((!m_bartRefreshUrgent.empty() || !m_bartRefreshPending.empty()) && batch.size() < 4) {
+   auto &queue = m_bartRefreshUrgent.empty() ? m_bartRefreshPending : m_bartRefreshUrgent;
+   auto it = queue.begin();
+   batch.push_back(*it);
+   m_bartRefreshDone.insert(*it);
+   queue.erase(it);
+  }
+  for (auto it = m_bartOfflineRetry.begin(); it != m_bartOfflineRetry.end() && batch.size()+retry.size()<4;) {
+   if (it->second > now) { ++it; continue; }
+   retry.push_back(it->first);
+   it = m_bartOfflineRetry.erase(it); // once only, even when the server does not reply
+  }
+ }
+ for (const auto &name : batch) {
+  MCONTACT contact = FindContact(name);
+  if (!contact) continue;
+  // Recover an already advertised hash even if the server does not answer LOCATE.
+  QueueCachedBartAvatar(contact);
+  bytes_t query;
+  if (bart::makeUserInfoQuery(name, query)) {
+   Send(OscarSnac(2, 0x15, 0, query));
+   debugLogA("BART: requested avatar metadata for %s (LOCATE 02/15)", name.c_str());
+   if (getWord(contact, "Status", ID_STATUS_OFFLINE) == ID_STATUS_OFFLINE &&
+       getMStringA(contact, "BartAdvertisedHash").IsEmpty() &&
+       getMStringA(contact, "BartAvatarHash").IsEmpty()) {
+    mir_cslock lock(m_csBart);
+    m_bartOfflineRetry[name] = now + 5;
+   }
+  }
+ }
+ for (const auto &name : retry) {
+  MCONTACT contact = FindContact(name);
+  if (!contact || getWord(contact, "Status", ID_STATUS_OFFLINE) != ID_STATUS_OFFLINE ||
+      !getMStringA(contact, "BartAdvertisedHash").IsEmpty() ||
+      !getMStringA(contact, "BartAvatarHash").IsEmpty()) continue;
+  // Numeric ICQ servers may only implement the old LOCATE query. AIM uses
+  // the modern query again. No synthetic hashes or extra BART traffic.
+  const bool legacy = oscarid::uin(name) != 0;
+  bytes_t query;
+  if (legacy ? bart::makeLegacyUserInfoQuery(name, query) : bart::makeUserInfoQuery(name, query)) {
+   Send(OscarSnac(2, legacy ? 0x05 : 0x15, 0, query));
+   debugLogA("BART: offline metadata retry for %s (LOCATE 02/%02x)", name.c_str(), legacy ? 5 : 0x15);
+  }
+ }
+}
+
+// Requests stay queued until the BART connection can send them.
+void CKicqProto::ObserveBartPresence(const std::string &name, const bytes_t &raw)
+{
+ if (name.empty() || raw.empty()) return;
+ MCONTACT contact = FindContact(name);
  if (!contact) return;
  size_t offset = 0;
  while (offset < raw.size()) {
   bart::AssetId id;
   if (!bart::parseId(raw, offset, id)) {
-   debugLogA("BART: invalid avatar metadata for %u", uin);
+   debugLogA("BART: invalid avatar metadata for %s", name.c_str());
    return;
   }
   if (id.type != 1 || id.hash.empty() || id.hash.size() > 64) continue;
   const std::string hash = bart::hexHash(id.hash);
-  // The hash in the database denotes a *downloaded* image, not merely an
-  // advertised one. Failed requests must be eligible for another attempt.
-  const auto stored = getMStringA(contact, "BartAvatarHash");
-  const auto path = getMStringW(contact, "BartAvatarPath");
-  if (stored == hash.c_str() && !path.IsEmpty() &&
-      GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) continue;
-  debugLogA("BART: contact %u advertises avatar type=%u hash=%s", uin, (unsigned)id.type, hash.c_str());
-  QueueBartAvatar(uin, id.type, id.hash);
+  db_set_w(contact, m_szModuleName, "BartAdvertisedType", id.type);
+  db_set_s(contact, m_szModuleName, "BartAdvertisedHash", hash.c_str());
+  {
+   mir_cslock lock(m_csBart);
+   m_bartOfflineRetry.erase(name);
+  }
+  // A real cache file is required even when the stored hash matches.
+  QueueCachedBartAvatar(contact);
  }
 }
 
-void CKicqProto::QueueBartAvatar(uint32_t uin, uint16_t type, const bytes_t &hash)
+void CKicqProto::QueueBartAvatar(const std::string &name, uint16_t type, const bytes_t &hash)
 {
- if (!uin || hash.empty() || hash.size() > 64) return;
- const std::string name = std::to_string(uin);
+ if (name.empty() || hash.empty() || hash.size() > 64) return;
  bart::AssetId id; id.type = type; id.hash = hash;
  bytes_t payload;
  if (!bart::makeDownload(name, id, payload)) return;
@@ -2118,7 +2522,7 @@ void CKicqProto::QueueBartAvatar(uint32_t uin, uint16_t type, const bytes_t &has
   if (item.screenName == name && item.hash == hash && item.type == type) return;
  m_bartPending.push_back({name, hash, type});
  m_bartOutgoing.push_back(wire);
- debugLogA("BART: queued image request for %u (type %u)", uin, (unsigned)type);
+ debugLogA("BART: queued image request for %s (type %u)", name.c_str(), (unsigned)type);
 }
 
 void CKicqProto::FlushBartRequests(HNETLIBCONN conn, uint16_t &seq)
@@ -2249,7 +2653,7 @@ void CKicqProto::HandleBartSnac(const bytes_t &payload)
  {
   mir_cslock lock(m_csBart);
   for (auto it = m_bartPending.begin(); it != m_bartPending.end(); ++it) {
-   if (it->screenName == reply.screenName && it->hash == reply.id.hash && it->type == reply.id.type) {
+   if (it->screenName == oscarid::key(reply.screenName) && it->hash == reply.id.hash && it->type == reply.id.type) {
     m_bartPending.erase(it);
     matched = true;
     break;
@@ -2295,10 +2699,12 @@ void CKicqProto::HandleBartSnac(const bytes_t &payload)
   return;
  }
  // Store per-contact cache location. The Avatar API must subsequently use this file.
- const unsigned long uin = strtoul(reply.screenName.c_str(), nullptr, 10);
- if (uin && std::to_string(uin) == reply.screenName) {
-  MCONTACT contact = FindContact((uint32_t)uin);
+ const auto peer = oscarid::key(reply.screenName);
+ if (!peer.empty()) {
+  MCONTACT contact = FindContact(peer);
   if (contact) {
+   const auto current = getMStringA(contact, "BartAdvertisedHash");
+   if (!current.IsEmpty() && current != name.c_str()) return;
    db_set_ws(contact, m_szModuleName, "BartAvatarPath", path.c_str());
    db_set_s(contact, m_szModuleName, "BartAvatarHash", name.c_str());
    db_set_ws(contact, "ContactPhoto", "File", path.c_str());
@@ -2312,7 +2718,7 @@ void CKicqProto::HandleBartSnac(const bytes_t &payload)
    // Synchronous ACK: Miranda AVS consumes the pointer during this call.
    // A nullptr on SUCCESS means 'no avatar' and caused the empty UI.
    ProtoBroadcastAck(contact, ACKTYPE_AVATAR, ACKRESULT_SUCCESS, (HANDLE)&info);
-   debugLogA("BART: cached and announced contact %lu avatar", uin);
+   debugLogA("BART: cached and announced contact %s avatar", peer.c_str());
   }
  }
 }
@@ -2441,6 +2847,7 @@ void CKicqProto::BartThread()
 
 void CKicqProto::StopBart()
 {
+ mir_cslock lifecycle(m_csBartLifecycle);
  InterlockedExchange(&m_bartStop, 1);
  {
   mir_cslock lock(m_csBart);

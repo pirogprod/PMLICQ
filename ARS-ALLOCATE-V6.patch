@@ -1,0 +1,404 @@
+--- a/normal/0.96.7/KICQ/src/ars_proxy.h
++++ b/normal/0.96.7/KICQ/src/ars_proxy.h
+@@ -39,22 +39,33 @@
+  const unsigned char *p = (const unsigned char *)body.data();
+  if (r16(p) != 0x044A) return false;
+  command = r16(p + 2);
+- return command != 1;
++ return true; // Error command 0x0001 must be reported to caller, not silently hidden.
+ }
++// An ARS error has the same framed header as a successful response, but
++// command 0x0001 carries a two-byte error code (e.g. 0x000d bad request).
++// Keep these outputs optional so existing receiver-side call sites are intact.
+ static inline bool handshakeAllocate(SOCKET s, const std::string &uin, const std::array<unsigned char,8> &cookie,
+-                         const std::string &cap, uint32_t &ip, uint16_t &port) {
++                         const std::string &cap, uint32_t &ip, uint16_t &port,
++                         unsigned *responseCommand = nullptr, unsigned *proxyError = nullptr) {
+  std::string packet, body;
+  unsigned cmd = 0;
+- // ALLOCATE is a control exchange, not file data. On a silent/broken
+- // proxy fail promptly so the sender can issue a direct OFT2 offer.
+- DWORD allocateTimeout = 5000; // Fallback to direct OFT2 quickly if the relay is silent
++ if (responseCommand) *responseCommand = 0;
++ if (proxyError) *proxyError = 0;
++ // The classic ARS server may take up to ten seconds to answer a bad login;
++ // an 8s timeout keeps the test bounded while allowing slower relays.
++ DWORD allocateTimeout = 8000;
+  setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&allocateTimeout, sizeof(allocateTimeout));
+  const bool received = encode(packet, uin, cookie, cap, false, 0) &&
+-   oft2::send_all(s, packet.data(), packet.size()) &&
+-   recvMessage(s, cmd, body) && cmd == 3 && body.size() >= 16;
++   oft2::send_all(s, packet.data(), packet.size()) && recvMessage(s, cmd, body);
+  DWORD dataTimeout = kTimeoutMs;
+  setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&dataTimeout, sizeof(dataTimeout));
++ if (responseCommand) *responseCommand = cmd;
+  if (!received) return false;
++ if (cmd == 1 && body.size() >= 12) {
++  if (proxyError) *proxyError = r16((const unsigned char *)body.data() + 10);
++  return false;
++ }
++ if (cmd != 3 || body.size() != 16) return false;
+  const unsigned char *p = (const unsigned char *)body.data();
+  port = (uint16_t)r16(p + 10); ip = r32(p + 12);
+  return port != 0 && ip != 0;
+--- a/normal/0.96.7/KICQ/src/proto.cpp
++++ b/normal/0.96.7/KICQ/src/proto.cpp
+@@ -1242,11 +1242,42 @@
+   uint16_t port = 0;
+   const std::string cap = OscarText::unhex(CAP_FILE);
+   T2Utf proxyHost(proto->m_wszFileProxy);
+-  if (cap.size() == 16 && ars::connectTo(proxyHost, (uint16_t)proto->m_iFileProxyPort, sock)) {
++  const uint16_t configuredProxyPort = (uint16_t)proto->m_iFileProxyPort;
++  uint16_t activeProxyPort = configuredProxyPort;
++  unsigned allocateReply = 0, allocateError = 0;
++  bool allocated = false;
++  if (cap.size() == 16 && ars::connectTo(proxyHost, configuredProxyPort, sock)) {
+    { mir_cslock lk(proto->m_csFiles); f->active = sock; }
+-   proto->debugLogA("ARS DIAG3: proxy TCP connected; ALLOCATE request next");
+-   if (!InterlockedCompareExchange(&f->cancelled, 0, 0) &&
+-       ars::handshakeAllocate(sock, proto->m_szUin.c_str(), f->cookie, cap, ip, port)) {
++   proto->debugLogA("ARS TX V6: TCP connected to configured relay port %u; ALLOCATE request next", (unsigned)configuredProxyPort);
++   if (!InterlockedCompareExchange(&f->cancelled, 0, 0))
++    allocated = ars::handshakeAllocate(sock, proto->m_szUin.c_str(), f->cookie, cap,
++      ip, port, &allocateReply, &allocateError);
++   if (!allocated)
++    proto->debugLogA("ARS TX V6: ALLOCATE not accepted on port %u (reply=%u proxyError=%u); checking classic port if applicable",
++      (unsigned)configuredProxyPort, allocateReply, allocateError);
++  }
++  // Classic OSCAR ARS normally listens on TCP/5190. When an account still
++  // uses the old 5191 default, retry 5190 only if 5191 did not allocate.
++  // Never send a second invitation: this retry occurs before any offer.
++  if (!allocated && configuredProxyPort == 5191 && !InterlockedCompareExchange(&f->cancelled, 0, 0) && cap.size() == 16) {
++   if (sock != INVALID_SOCKET) {
++    { mir_cslock lk(proto->m_csFiles); if (f->active == sock) f->active = INVALID_SOCKET; }
++    closesocket(sock); sock = INVALID_SOCKET;
++   }
++   activeProxyPort = 5190;
++   proto->debugLogA("ARS TX V6: retry ALLOCATE on classic ARS TCP port 5190");
++   allocateReply = allocateError = 0;
++   if (ars::connectTo(proxyHost, activeProxyPort, sock)) {
++    { mir_cslock lk(proto->m_csFiles); f->active = sock; }
++    allocated = ars::handshakeAllocate(sock, proto->m_szUin.c_str(), f->cookie, cap,
++      ip, port, &allocateReply, &allocateError);
++    if (!allocated)
++     proto->debugLogA("ARS TX V6: classic port did not allocate (reply=%u proxyError=%u)", allocateReply, allocateError);
++   }
++   else proto->debugLogA("ARS TX V6: classic port 5190 connection failed");
++  }
++  if (sock != INVALID_SOCKET) {
++   if (allocated && !InterlockedCompareExchange(&f->cancelled, 0, 0)) {
+     proto->debugLogA("ARS DIAG3: ALLOCATE_OK, advertised relay %s:%u; sending OSCAR offer to %u", ars::ip4(ip).c_str(), (unsigned)port, f->uin);
+     oft2::Rendezvous rv;
+     rv.type = 0;
+@@ -1306,7 +1337,7 @@
+          closesocket(sock); sock = INVALID_SOCKET;
+         }
+         // Some servers return a ticket rather than a public TCP port.
+-        if (ars::connectTo(proxyHost, (uint16_t)proto->m_iFileProxyPort, sock)) {
++        if (ars::connectTo(proxyHost, activeProxyPort, sock)) {
+          { mir_cslock lk(proto->m_csFiles); f->active = sock; }
+          ready = ars::handshakeJoin(sock, proto->m_szUin.c_str(), f->cookie, cap, redirectPort);
+         }
+--- a/normal/0.96.8/KICQ/src/ars_proxy.h
++++ b/normal/0.96.8/KICQ/src/ars_proxy.h
+@@ -39,22 +39,33 @@
+  const unsigned char *p = (const unsigned char *)body.data();
+  if (r16(p) != 0x044A) return false;
+  command = r16(p + 2);
+- return command != 1;
++ return true; // Error command 0x0001 must be reported to caller, not silently hidden.
+ }
++// An ARS error has the same framed header as a successful response, but
++// command 0x0001 carries a two-byte error code (e.g. 0x000d bad request).
++// Keep these outputs optional so existing receiver-side call sites are intact.
+ static inline bool handshakeAllocate(SOCKET s, const std::string &uin, const std::array<unsigned char,8> &cookie,
+-                         const std::string &cap, uint32_t &ip, uint16_t &port) {
++                         const std::string &cap, uint32_t &ip, uint16_t &port,
++                         unsigned *responseCommand = nullptr, unsigned *proxyError = nullptr) {
+  std::string packet, body;
+  unsigned cmd = 0;
+- // ALLOCATE is a control exchange, not file data. On a silent/broken
+- // proxy fail promptly so the sender can issue a direct OFT2 offer.
+- DWORD allocateTimeout = 5000; // Fallback to direct OFT2 quickly if the relay is silent
++ if (responseCommand) *responseCommand = 0;
++ if (proxyError) *proxyError = 0;
++ // The classic ARS server may take up to ten seconds to answer a bad login;
++ // an 8s timeout keeps the test bounded while allowing slower relays.
++ DWORD allocateTimeout = 8000;
+  setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&allocateTimeout, sizeof(allocateTimeout));
+  const bool received = encode(packet, uin, cookie, cap, false, 0) &&
+-   oft2::send_all(s, packet.data(), packet.size()) &&
+-   recvMessage(s, cmd, body) && cmd == 3 && body.size() >= 16;
++   oft2::send_all(s, packet.data(), packet.size()) && recvMessage(s, cmd, body);
+  DWORD dataTimeout = kTimeoutMs;
+  setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&dataTimeout, sizeof(dataTimeout));
++ if (responseCommand) *responseCommand = cmd;
+  if (!received) return false;
++ if (cmd == 1 && body.size() >= 12) {
++  if (proxyError) *proxyError = r16((const unsigned char *)body.data() + 10);
++  return false;
++ }
++ if (cmd != 3 || body.size() != 16) return false;
+  const unsigned char *p = (const unsigned char *)body.data();
+  port = (uint16_t)r16(p + 10); ip = r32(p + 12);
+  return port != 0 && ip != 0;
+--- a/normal/0.96.8/KICQ/src/proto.cpp
++++ b/normal/0.96.8/KICQ/src/proto.cpp
+@@ -1240,11 +1240,42 @@
+   uint16_t port = 0;
+   const std::string cap = OscarText::unhex(CAP_FILE);
+   T2Utf proxyHost(proto->m_wszFileProxy);
+-  if (cap.size() == 16 && ars::connectTo(proxyHost, (uint16_t)proto->m_iFileProxyPort, sock)) {
++  const uint16_t configuredProxyPort = (uint16_t)proto->m_iFileProxyPort;
++  uint16_t activeProxyPort = configuredProxyPort;
++  unsigned allocateReply = 0, allocateError = 0;
++  bool allocated = false;
++  if (cap.size() == 16 && ars::connectTo(proxyHost, configuredProxyPort, sock)) {
+    { mir_cslock lk(proto->m_csFiles); f->active = sock; }
+-   proto->debugLogA("ARS DIAG3: proxy TCP connected; ALLOCATE request next");
+-   if (!InterlockedCompareExchange(&f->cancelled, 0, 0) &&
+-       ars::handshakeAllocate(sock, proto->m_szUin.c_str(), f->cookie, cap, ip, port)) {
++   proto->debugLogA("ARS TX V6: TCP connected to configured relay port %u; ALLOCATE request next", (unsigned)configuredProxyPort);
++   if (!InterlockedCompareExchange(&f->cancelled, 0, 0))
++    allocated = ars::handshakeAllocate(sock, proto->m_szUin.c_str(), f->cookie, cap,
++      ip, port, &allocateReply, &allocateError);
++   if (!allocated)
++    proto->debugLogA("ARS TX V6: ALLOCATE not accepted on port %u (reply=%u proxyError=%u); checking classic port if applicable",
++      (unsigned)configuredProxyPort, allocateReply, allocateError);
++  }
++  // Classic OSCAR ARS normally listens on TCP/5190. When an account still
++  // uses the old 5191 default, retry 5190 only if 5191 did not allocate.
++  // Never send a second invitation: this retry occurs before any offer.
++  if (!allocated && configuredProxyPort == 5191 && !InterlockedCompareExchange(&f->cancelled, 0, 0) && cap.size() == 16) {
++   if (sock != INVALID_SOCKET) {
++    { mir_cslock lk(proto->m_csFiles); if (f->active == sock) f->active = INVALID_SOCKET; }
++    closesocket(sock); sock = INVALID_SOCKET;
++   }
++   activeProxyPort = 5190;
++   proto->debugLogA("ARS TX V6: retry ALLOCATE on classic ARS TCP port 5190");
++   allocateReply = allocateError = 0;
++   if (ars::connectTo(proxyHost, activeProxyPort, sock)) {
++    { mir_cslock lk(proto->m_csFiles); f->active = sock; }
++    allocated = ars::handshakeAllocate(sock, proto->m_szUin.c_str(), f->cookie, cap,
++      ip, port, &allocateReply, &allocateError);
++    if (!allocated)
++     proto->debugLogA("ARS TX V6: classic port did not allocate (reply=%u proxyError=%u)", allocateReply, allocateError);
++   }
++   else proto->debugLogA("ARS TX V6: classic port 5190 connection failed");
++  }
++  if (sock != INVALID_SOCKET) {
++   if (allocated && !InterlockedCompareExchange(&f->cancelled, 0, 0)) {
+     proto->debugLogA("ARS DIAG3: ALLOCATE_OK, advertised relay %s:%u; sending OSCAR offer to %u", ars::ip4(ip).c_str(), (unsigned)port, f->uin);
+     oft2::Rendezvous rv;
+     rv.type = 0;
+@@ -1304,7 +1335,7 @@
+          closesocket(sock); sock = INVALID_SOCKET;
+         }
+         // Some servers return a ticket rather than a public TCP port.
+-        if (ars::connectTo(proxyHost, (uint16_t)proto->m_iFileProxyPort, sock)) {
++        if (ars::connectTo(proxyHost, activeProxyPort, sock)) {
+          { mir_cslock lk(proto->m_csFiles); f->active = sock; }
+          ready = ars::handshakeJoin(sock, proto->m_szUin.c_str(), f->cookie, cap, redirectPort);
+         }
+--- a/windows-xp-x86/0.96.7/KICQ/src/ars_proxy.h
++++ b/windows-xp-x86/0.96.7/KICQ/src/ars_proxy.h
+@@ -39,22 +39,33 @@
+  const unsigned char *p = (const unsigned char *)body.data();
+  if (r16(p) != 0x044A) return false;
+  command = r16(p + 2);
+- return command != 1;
++ return true; // Error command 0x0001 must be reported to caller, not silently hidden.
+ }
++// An ARS error has the same framed header as a successful response, but
++// command 0x0001 carries a two-byte error code (e.g. 0x000d bad request).
++// Keep these outputs optional so existing receiver-side call sites are intact.
+ static inline bool handshakeAllocate(SOCKET s, const std::string &uin, const std::array<unsigned char,8> &cookie,
+-                         const std::string &cap, uint32_t &ip, uint16_t &port) {
++                         const std::string &cap, uint32_t &ip, uint16_t &port,
++                         unsigned *responseCommand = nullptr, unsigned *proxyError = nullptr) {
+  std::string packet, body;
+  unsigned cmd = 0;
+- // ALLOCATE is a control exchange, not file data. On a silent/broken
+- // proxy fail promptly so the sender can issue a direct OFT2 offer.
+- DWORD allocateTimeout = 5000; // Fallback to direct OFT2 quickly if the relay is silent
++ if (responseCommand) *responseCommand = 0;
++ if (proxyError) *proxyError = 0;
++ // The classic ARS server may take up to ten seconds to answer a bad login;
++ // an 8s timeout keeps the test bounded while allowing slower relays.
++ DWORD allocateTimeout = 8000;
+  setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&allocateTimeout, sizeof(allocateTimeout));
+  const bool received = encode(packet, uin, cookie, cap, false, 0) &&
+-   oft2::send_all(s, packet.data(), packet.size()) &&
+-   recvMessage(s, cmd, body) && cmd == 3 && body.size() >= 16;
++   oft2::send_all(s, packet.data(), packet.size()) && recvMessage(s, cmd, body);
+  DWORD dataTimeout = kTimeoutMs;
+  setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&dataTimeout, sizeof(dataTimeout));
++ if (responseCommand) *responseCommand = cmd;
+  if (!received) return false;
++ if (cmd == 1 && body.size() >= 12) {
++  if (proxyError) *proxyError = r16((const unsigned char *)body.data() + 10);
++  return false;
++ }
++ if (cmd != 3 || body.size() != 16) return false;
+  const unsigned char *p = (const unsigned char *)body.data();
+  port = (uint16_t)r16(p + 10); ip = r32(p + 12);
+  return port != 0 && ip != 0;
+--- a/windows-xp-x86/0.96.7/KICQ/src/proto.cpp
++++ b/windows-xp-x86/0.96.7/KICQ/src/proto.cpp
+@@ -1249,11 +1249,42 @@
+   uint16_t port = 0;
+   const std::string cap = OscarText::unhex(CAP_FILE);
+   T2Utf proxyHost(proto->m_wszFileProxy);
+-  if (cap.size() == 16 && ars::connectTo(proxyHost, (uint16_t)proto->m_iFileProxyPort, sock)) {
++  const uint16_t configuredProxyPort = (uint16_t)proto->m_iFileProxyPort;
++  uint16_t activeProxyPort = configuredProxyPort;
++  unsigned allocateReply = 0, allocateError = 0;
++  bool allocated = false;
++  if (cap.size() == 16 && ars::connectTo(proxyHost, configuredProxyPort, sock)) {
+    { mir_cslock lk(proto->m_csFiles); f->active = sock; }
+-   proto->debugLogA("ARS DIAG3: proxy TCP connected; ALLOCATE request next");
+-   if (!InterlockedCompareExchange(&f->cancelled, 0, 0) &&
+-       ars::handshakeAllocate(sock, proto->m_szUin.c_str(), f->cookie, cap, ip, port)) {
++   proto->debugLogA("ARS TX V6: TCP connected to configured relay port %u; ALLOCATE request next", (unsigned)configuredProxyPort);
++   if (!InterlockedCompareExchange(&f->cancelled, 0, 0))
++    allocated = ars::handshakeAllocate(sock, proto->m_szUin.c_str(), f->cookie, cap,
++      ip, port, &allocateReply, &allocateError);
++   if (!allocated)
++    proto->debugLogA("ARS TX V6: ALLOCATE not accepted on port %u (reply=%u proxyError=%u); checking classic port if applicable",
++      (unsigned)configuredProxyPort, allocateReply, allocateError);
++  }
++  // Classic OSCAR ARS normally listens on TCP/5190. When an account still
++  // uses the old 5191 default, retry 5190 only if 5191 did not allocate.
++  // Never send a second invitation: this retry occurs before any offer.
++  if (!allocated && configuredProxyPort == 5191 && !InterlockedCompareExchange(&f->cancelled, 0, 0) && cap.size() == 16) {
++   if (sock != INVALID_SOCKET) {
++    { mir_cslock lk(proto->m_csFiles); if (f->active == sock) f->active = INVALID_SOCKET; }
++    closesocket(sock); sock = INVALID_SOCKET;
++   }
++   activeProxyPort = 5190;
++   proto->debugLogA("ARS TX V6: retry ALLOCATE on classic ARS TCP port 5190");
++   allocateReply = allocateError = 0;
++   if (ars::connectTo(proxyHost, activeProxyPort, sock)) {
++    { mir_cslock lk(proto->m_csFiles); f->active = sock; }
++    allocated = ars::handshakeAllocate(sock, proto->m_szUin.c_str(), f->cookie, cap,
++      ip, port, &allocateReply, &allocateError);
++    if (!allocated)
++     proto->debugLogA("ARS TX V6: classic port did not allocate (reply=%u proxyError=%u)", allocateReply, allocateError);
++   }
++   else proto->debugLogA("ARS TX V6: classic port 5190 connection failed");
++  }
++  if (sock != INVALID_SOCKET) {
++   if (allocated && !InterlockedCompareExchange(&f->cancelled, 0, 0)) {
+     proto->debugLogA("ARS DIAG3: ALLOCATE_OK, advertised relay %s:%u; sending OSCAR offer to %u", ars::ip4(ip).c_str(), (unsigned)port, f->uin);
+     oft2::Rendezvous rv;
+     rv.type = 0;
+@@ -1313,7 +1344,7 @@
+          closesocket(sock); sock = INVALID_SOCKET;
+         }
+         // Some servers return a ticket rather than a public TCP port.
+-        if (ars::connectTo(proxyHost, (uint16_t)proto->m_iFileProxyPort, sock)) {
++        if (ars::connectTo(proxyHost, activeProxyPort, sock)) {
+          { mir_cslock lk(proto->m_csFiles); f->active = sock; }
+          ready = ars::handshakeJoin(sock, proto->m_szUin.c_str(), f->cookie, cap, redirectPort);
+         }
+--- a/windows-xp-x86/0.96.8/KICQ/src/ars_proxy.h
++++ b/windows-xp-x86/0.96.8/KICQ/src/ars_proxy.h
+@@ -39,22 +39,33 @@
+  const unsigned char *p = (const unsigned char *)body.data();
+  if (r16(p) != 0x044A) return false;
+  command = r16(p + 2);
+- return command != 1;
++ return true; // Error command 0x0001 must be reported to caller, not silently hidden.
+ }
++// An ARS error has the same framed header as a successful response, but
++// command 0x0001 carries a two-byte error code (e.g. 0x000d bad request).
++// Keep these outputs optional so existing receiver-side call sites are intact.
+ static inline bool handshakeAllocate(SOCKET s, const std::string &uin, const std::array<unsigned char,8> &cookie,
+-                         const std::string &cap, uint32_t &ip, uint16_t &port) {
++                         const std::string &cap, uint32_t &ip, uint16_t &port,
++                         unsigned *responseCommand = nullptr, unsigned *proxyError = nullptr) {
+  std::string packet, body;
+  unsigned cmd = 0;
+- // ALLOCATE is a control exchange, not file data. On a silent/broken
+- // proxy fail promptly so the sender can issue a direct OFT2 offer.
+- DWORD allocateTimeout = 5000; // Fallback to direct OFT2 quickly if the relay is silent
++ if (responseCommand) *responseCommand = 0;
++ if (proxyError) *proxyError = 0;
++ // The classic ARS server may take up to ten seconds to answer a bad login;
++ // an 8s timeout keeps the test bounded while allowing slower relays.
++ DWORD allocateTimeout = 8000;
+  setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&allocateTimeout, sizeof(allocateTimeout));
+  const bool received = encode(packet, uin, cookie, cap, false, 0) &&
+-   oft2::send_all(s, packet.data(), packet.size()) &&
+-   recvMessage(s, cmd, body) && cmd == 3 && body.size() >= 16;
++   oft2::send_all(s, packet.data(), packet.size()) && recvMessage(s, cmd, body);
+  DWORD dataTimeout = kTimeoutMs;
+  setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&dataTimeout, sizeof(dataTimeout));
++ if (responseCommand) *responseCommand = cmd;
+  if (!received) return false;
++ if (cmd == 1 && body.size() >= 12) {
++  if (proxyError) *proxyError = r16((const unsigned char *)body.data() + 10);
++  return false;
++ }
++ if (cmd != 3 || body.size() != 16) return false;
+  const unsigned char *p = (const unsigned char *)body.data();
+  port = (uint16_t)r16(p + 10); ip = r32(p + 12);
+  return port != 0 && ip != 0;
+--- a/windows-xp-x86/0.96.8/KICQ/src/proto.cpp
++++ b/windows-xp-x86/0.96.8/KICQ/src/proto.cpp
+@@ -1244,11 +1244,42 @@
+   uint16_t port = 0;
+   const std::string cap = OscarText::unhex(CAP_FILE);
+   T2Utf proxyHost(proto->m_wszFileProxy);
+-  if (cap.size() == 16 && ars::connectTo(proxyHost, (uint16_t)proto->m_iFileProxyPort, sock)) {
++  const uint16_t configuredProxyPort = (uint16_t)proto->m_iFileProxyPort;
++  uint16_t activeProxyPort = configuredProxyPort;
++  unsigned allocateReply = 0, allocateError = 0;
++  bool allocated = false;
++  if (cap.size() == 16 && ars::connectTo(proxyHost, configuredProxyPort, sock)) {
+    { mir_cslock lk(proto->m_csFiles); f->active = sock; }
+-   proto->debugLogA("ARS DIAG3: proxy TCP connected; ALLOCATE request next");
+-   if (!InterlockedCompareExchange(&f->cancelled, 0, 0) &&
+-       ars::handshakeAllocate(sock, proto->m_szUin.c_str(), f->cookie, cap, ip, port)) {
++   proto->debugLogA("ARS TX V6: TCP connected to configured relay port %u; ALLOCATE request next", (unsigned)configuredProxyPort);
++   if (!InterlockedCompareExchange(&f->cancelled, 0, 0))
++    allocated = ars::handshakeAllocate(sock, proto->m_szUin.c_str(), f->cookie, cap,
++      ip, port, &allocateReply, &allocateError);
++   if (!allocated)
++    proto->debugLogA("ARS TX V6: ALLOCATE not accepted on port %u (reply=%u proxyError=%u); checking classic port if applicable",
++      (unsigned)configuredProxyPort, allocateReply, allocateError);
++  }
++  // Classic OSCAR ARS normally listens on TCP/5190. When an account still
++  // uses the old 5191 default, retry 5190 only if 5191 did not allocate.
++  // Never send a second invitation: this retry occurs before any offer.
++  if (!allocated && configuredProxyPort == 5191 && !InterlockedCompareExchange(&f->cancelled, 0, 0) && cap.size() == 16) {
++   if (sock != INVALID_SOCKET) {
++    { mir_cslock lk(proto->m_csFiles); if (f->active == sock) f->active = INVALID_SOCKET; }
++    closesocket(sock); sock = INVALID_SOCKET;
++   }
++   activeProxyPort = 5190;
++   proto->debugLogA("ARS TX V6: retry ALLOCATE on classic ARS TCP port 5190");
++   allocateReply = allocateError = 0;
++   if (ars::connectTo(proxyHost, activeProxyPort, sock)) {
++    { mir_cslock lk(proto->m_csFiles); f->active = sock; }
++    allocated = ars::handshakeAllocate(sock, proto->m_szUin.c_str(), f->cookie, cap,
++      ip, port, &allocateReply, &allocateError);
++    if (!allocated)
++     proto->debugLogA("ARS TX V6: classic port did not allocate (reply=%u proxyError=%u)", allocateReply, allocateError);
++   }
++   else proto->debugLogA("ARS TX V6: classic port 5190 connection failed");
++  }
++  if (sock != INVALID_SOCKET) {
++   if (allocated && !InterlockedCompareExchange(&f->cancelled, 0, 0)) {
+     proto->debugLogA("ARS DIAG3: ALLOCATE_OK, advertised relay %s:%u; sending OSCAR offer to %u", ars::ip4(ip).c_str(), (unsigned)port, f->uin);
+     oft2::Rendezvous rv;
+     rv.type = 0;
+@@ -1308,7 +1339,7 @@
+          closesocket(sock); sock = INVALID_SOCKET;
+         }
+         // Some servers return a ticket rather than a public TCP port.
+-        if (ars::connectTo(proxyHost, (uint16_t)proto->m_iFileProxyPort, sock)) {
++        if (ars::connectTo(proxyHost, activeProxyPort, sock)) {
+          { mir_cslock lk(proto->m_csFiles); f->active = sock; }
+          ready = ars::handshakeJoin(sock, proto->m_szUin.c_str(), f->cookie, cap, redirectPort);
+         }

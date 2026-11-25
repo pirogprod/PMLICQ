@@ -36,7 +36,7 @@ PLUGININFOEX pluginInfoEx =
 CMPlugin::CMPlugin() :
 	ACCPROTOPLUGIN<CKicqProto>("PMLICQ", pluginInfoEx)
 {
-	SetUniqueId("UIN");
+	SetUniqueId("ScreenName");
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////

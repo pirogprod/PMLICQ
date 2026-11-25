@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 // OFT2 TCP transport primitives. The caller owns the socket and must negotiate
 // OSCAR rendezvous and notify Miranda before using these operations.
 #include "oft2_codec.h"
@@ -51,14 +51,16 @@ static inline bool send_prompt(SOCKET s, const uint8_t (&packet)[HEADER_SIZE]) {
 // Transfer exactly 'size' bytes; never treat a short read/write as success.
 // progress may be nullptr. A callback returning false cancels the transfer.
 typedef bool (*Progress)(uint64_t transferred, uint64_t total, void *context);
-static inline bool send_file(SOCKET s, FILE *f, uint64_t size, Progress progress, void *context) {
+static inline bool send_file(SOCKET s, FILE *f, uint64_t size, Progress progress, void *context, uint64_t *sentBytes = nullptr) {
+ if (sentBytes) *sentBytes = 0;
  if (!f) return false;
- uint8_t buffer[32768]; uint64_t done = 0;
+ uint8_t buffer[65536]; uint64_t done = 0;
  while (done < size) {
   size_t wanted = (size_t)((size - done) < sizeof(buffer) ? (size - done) : sizeof(buffer));
   size_t got = fread(buffer, 1, wanted, f);
   if (got != wanted || !send_all(s, buffer, got)) return false;
   done += got;
+  if (sentBytes) *sentBytes = done;
   if (progress && !progress(done, size, context)) return false;
  }
  return true;

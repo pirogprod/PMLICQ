@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 // PMLICQ ARS relay transport, independent of Miranda callbacks and data model.
 // OSCAR ARS protocol 0x044A / allocate=2 / ready=5 / join=4.
 // The caller owns the socket; never free a socket from a second thread.
@@ -39,14 +39,33 @@ static inline bool recvMessage(SOCKET s, unsigned &command, std::string &body) {
  const unsigned char *p = (const unsigned char *)body.data();
  if (r16(p) != 0x044A) return false;
  command = r16(p + 2);
- return command != 1;
+ return true; // Error command 0x0001 must be reported to caller, not silently hidden.
 }
+// An ARS error has the same framed header as a successful response, but
+// command 0x0001 carries a two-byte error code (e.g. 0x000d bad request).
+// Keep these outputs optional so existing receiver-side call sites are intact.
 static inline bool handshakeAllocate(SOCKET s, const std::string &uin, const std::array<unsigned char,8> &cookie,
-                         const std::string &cap, uint32_t &ip, uint16_t &port) {
+                         const std::string &cap, uint32_t &ip, uint16_t &port,
+                         unsigned *responseCommand = nullptr, unsigned *proxyError = nullptr) {
  std::string packet, body;
  unsigned cmd = 0;
- if (!encode(packet, uin, cookie, cap, false, 0) || !oft2::send_all(s, packet.data(), packet.size()) ||
-     !recvMessage(s, cmd, body) || cmd != 3 || body.size() < 16) return false;
+ if (responseCommand) *responseCommand = 0;
+ if (proxyError) *proxyError = 0;
+ // The classic ARS server may take up to ten seconds to answer a bad login;
+ // an 8s timeout keeps the test bounded while allowing slower relays.
+ DWORD allocateTimeout = 8000;
+ setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&allocateTimeout, sizeof(allocateTimeout));
+ const bool received = encode(packet, uin, cookie, cap, false, 0) &&
+   oft2::send_all(s, packet.data(), packet.size()) && recvMessage(s, cmd, body);
+ DWORD dataTimeout = kTimeoutMs;
+ setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&dataTimeout, sizeof(dataTimeout));
+ if (responseCommand) *responseCommand = cmd;
+ if (!received) return false;
+ if (cmd == 1 && body.size() >= 12) {
+  if (proxyError) *proxyError = r16((const unsigned char *)body.data() + 10);
+  return false;
+ }
+ if (cmd != 3 || body.size() != 16) return false;
  const unsigned char *p = (const unsigned char *)body.data();
  port = (uint16_t)r16(p + 10); ip = r32(p + 12);
  return port != 0 && ip != 0;
@@ -56,7 +75,7 @@ static inline bool handshakeJoin(SOCKET s, const std::string &uin, const std::ar
  std::string packet, body; unsigned cmd = 0;
  // A rejected JOIN must not occupy the entire 120-second sender timeout.
  // Restore the data-phase timeout after a successful handshake.
- DWORD handshakeTimeout = 15000;
+ DWORD handshakeTimeout = 5000;
  setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&handshakeTimeout, sizeof(handshakeTimeout));
  bool ok = encode(packet, uin, cookie, cap, true, port) &&
            oft2::send_all(s, packet.data(), packet.size()) &&
@@ -65,9 +84,11 @@ static inline bool handshakeJoin(SOCKET s, const std::string &uin, const std::ar
  setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&dataTimeout, sizeof(dataTimeout));
  return ok;
 }
-static inline bool waitReady(SOCKET s) {
+static inline bool waitReady(SOCKET s, unsigned *lastResponse = nullptr) {
  unsigned command = 0; std::string body;
- return recvMessage(s, command, body) && command == 5;
+ const bool received = recvMessage(s, command, body);
+ if (lastResponse) *lastResponse = command;
+ return received && command == 5;
 }
 static inline bool connectTo(const char *host, uint16_t port, SOCKET &result) {
  result = INVALID_SOCKET;
@@ -84,7 +105,7 @@ static inline bool connectTo(const char *host, uint16_t port, SOCKET &result) {
   int r=connect(s, it->ai_addr, (int)it->ai_addrlen);
   if (r == SOCKET_ERROR && WSAGetLastError() == WSAEWOULDBLOCK) {
    fd_set writes, errors; FD_ZERO(&writes); FD_ZERO(&errors); FD_SET(s, &writes); FD_SET(s, &errors);
-   timeval tv = { 15, 0 };
+   timeval tv = { 5, 0 }; // Do not stall initial OSCAR file invitation for 15 seconds
    r = select(0, nullptr, &writes, &errors, &tv);
    if (r > 0 && FD_ISSET(s, &writes)) { int err=0; int len=sizeof(err); r = (getsockopt(s, SOL_SOCKET, SO_ERROR, (char *)&err, &len)==0 && !err) ? 0 : SOCKET_ERROR; }
    else r=SOCKET_ERROR;

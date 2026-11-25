@@ -1,0 +1,716 @@
+--- a/normal/0.96.7/KICQ/src/proto.cpp
++++ b/normal/0.96.7/KICQ/src/proto.cpp
+@@ -1079,23 +1079,32 @@
+ 
+ // Select the IPv4 used to reach the OSCAR server; does not send any UDP data.
+ // This is a local interface address, not a NAT-discovered public address.
+-static uint32_t Oft2LocalIPv4()
+-{
+- SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+- if (s == INVALID_SOCKET) return 0;
+- sockaddr_in peer = {};
+- peer.sin_family = AF_INET;
+- peer.sin_port = htons(5190);
+- peer.sin_addr.s_addr = inet_addr(KICQ_DEFAULT_SERVER);
++static uint32_t Oft2LocalIPv4(const char *host)
++{
++ // The earlier build used a hard-coded OSCAR address regardless of the
++ // configured server. Choose the interface route to the actual server.
++ // This is NOT public-IP discovery: NAT still requires a reachable relay.
++ if (!host || !*host) return 0;
++ addrinfo hints = {};
++ hints.ai_family = AF_INET;
++ hints.ai_socktype = SOCK_DGRAM;
++ addrinfo *addresses = nullptr;
++ if (getaddrinfo(host, "5190", &hints, &addresses) != 0 || !addresses)
++  return 0;
+  uint32_t ip = 0;
+- if (peer.sin_addr.s_addr != INADDR_NONE &&
+-     connect(s, (const sockaddr *)&peer, sizeof(peer)) != SOCKET_ERROR) {
+-  sockaddr_in local = {};
+-  int len = sizeof(local);
+-  if (getsockname(s, (sockaddr *)&local, &len) == 0)
+-   ip = ntohl(local.sin_addr.s_addr);
+- }
+- closesocket(s);
++ for (addrinfo *entry = addresses; entry; entry = entry->ai_next) {
++  SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
++  if (sock == INVALID_SOCKET) continue;
++  if (connect(sock, entry->ai_addr, (int)entry->ai_addrlen) != SOCKET_ERROR) {
++   sockaddr_in local = {};
++   int len = sizeof(local);
++   if (getsockname(sock, (sockaddr *)&local, &len) == 0)
++    ip = ntohl(local.sin_addr.s_addr);
++  }
++  closesocket(sock);
++  if (ip) break;
++ }
++ freeaddrinfo(addresses);
+  return ip;
+ }
+ 
+@@ -1120,7 +1129,7 @@
+   debugLogA("OFT2 fallback: cannot open TCP listener");
+   return false;
+  }
+- const uint32_t ip = Oft2LocalIPv4();
++ const uint32_t ip = Oft2LocalIPv4(T2Utf(m_wszServer));
+  const bytes_t cap = OscarText::unhex(CAP_FILE);
+  if (!ip || cap.size() != 16) {
+   debugLogA("OFT2 fallback: no route to OSCAR server or invalid file capability");
+@@ -1162,7 +1171,9 @@
+  bytes_t cookie((const char *)f->cookie.data(), 8);
+  uint32_t req;
+  { mir_cslock lk(m_csPending); req = m_nextMsgReq++; }
++ { mir_cslock lk(m_csFiles); f->offerRequestId = req; }
+  Send(OscarPackets::fileRendezvous(receiver, cookie, payload, req));
++ ProtoBroadcastAck(f->contact, ACKTYPE_FILE, ACKRESULT_LISTENING, f.get());
+  debugLogA("OFT2 fallback: direct file offer sent to %u, port=%u, local IP=%s (NAT may block it)",
+    (unsigned)f->uin, (unsigned)rv.port, ars::ip4(ip).c_str());
+  return true;
+@@ -1261,6 +1272,7 @@
+       bytes_t cookie((const char *)f->cookie.data(), 8);
+       uint32_t req;
+       { mir_cslock lk(proto->m_csPending); req = proto->m_nextMsgReq++; }
++      { mir_cslock lk(proto->m_csFiles); f->offerRequestId = req; }
+       proto->Send(OscarPackets::fileRendezvous(receiver, cookie, payload, req));
+       offerSent = true;
+       proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE, ACKRESULT_LISTENING, f.get());
+@@ -1328,15 +1340,17 @@
+   // Such a duplicate can leave two pending dialogs and mismatched rendezvous state.
+   if (offerSent || success || InterlockedCompareExchange(&f->cancelled, 0, 0)) {
+    if (!success) proto->debugLogA("ARS sender: offer was sent but transfer failed; no duplicate direct offer");
+-   proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE,
+-     success ? ACKRESULT_SUCCESS : ACKRESULT_FAILED, f.get(), 0);
++   if (InterlockedCompareExchange(&f->terminalAckSent, 1, 0) == 0)
++    proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE,
++      success ? ACKRESULT_SUCCESS : ACKRESULT_FAILED, f.get(), 0);
+    return 0;
+   }
+   // The relay never yielded an offer: fall back to direct TCP/OFT2.
+   proto->debugLogA("ARS sender: no relay offer sent; attempting direct OFT2 fallback");
+   f->viaProxy = false;
+   if (!proto->StartDirectFileFallback(f)) {
+-   proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE, ACKRESULT_FAILED, f.get(), 0);
++   if (InterlockedCompareExchange(&f->terminalAckSent, 1, 0) == 0)
++    proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE, ACKRESULT_FAILED, f.get(), 0);
+    return 0;
+   }
+  }
+@@ -1379,8 +1393,9 @@
+  f->listener.close();
+  if (!success)
+   proto->debugLogA("OFT2 sender: direct transport failed or recipient did not connect");
+- proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE,
+-  success ? ACKRESULT_SUCCESS : ACKRESULT_FAILED, f.get(), 0);
++ if (InterlockedCompareExchange(&f->terminalAckSent, 1, 0) == 0)
++  proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE,
++   success ? ACKRESULT_SUCCESS : ACKRESULT_FAILED, f.get(), 0);
+  return 0;
+ }
+ 
+@@ -1420,7 +1435,7 @@
+  memcpy(rv.capability.data(), cap.data(), 16);
+  rv.port = f->listener.port();
+  rv.requestNumber = 1;
+- rv.externalIp = Oft2LocalIPv4();
++ rv.externalIp = Oft2LocalIPv4(T2Utf(m_wszServer));
+  rv.internalIp = rv.externalIp;
+  if (!rv.externalIp) return nullptr;
+  rv.hasOffer = true;
+@@ -1447,7 +1462,11 @@
+  bytes_t cookie((char *)f->cookie.data(), 8);
+  if (!f->viaProxy) {
+   debugLogA("OFT2 sender: sending initial direct OSCAR file offer to %u", (unsigned)uin);
+-  Send(OscarPackets::fileRendezvous(recipient, cookie, payload, m_nextMsgReq++));
++  uint32_t requestId;
++  { mir_cslock lk(m_csPending); requestId = m_nextMsgReq++; }
++  { mir_cslock lk(m_csFiles); f->offerRequestId = requestId; }
++  Send(OscarPackets::fileRendezvous(recipient, cookie, payload, requestId));
++  ProtoBroadcastAck(f->contact, ACKTYPE_FILE, ACKRESULT_LISTENING, f.get());
+  }
+  else debugLogA("ARS sender: starting relay allocation for %u (offer not yet sent)", (unsigned)uin);
+  return f.get();
+--- a/normal/0.96.7/KICQ/src/proto.h
++++ b/normal/0.96.7/KICQ/src/proto.h
+@@ -78,6 +78,9 @@
+         uint32_t redirectIp = 0;
+         uint16_t redirectPort = 0;
+         uint32_t uin = 0;
++        // OSCAR SNAC request id of the pending file invitation.
++        uint32_t offerRequestId = 0;
++        volatile LONG terminalAckSent = 0;
+         SOCKET active = INVALID_SOCKET;
+ 		MCONTACT contact = 0;
+ 		std::wstring path, filename;
+--- a/normal/0.96.7/KICQ/src/server.cpp
++++ b/normal/0.96.7/KICQ/src/server.cpp
+@@ -1789,6 +1789,31 @@
+ {
+ 	int code = OscarReader(data).u16();
+ 
++ // File rendezvous messages are not tracked in m_pendingMsgs. Match the
++ // OSCAR request ID so an explicit server rejection is not silently ignored.
++ std::shared_ptr<OutgoingFile> rejectedFile;
++ {
++  mir_cslock lock(m_csFiles);
++  for (auto &entry : m_outgoingFiles) {
++   auto &file = entry.second;
++   if (file->offerRequestId == reqId && reqId != 0 &&
++       InterlockedCompareExchange(&file->terminalAckSent, 0, 0) == 0) {
++    rejectedFile = file;
++    InterlockedExchange(&file->cancelled, 1);
++    if (file->active != INVALID_SOCKET) shutdown(file->active, SD_BOTH);
++    file->listener.close();
++    break;
++   }
++  }
++ }
++ if (rejectedFile) {
++  debugLogA("OFT2 OSCAR server refused file invitation: reqId=%u error=%d uin=%u",
++    (unsigned)reqId, code, (unsigned)rejectedFile->uin);
++  if (InterlockedCompareExchange(&rejectedFile->terminalAckSent, 1, 0) == 0)
++   ProtoBroadcastAck(rejectedFile->contact, ACKTYPE_FILE, ACKRESULT_FAILED, rejectedFile.get(), 0);
++  return;
++ }
++
+ 	KicqPendingMsg msg;
+ 	{
+ 		mir_cslock lck(m_csPending);
+--- a/normal/0.96.8/KICQ/src/proto.cpp
++++ b/normal/0.96.8/KICQ/src/proto.cpp
+@@ -1077,23 +1077,32 @@
+ 
+ // Select the IPv4 used to reach the OSCAR server; does not send any UDP data.
+ // This is a local interface address, not a NAT-discovered public address.
+-static uint32_t Oft2LocalIPv4()
+-{
+- SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+- if (s == INVALID_SOCKET) return 0;
+- sockaddr_in peer = {};
+- peer.sin_family = AF_INET;
+- peer.sin_port = htons(5190);
+- peer.sin_addr.s_addr = inet_addr(KICQ_DEFAULT_SERVER);
++static uint32_t Oft2LocalIPv4(const char *host)
++{
++ // The earlier build used a hard-coded OSCAR address regardless of the
++ // configured server. Choose the interface route to the actual server.
++ // This is NOT public-IP discovery: NAT still requires a reachable relay.
++ if (!host || !*host) return 0;
++ addrinfo hints = {};
++ hints.ai_family = AF_INET;
++ hints.ai_socktype = SOCK_DGRAM;
++ addrinfo *addresses = nullptr;
++ if (getaddrinfo(host, "5190", &hints, &addresses) != 0 || !addresses)
++  return 0;
+  uint32_t ip = 0;
+- if (peer.sin_addr.s_addr != INADDR_NONE &&
+-     connect(s, (const sockaddr *)&peer, sizeof(peer)) != SOCKET_ERROR) {
+-  sockaddr_in local = {};
+-  int len = sizeof(local);
+-  if (getsockname(s, (sockaddr *)&local, &len) == 0)
+-   ip = ntohl(local.sin_addr.s_addr);
+- }
+- closesocket(s);
++ for (addrinfo *entry = addresses; entry; entry = entry->ai_next) {
++  SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
++  if (sock == INVALID_SOCKET) continue;
++  if (connect(sock, entry->ai_addr, (int)entry->ai_addrlen) != SOCKET_ERROR) {
++   sockaddr_in local = {};
++   int len = sizeof(local);
++   if (getsockname(sock, (sockaddr *)&local, &len) == 0)
++    ip = ntohl(local.sin_addr.s_addr);
++  }
++  closesocket(sock);
++  if (ip) break;
++ }
++ freeaddrinfo(addresses);
+  return ip;
+ }
+ 
+@@ -1118,7 +1127,7 @@
+   debugLogA("OFT2 fallback: cannot open TCP listener");
+   return false;
+  }
+- const uint32_t ip = Oft2LocalIPv4();
++ const uint32_t ip = Oft2LocalIPv4(T2Utf(m_wszServer));
+  const bytes_t cap = OscarText::unhex(CAP_FILE);
+  if (!ip || cap.size() != 16) {
+   debugLogA("OFT2 fallback: no route to OSCAR server or invalid file capability");
+@@ -1160,7 +1169,9 @@
+  bytes_t cookie((const char *)f->cookie.data(), 8);
+  uint32_t req;
+  { mir_cslock lk(m_csPending); req = m_nextMsgReq++; }
++ { mir_cslock lk(m_csFiles); f->offerRequestId = req; }
+  Send(OscarPackets::fileRendezvous(receiver, cookie, payload, req));
++ ProtoBroadcastAck(f->contact, ACKTYPE_FILE, ACKRESULT_LISTENING, f.get());
+  debugLogA("OFT2 fallback: direct file offer sent to %u, port=%u, local IP=%s (NAT may block it)",
+    (unsigned)f->uin, (unsigned)rv.port, ars::ip4(ip).c_str());
+  return true;
+@@ -1259,6 +1270,7 @@
+       bytes_t cookie((const char *)f->cookie.data(), 8);
+       uint32_t req;
+       { mir_cslock lk(proto->m_csPending); req = proto->m_nextMsgReq++; }
++      { mir_cslock lk(proto->m_csFiles); f->offerRequestId = req; }
+       proto->Send(OscarPackets::fileRendezvous(receiver, cookie, payload, req));
+       offerSent = true;
+       proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE, ACKRESULT_LISTENING, f.get());
+@@ -1326,15 +1338,17 @@
+   // Such a duplicate can leave two pending dialogs and mismatched rendezvous state.
+   if (offerSent || success || InterlockedCompareExchange(&f->cancelled, 0, 0)) {
+    if (!success) proto->debugLogA("ARS sender: offer was sent but transfer failed; no duplicate direct offer");
+-   proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE,
+-     success ? ACKRESULT_SUCCESS : ACKRESULT_FAILED, f.get(), 0);
++   if (InterlockedCompareExchange(&f->terminalAckSent, 1, 0) == 0)
++    proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE,
++      success ? ACKRESULT_SUCCESS : ACKRESULT_FAILED, f.get(), 0);
+    return 0;
+   }
+   // The relay never yielded an offer: fall back to direct TCP/OFT2.
+   proto->debugLogA("ARS sender: no relay offer sent; attempting direct OFT2 fallback");
+   f->viaProxy = false;
+   if (!proto->StartDirectFileFallback(f)) {
+-   proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE, ACKRESULT_FAILED, f.get(), 0);
++   if (InterlockedCompareExchange(&f->terminalAckSent, 1, 0) == 0)
++    proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE, ACKRESULT_FAILED, f.get(), 0);
+    return 0;
+   }
+  }
+@@ -1377,8 +1391,9 @@
+  f->listener.close();
+  if (!success)
+   proto->debugLogA("OFT2 sender: direct transport failed or recipient did not connect");
+- proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE,
+-  success ? ACKRESULT_SUCCESS : ACKRESULT_FAILED, f.get(), 0);
++ if (InterlockedCompareExchange(&f->terminalAckSent, 1, 0) == 0)
++  proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE,
++   success ? ACKRESULT_SUCCESS : ACKRESULT_FAILED, f.get(), 0);
+  return 0;
+ }
+ 
+@@ -1418,7 +1433,7 @@
+  memcpy(rv.capability.data(), cap.data(), 16);
+  rv.port = f->listener.port();
+  rv.requestNumber = 1;
+- rv.externalIp = Oft2LocalIPv4();
++ rv.externalIp = Oft2LocalIPv4(T2Utf(m_wszServer));
+  rv.internalIp = rv.externalIp;
+  if (!rv.externalIp) return nullptr;
+  rv.hasOffer = true;
+@@ -1445,7 +1460,11 @@
+  bytes_t cookie((char *)f->cookie.data(), 8);
+  if (!f->viaProxy) {
+   debugLogA("OFT2 sender: sending initial direct OSCAR file offer to %u", (unsigned)uin);
+-  Send(OscarPackets::fileRendezvous(recipient, cookie, payload, m_nextMsgReq++));
++  uint32_t requestId;
++  { mir_cslock lk(m_csPending); requestId = m_nextMsgReq++; }
++  { mir_cslock lk(m_csFiles); f->offerRequestId = requestId; }
++  Send(OscarPackets::fileRendezvous(recipient, cookie, payload, requestId));
++  ProtoBroadcastAck(f->contact, ACKTYPE_FILE, ACKRESULT_LISTENING, f.get());
+  }
+  else debugLogA("ARS sender: starting relay allocation for %u (offer not yet sent)", (unsigned)uin);
+  return f.get();
+--- a/normal/0.96.8/KICQ/src/proto.h
++++ b/normal/0.96.8/KICQ/src/proto.h
+@@ -78,6 +78,9 @@
+         uint32_t redirectIp = 0;
+         uint16_t redirectPort = 0;
+         uint32_t uin = 0;
++        // OSCAR SNAC request id of the pending file invitation.
++        uint32_t offerRequestId = 0;
++        volatile LONG terminalAckSent = 0;
+         SOCKET active = INVALID_SOCKET;
+ 		MCONTACT contact = 0;
+ 		std::wstring path, filename;
+--- a/normal/0.96.8/KICQ/src/server.cpp
++++ b/normal/0.96.8/KICQ/src/server.cpp
+@@ -1789,6 +1789,31 @@
+ {
+ 	int code = OscarReader(data).u16();
+ 
++ // File rendezvous messages are not tracked in m_pendingMsgs. Match the
++ // OSCAR request ID so an explicit server rejection is not silently ignored.
++ std::shared_ptr<OutgoingFile> rejectedFile;
++ {
++  mir_cslock lock(m_csFiles);
++  for (auto &entry : m_outgoingFiles) {
++   auto &file = entry.second;
++   if (file->offerRequestId == reqId && reqId != 0 &&
++       InterlockedCompareExchange(&file->terminalAckSent, 0, 0) == 0) {
++    rejectedFile = file;
++    InterlockedExchange(&file->cancelled, 1);
++    if (file->active != INVALID_SOCKET) shutdown(file->active, SD_BOTH);
++    file->listener.close();
++    break;
++   }
++  }
++ }
++ if (rejectedFile) {
++  debugLogA("OFT2 OSCAR server refused file invitation: reqId=%u error=%d uin=%u",
++    (unsigned)reqId, code, (unsigned)rejectedFile->uin);
++  if (InterlockedCompareExchange(&rejectedFile->terminalAckSent, 1, 0) == 0)
++   ProtoBroadcastAck(rejectedFile->contact, ACKTYPE_FILE, ACKRESULT_FAILED, rejectedFile.get(), 0);
++  return;
++ }
++
+ 	KicqPendingMsg msg;
+ 	{
+ 		mir_cslock lck(m_csPending);
+--- a/windows-xp-x86/0.96.7/KICQ/src/proto.cpp
++++ b/windows-xp-x86/0.96.7/KICQ/src/proto.cpp
+@@ -1086,23 +1086,32 @@
+ 
+ // Select the IPv4 used to reach the OSCAR server; does not send any UDP data.
+ // This is a local interface address, not a NAT-discovered public address.
+-static uint32_t Oft2LocalIPv4()
+-{
+- SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+- if (s == INVALID_SOCKET) return 0;
+- sockaddr_in peer = {};
+- peer.sin_family = AF_INET;
+- peer.sin_port = htons(5190);
+- peer.sin_addr.s_addr = inet_addr(KICQ_DEFAULT_SERVER);
++static uint32_t Oft2LocalIPv4(const char *host)
++{
++ // The earlier build used a hard-coded OSCAR address regardless of the
++ // configured server. Choose the interface route to the actual server.
++ // This is NOT public-IP discovery: NAT still requires a reachable relay.
++ if (!host || !*host) return 0;
++ addrinfo hints = {};
++ hints.ai_family = AF_INET;
++ hints.ai_socktype = SOCK_DGRAM;
++ addrinfo *addresses = nullptr;
++ if (getaddrinfo(host, "5190", &hints, &addresses) != 0 || !addresses)
++  return 0;
+  uint32_t ip = 0;
+- if (peer.sin_addr.s_addr != INADDR_NONE &&
+-     connect(s, (const sockaddr *)&peer, sizeof(peer)) != SOCKET_ERROR) {
+-  sockaddr_in local = {};
+-  int len = sizeof(local);
+-  if (getsockname(s, (sockaddr *)&local, &len) == 0)
+-   ip = ntohl(local.sin_addr.s_addr);
+- }
+- closesocket(s);
++ for (addrinfo *entry = addresses; entry; entry = entry->ai_next) {
++  SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
++  if (sock == INVALID_SOCKET) continue;
++  if (connect(sock, entry->ai_addr, (int)entry->ai_addrlen) != SOCKET_ERROR) {
++   sockaddr_in local = {};
++   int len = sizeof(local);
++   if (getsockname(sock, (sockaddr *)&local, &len) == 0)
++    ip = ntohl(local.sin_addr.s_addr);
++  }
++  closesocket(sock);
++  if (ip) break;
++ }
++ freeaddrinfo(addresses);
+  return ip;
+ }
+ 
+@@ -1127,7 +1136,7 @@
+   debugLogA("OFT2 fallback: cannot open TCP listener");
+   return false;
+  }
+- const uint32_t ip = Oft2LocalIPv4();
++ const uint32_t ip = Oft2LocalIPv4(T2Utf(m_wszServer));
+  const bytes_t cap = OscarText::unhex(CAP_FILE);
+  if (!ip || cap.size() != 16) {
+   debugLogA("OFT2 fallback: no route to OSCAR server or invalid file capability");
+@@ -1169,7 +1178,9 @@
+  bytes_t cookie((const char *)f->cookie.data(), 8);
+  uint32_t req;
+  { mir_cslock lk(m_csPending); req = m_nextMsgReq++; }
++ { mir_cslock lk(m_csFiles); f->offerRequestId = req; }
+  Send(OscarPackets::fileRendezvous(receiver, cookie, payload, req));
++ ProtoBroadcastAck(f->contact, ACKTYPE_FILE, ACKRESULT_LISTENING, f.get());
+  debugLogA("OFT2 fallback: direct file offer sent to %u, port=%u, local IP=%s (NAT may block it)",
+    (unsigned)f->uin, (unsigned)rv.port, ars::ip4(ip).c_str());
+  return true;
+@@ -1268,6 +1279,7 @@
+       bytes_t cookie((const char *)f->cookie.data(), 8);
+       uint32_t req;
+       { mir_cslock lk(proto->m_csPending); req = proto->m_nextMsgReq++; }
++      { mir_cslock lk(proto->m_csFiles); f->offerRequestId = req; }
+       proto->Send(OscarPackets::fileRendezvous(receiver, cookie, payload, req));
+       offerSent = true;
+       proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE, ACKRESULT_LISTENING, f.get());
+@@ -1335,15 +1347,17 @@
+   // Such a duplicate can leave two pending dialogs and mismatched rendezvous state.
+   if (offerSent || success || InterlockedCompareExchange(&f->cancelled, 0, 0)) {
+    if (!success) proto->debugLogA("ARS sender: offer was sent but transfer failed; no duplicate direct offer");
+-   proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE,
+-     success ? ACKRESULT_SUCCESS : ACKRESULT_FAILED, f.get(), 0);
++   if (InterlockedCompareExchange(&f->terminalAckSent, 1, 0) == 0)
++    proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE,
++      success ? ACKRESULT_SUCCESS : ACKRESULT_FAILED, f.get(), 0);
+    return 0;
+   }
+   // The relay never yielded an offer: fall back to direct TCP/OFT2.
+   proto->debugLogA("ARS sender: no relay offer sent; attempting direct OFT2 fallback");
+   f->viaProxy = false;
+   if (!proto->StartDirectFileFallback(f)) {
+-   proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE, ACKRESULT_FAILED, f.get(), 0);
++   if (InterlockedCompareExchange(&f->terminalAckSent, 1, 0) == 0)
++    proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE, ACKRESULT_FAILED, f.get(), 0);
+    return 0;
+   }
+  }
+@@ -1386,8 +1400,9 @@
+  f->listener.close();
+  if (!success)
+   proto->debugLogA("OFT2 sender: direct transport failed or recipient did not connect");
+- proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE,
+-  success ? ACKRESULT_SUCCESS : ACKRESULT_FAILED, f.get(), 0);
++ if (InterlockedCompareExchange(&f->terminalAckSent, 1, 0) == 0)
++  proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE,
++   success ? ACKRESULT_SUCCESS : ACKRESULT_FAILED, f.get(), 0);
+  return 0;
+ }
+ 
+@@ -1427,7 +1442,7 @@
+  memcpy(rv.capability.data(), cap.data(), 16);
+  rv.port = f->listener.port();
+  rv.requestNumber = 1;
+- rv.externalIp = Oft2LocalIPv4();
++ rv.externalIp = Oft2LocalIPv4(T2Utf(m_wszServer));
+  rv.internalIp = rv.externalIp;
+  if (!rv.externalIp) return nullptr;
+  rv.hasOffer = true;
+@@ -1454,7 +1469,11 @@
+  bytes_t cookie((char *)f->cookie.data(), 8);
+  if (!f->viaProxy) {
+   debugLogA("OFT2 sender: sending initial direct OSCAR file offer to %u", (unsigned)uin);
+-  Send(OscarPackets::fileRendezvous(recipient, cookie, payload, m_nextMsgReq++));
++  uint32_t requestId;
++  { mir_cslock lk(m_csPending); requestId = m_nextMsgReq++; }
++  { mir_cslock lk(m_csFiles); f->offerRequestId = requestId; }
++  Send(OscarPackets::fileRendezvous(recipient, cookie, payload, requestId));
++  ProtoBroadcastAck(f->contact, ACKTYPE_FILE, ACKRESULT_LISTENING, f.get());
+  }
+  else debugLogA("ARS sender: starting relay allocation for %u (offer not yet sent)", (unsigned)uin);
+  return f.get();
+--- a/windows-xp-x86/0.96.7/KICQ/src/proto.h
++++ b/windows-xp-x86/0.96.7/KICQ/src/proto.h
+@@ -78,6 +78,9 @@
+         uint32_t redirectIp = 0;
+         uint16_t redirectPort = 0;
+         uint32_t uin = 0;
++        // OSCAR SNAC request id of the pending file invitation.
++        uint32_t offerRequestId = 0;
++        volatile LONG terminalAckSent = 0;
+         SOCKET active = INVALID_SOCKET;
+ 		MCONTACT contact = 0;
+ 		std::wstring path, filename;
+--- a/windows-xp-x86/0.96.7/KICQ/src/server.cpp
++++ b/windows-xp-x86/0.96.7/KICQ/src/server.cpp
+@@ -1920,6 +1920,31 @@
+ {
+ 	int code = OscarReader(data).u16();
+ 
++ // File rendezvous messages are not tracked in m_pendingMsgs. Match the
++ // OSCAR request ID so an explicit server rejection is not silently ignored.
++ std::shared_ptr<OutgoingFile> rejectedFile;
++ {
++  mir_cslock lock(m_csFiles);
++  for (auto &entry : m_outgoingFiles) {
++   auto &file = entry.second;
++   if (file->offerRequestId == reqId && reqId != 0 &&
++       InterlockedCompareExchange(&file->terminalAckSent, 0, 0) == 0) {
++    rejectedFile = file;
++    InterlockedExchange(&file->cancelled, 1);
++    if (file->active != INVALID_SOCKET) shutdown(file->active, SD_BOTH);
++    file->listener.close();
++    break;
++   }
++  }
++ }
++ if (rejectedFile) {
++  debugLogA("OFT2 OSCAR server refused file invitation: reqId=%u error=%d uin=%u",
++    (unsigned)reqId, code, (unsigned)rejectedFile->uin);
++  if (InterlockedCompareExchange(&rejectedFile->terminalAckSent, 1, 0) == 0)
++   ProtoBroadcastAck(rejectedFile->contact, ACKTYPE_FILE, ACKRESULT_FAILED, rejectedFile.get(), 0);
++  return;
++ }
++
+ 	KicqPendingMsg msg;
+ 	{
+ 		mir_cslock lck(m_csPending);
+--- a/windows-xp-x86/0.96.8/KICQ/src/proto.cpp
++++ b/windows-xp-x86/0.96.8/KICQ/src/proto.cpp
+@@ -1081,23 +1081,32 @@
+ 
+ // Select the IPv4 used to reach the OSCAR server; does not send any UDP data.
+ // This is a local interface address, not a NAT-discovered public address.
+-static uint32_t Oft2LocalIPv4()
+-{
+- SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+- if (s == INVALID_SOCKET) return 0;
+- sockaddr_in peer = {};
+- peer.sin_family = AF_INET;
+- peer.sin_port = htons(5190);
+- peer.sin_addr.s_addr = inet_addr(KICQ_DEFAULT_SERVER);
++static uint32_t Oft2LocalIPv4(const char *host)
++{
++ // The earlier build used a hard-coded OSCAR address regardless of the
++ // configured server. Choose the interface route to the actual server.
++ // This is NOT public-IP discovery: NAT still requires a reachable relay.
++ if (!host || !*host) return 0;
++ addrinfo hints = {};
++ hints.ai_family = AF_INET;
++ hints.ai_socktype = SOCK_DGRAM;
++ addrinfo *addresses = nullptr;
++ if (getaddrinfo(host, "5190", &hints, &addresses) != 0 || !addresses)
++  return 0;
+  uint32_t ip = 0;
+- if (peer.sin_addr.s_addr != INADDR_NONE &&
+-     connect(s, (const sockaddr *)&peer, sizeof(peer)) != SOCKET_ERROR) {
+-  sockaddr_in local = {};
+-  int len = sizeof(local);
+-  if (getsockname(s, (sockaddr *)&local, &len) == 0)
+-   ip = ntohl(local.sin_addr.s_addr);
+- }
+- closesocket(s);
++ for (addrinfo *entry = addresses; entry; entry = entry->ai_next) {
++  SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
++  if (sock == INVALID_SOCKET) continue;
++  if (connect(sock, entry->ai_addr, (int)entry->ai_addrlen) != SOCKET_ERROR) {
++   sockaddr_in local = {};
++   int len = sizeof(local);
++   if (getsockname(sock, (sockaddr *)&local, &len) == 0)
++    ip = ntohl(local.sin_addr.s_addr);
++  }
++  closesocket(sock);
++  if (ip) break;
++ }
++ freeaddrinfo(addresses);
+  return ip;
+ }
+ 
+@@ -1122,7 +1131,7 @@
+   debugLogA("OFT2 fallback: cannot open TCP listener");
+   return false;
+  }
+- const uint32_t ip = Oft2LocalIPv4();
++ const uint32_t ip = Oft2LocalIPv4(T2Utf(m_wszServer));
+  const bytes_t cap = OscarText::unhex(CAP_FILE);
+  if (!ip || cap.size() != 16) {
+   debugLogA("OFT2 fallback: no route to OSCAR server or invalid file capability");
+@@ -1164,7 +1173,9 @@
+  bytes_t cookie((const char *)f->cookie.data(), 8);
+  uint32_t req;
+  { mir_cslock lk(m_csPending); req = m_nextMsgReq++; }
++ { mir_cslock lk(m_csFiles); f->offerRequestId = req; }
+  Send(OscarPackets::fileRendezvous(receiver, cookie, payload, req));
++ ProtoBroadcastAck(f->contact, ACKTYPE_FILE, ACKRESULT_LISTENING, f.get());
+  debugLogA("OFT2 fallback: direct file offer sent to %u, port=%u, local IP=%s (NAT may block it)",
+    (unsigned)f->uin, (unsigned)rv.port, ars::ip4(ip).c_str());
+  return true;
+@@ -1263,6 +1274,7 @@
+       bytes_t cookie((const char *)f->cookie.data(), 8);
+       uint32_t req;
+       { mir_cslock lk(proto->m_csPending); req = proto->m_nextMsgReq++; }
++      { mir_cslock lk(proto->m_csFiles); f->offerRequestId = req; }
+       proto->Send(OscarPackets::fileRendezvous(receiver, cookie, payload, req));
+       offerSent = true;
+       proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE, ACKRESULT_LISTENING, f.get());
+@@ -1330,15 +1342,17 @@
+   // Such a duplicate can leave two pending dialogs and mismatched rendezvous state.
+   if (offerSent || success || InterlockedCompareExchange(&f->cancelled, 0, 0)) {
+    if (!success) proto->debugLogA("ARS sender: offer was sent but transfer failed; no duplicate direct offer");
+-   proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE,
+-     success ? ACKRESULT_SUCCESS : ACKRESULT_FAILED, f.get(), 0);
++   if (InterlockedCompareExchange(&f->terminalAckSent, 1, 0) == 0)
++    proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE,
++      success ? ACKRESULT_SUCCESS : ACKRESULT_FAILED, f.get(), 0);
+    return 0;
+   }
+   // The relay never yielded an offer: fall back to direct TCP/OFT2.
+   proto->debugLogA("ARS sender: no relay offer sent; attempting direct OFT2 fallback");
+   f->viaProxy = false;
+   if (!proto->StartDirectFileFallback(f)) {
+-   proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE, ACKRESULT_FAILED, f.get(), 0);
++   if (InterlockedCompareExchange(&f->terminalAckSent, 1, 0) == 0)
++    proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE, ACKRESULT_FAILED, f.get(), 0);
+    return 0;
+   }
+  }
+@@ -1381,8 +1395,9 @@
+  f->listener.close();
+  if (!success)
+   proto->debugLogA("OFT2 sender: direct transport failed or recipient did not connect");
+- proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE,
+-  success ? ACKRESULT_SUCCESS : ACKRESULT_FAILED, f.get(), 0);
++ if (InterlockedCompareExchange(&f->terminalAckSent, 1, 0) == 0)
++  proto->ProtoBroadcastAck(f->contact, ACKTYPE_FILE,
++   success ? ACKRESULT_SUCCESS : ACKRESULT_FAILED, f.get(), 0);
+  return 0;
+ }
+ 
+@@ -1422,7 +1437,7 @@
+  memcpy(rv.capability.data(), cap.data(), 16);
+  rv.port = f->listener.port();
+  rv.requestNumber = 1;
+- rv.externalIp = Oft2LocalIPv4();
++ rv.externalIp = Oft2LocalIPv4(T2Utf(m_wszServer));
+  rv.internalIp = rv.externalIp;
+  if (!rv.externalIp) return nullptr;
+  rv.hasOffer = true;
+@@ -1449,7 +1464,11 @@
+  bytes_t cookie((char *)f->cookie.data(), 8);
+  if (!f->viaProxy) {
+   debugLogA("OFT2 sender: sending initial direct OSCAR file offer to %u", (unsigned)uin);
+-  Send(OscarPackets::fileRendezvous(recipient, cookie, payload, m_nextMsgReq++));
++  uint32_t requestId;
++  { mir_cslock lk(m_csPending); requestId = m_nextMsgReq++; }
++  { mir_cslock lk(m_csFiles); f->offerRequestId = requestId; }
++  Send(OscarPackets::fileRendezvous(recipient, cookie, payload, requestId));
++  ProtoBroadcastAck(f->contact, ACKTYPE_FILE, ACKRESULT_LISTENING, f.get());
+  }
+  else debugLogA("ARS sender: starting relay allocation for %u (offer not yet sent)", (unsigned)uin);
+  return f.get();
+--- a/windows-xp-x86/0.96.8/KICQ/src/proto.h
++++ b/windows-xp-x86/0.96.8/KICQ/src/proto.h
+@@ -78,6 +78,9 @@
+         uint32_t redirectIp = 0;
+         uint16_t redirectPort = 0;
+         uint32_t uin = 0;
++        // OSCAR SNAC request id of the pending file invitation.
++        uint32_t offerRequestId = 0;
++        volatile LONG terminalAckSent = 0;
+         SOCKET active = INVALID_SOCKET;
+ 		MCONTACT contact = 0;
+ 		std::wstring path, filename;
+--- a/windows-xp-x86/0.96.8/KICQ/src/server.cpp
++++ b/windows-xp-x86/0.96.8/KICQ/src/server.cpp
+@@ -1920,6 +1920,31 @@
+ {
+ 	int code = OscarReader(data).u16();
+ 
++ // File rendezvous messages are not tracked in m_pendingMsgs. Match the
++ // OSCAR request ID so an explicit server rejection is not silently ignored.
++ std::shared_ptr<OutgoingFile> rejectedFile;
++ {
++  mir_cslock lock(m_csFiles);
++  for (auto &entry : m_outgoingFiles) {
++   auto &file = entry.second;
++   if (file->offerRequestId == reqId && reqId != 0 &&
++       InterlockedCompareExchange(&file->terminalAckSent, 0, 0) == 0) {
++    rejectedFile = file;
++    InterlockedExchange(&file->cancelled, 1);
++    if (file->active != INVALID_SOCKET) shutdown(file->active, SD_BOTH);
++    file->listener.close();
++    break;
++   }
++  }
++ }
++ if (rejectedFile) {
++  debugLogA("OFT2 OSCAR server refused file invitation: reqId=%u error=%d uin=%u",
++    (unsigned)reqId, code, (unsigned)rejectedFile->uin);
++  if (InterlockedCompareExchange(&rejectedFile->terminalAckSent, 1, 0) == 0)
++   ProtoBroadcastAck(rejectedFile->contact, ACKTYPE_FILE, ACKRESULT_FAILED, rejectedFile.get(), 0);
++  return;
++ }
++
+ 	KicqPendingMsg msg;
+ 	{
+ 		mir_cslock lck(m_csPending);

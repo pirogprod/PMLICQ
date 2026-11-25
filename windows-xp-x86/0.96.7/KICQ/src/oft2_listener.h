@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 // Windows TCP endpoint for OSCAR/OFT2 direct connections.
 // Owns only the listening socket; accepted sockets are owned by the caller.
 // The endpoint must be created BEFORE a channel-2 offer is sent.
@@ -16,14 +16,14 @@ public:
  TcpListener& operator=(const TcpListener&) = delete;
  ~TcpListener() { close(); }
  uint16_t port() const { return port_; }
- bool open(uint32_t address = INADDR_ANY) {
+ bool open(uint32_t address = INADDR_ANY, uint16_t listenPort = 0) {
   close();
   SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
   if (s == INVALID_SOCKET) return false;
   sockaddr_in addr = {};
   addr.sin_family = AF_INET;
   addr.sin_addr.s_addr = htonl(address);
-  addr.sin_port = 0; // let OS allocate an unused port
+  addr.sin_port = htons(listenPort); // 0=ephemeral; fixed port allows explicit NAT forwarding
   if (bind(s, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) == SOCKET_ERROR ||
       listen(s, 1) == SOCKET_ERROR) {
    closesocket(s); return false;

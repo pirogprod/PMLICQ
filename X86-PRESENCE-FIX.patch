@@ -1,0 +1,692 @@
+--- a/normal/0.96.7/KICQ/src/proto.h
++++ b/normal/0.96.7/KICQ/src/proto.h
+@@ -197,6 +197,11 @@
+ 
+ 	void HandleRoster(const bytes_t &data, int flags);
+ 	void FinishLogin();
++#if defined(_WIN32) && !defined(_WIN64)
++	// Network-thread only: one bounded resubscription after sign-on.
++	time_t m_x86PresenceRetryAt = 0;
++	void SendX86PresenceSubscriptions(bool missingOnly);
++#endif
+ 	void HandleBuddyPresence(const bytes_t &data, bool departed);
+ 	void HandleUserOnline(const bytes_t &data);
+ 	void HandleUserOffline(const bytes_t &data);
+--- a/normal/0.96.7/KICQ/src/server.cpp
++++ b/normal/0.96.7/KICQ/src/server.cpp
+@@ -93,6 +93,9 @@
+ void CKicqProto::ServerThread(void *)
+ {
+ 	m_iLoginError = 0;
++#if defined(_WIN32) && !defined(_WIN64)
++	m_x86PresenceRetryAt = 0;
++#endif
+ 	m_cookie.clear();
+ 	StopBart(); // previous BOS session may have left an exited BART worker
+ 	m_szUin = AccountId().c_str();
+@@ -285,6 +288,12 @@
+ void CKicqProto::CheckTimeouts()
+ {
+ 	time_t now = time(0);
++#if defined(_WIN32) && !defined(_WIN64)
++	if (m_bOnline && m_x86PresenceRetryAt && now >= m_x86PresenceRetryAt) {
++		m_x86PresenceRetryAt = 0; // no periodic polling or retry storm
++		SendX86PresenceSubscriptions(true);
++	}
++#endif
+ 	if (m_bOnline) PumpBartRefresh(now);
+ 
+ 	if (m_bOnline && now - m_lastProbe >= KEEPALIVE_INTERVAL) {
+@@ -486,6 +495,10 @@
+ 	case 0x03:
+ 		if (subtype == 0x0B || subtype == 0x0C)
+ 			HandleBuddyPresence(body, subtype == 0x0C);
++#if defined(_WIN32) && !defined(_WIN64)
++		else if (subtype == 0x0A)
++			debugLogA("PRESENCE x86: server rejected client-side buddy subscription (%u bytes)", (unsigned)body.size());
++#endif
+ 		break;
+ 
+ 	case 0x04:
+@@ -709,6 +722,46 @@
+ 	}
+ }
+ 
++#if defined(_WIN32) && !defined(_WIN64)
++void CKicqProto::SendX86PresenceSubscriptions(bool missingOnly)
++{
++	// Keep SSI as the authority for presence. Never bypass pending auth,
++	// and never use the client-side buddy path for AIM -> ICQ on OOS.
++	const bool aimAccount = oscarid::uin(AccountId()) == 0;
++	std::vector<std::string> names;
++	unsigned feedbagOnly = 0, pendingAuth = 0;
++	{
++		mir_cslock lock(m_csRoster);
++		for (auto &user : m_arUsers) {
++			if (!user->hContact || user->name.empty() || !user->ssiId)
++				continue;
++			if (!user->bAuthorized) { ++pendingAuth; continue; }
++			if (aimAccount && oscarid::uin(user->name)) { ++feedbagOnly; continue; }
++			if (missingOnly && user->bOnline)
++				continue;
++			names.push_back(user->name);
++		}
++	}
++	// Release roster lock before any potentially blocking network sends.
++	OscarWriter batch;
++	unsigned count = 0;
++	for (const auto &name : names) {
++		if (count && (count >= 50 || batch.size() + int(name.size()) + 1 > 3500)) {
++			Send(OscarSnac(3, 4, 0, batch.data()));
++			batch = OscarWriter();
++			count = 0;
++		}
++		batch.ascii8(name.c_str());
++		++count;
++	}
++	if (count)
++		Send(OscarSnac(3, 4, 0, batch.data()));
++	debugLogA("PRESENCE x86: %s account=%s subscribed=%u feedbag-only=%u pending-auth=%u",
++		missingOnly ? "post-ready retry" : "initial", aimAccount ? "AIM" : "ICQ",
++		(unsigned)names.size(), feedbagOnly, pendingAuth);
++}
++
++#endif
+ void CKicqProto::FinishLogin()
+ {
+ 	int iOldStatus = m_iStatus;
+@@ -719,6 +772,16 @@
+ 	auto *pVer = &pluginInfoEx.version;
+ 	Send(OscarPackets::setUserInfo(HIBYTE(HIWORD(*pVer)), LOBYTE(HIWORD(*pVer)), HIBYTE(LOWORD(*pVer)), nullptr, getByte("ClientIdPreset", 0) ? getByte("ClientIdPreset", 0) : (getDword("UIN") ? 0 : 10)));
+ 	Send(OscarPackets::setIcbmParams());
++#if defined(_WIN32) && !defined(_WIN64)
++	// Activate the feedbag BEFORE ClientOnline. OOS performs its initial
++	// visibility broadcast at ClientOnline for AIM and most ICQ clients.
++	// An AIM account cannot subscribe to ICQ UINs through 03/04; these
++	// contacts must receive presence via the activated, authorized SSI list.
++	Send(OscarPackets::rosterActivate());
++	SendX86PresenceSubscriptions(false);
++	Send(OscarPackets::clientReady());
++	debugLogA("PRESENCE x86: SSI activated before ClientOnline");
++#else
+ 	// Subscribe to presence for SSI contacts. The server sends 03/0B and
+ 	// 03/0C updates to clients registered via BuddyAddBuddies (03/04).
+ 	// Keep packets small to avoid exceeding server-side SNAC limits.
+@@ -744,12 +807,18 @@
+ 	Send(OscarPackets::clientReady());
+ 	// Activate SSI before publishing our initial presence.
+ 	Send(OscarPackets::rosterActivate());
++#endif
+ 	// Send only a 4-byte status TLV. The legacy DC-info/away-text
+ 	// extensions are not needed for Open OSCAR Server presence.
+ 	Send(OscarPackets::setStatus(MirandaToIcqStatus(m_iStatus), 256));
+ 	if(getDword("UIN")) Send(OscarPackets::offlineMsgsRequest(atoi(m_szUin), m_seq));
+ 
+ 	m_bOnline = true;
++#if defined(_WIN32) && !defined(_WIN64)
++	// Give initial BUDDY notifications time to arrive, then retry only
++	// authorized, still-offline contacts once on the BOS network thread.
++	m_x86PresenceRetryAt = time(0) + 4;
++#endif
+ 	// Include local contacts too, not just the online subset of the SSI roster.
+ 	// Discovery is deliberately queued, after the BOS client-ready sequence.
+ 	for (auto &contact : AccContacts()) ScheduleBartRefresh(ContactId(contact));
+@@ -1039,8 +1108,22 @@
+   if (avatarInfo.offline) { HandleUserOffline(data); return; }
+   for (const auto &raw : avatarInfo.metadata) ObserveBartPresence(name, raw);
+  }
++#if defined(_WIN32) && !defined(_WIN64)
++ if (!uin) {
++  MCONTACT c=0; bool changed=false;
++  { mir_cslock lock(m_csRoster); if (auto *u=FindUser(name)) { changed=!u->bOnline; u->bOnline=true; c=u->hContact; } }
++  if (c) {
++   const auto *flags=tlvs.find(1);
++   const WORD status=flags && (flags->u16()&0x20)?ID_STATUS_AWAY:ID_STATUS_ONLINE;
++   if (getWord(c,"Status",ID_STATUS_OFFLINE)!=status) setWord(c,"Status",status);
++   if (changed) debugLogA("PRESENCE x86: AIM arrived %s status=%u",name.c_str(),(unsigned)status);
++  } else debugLogA("PRESENCE x86: AIM arrival not in session roster: %s",name.c_str());
++  return;
++ }
++#else
+  if(!uin){MCONTACT c=0;{mir_cslock lock(m_csRoster);if(auto *u=FindUser(name)){u->bOnline=true;c=u->hContact;}}
+   if(c){const auto *flags=tlvs.find(1);setWord(c,"Status",flags && (flags->u16()&0x20)?ID_STATUS_AWAY:ID_STATUS_ONLINE);}return;}
++#endif
+ 
+ 
+     // Only trace changes for the target Jimm Multi UIN. A presence refresh can
+@@ -1087,8 +1170,16 @@
+ 	{
+ 		mir_cslock lck(m_csRoster);
+ 		auto *pUser = FindUser(name);
++#if defined(_WIN32) && !defined(_WIN64)
++		if (pUser == nullptr || !pUser->hContact) {
++			debugLogA("PRESENCE x86: ICQ arrival not in session roster: %s", name.c_str());
++			return;
++		}
++		if (!pUser->bOnline) debugLogA("PRESENCE x86: ICQ arrived %s", name.c_str());
++#else
+ 		if (pUser == nullptr)
+ 			return;
++#endif
+ 
+ 		hContact = pUser->hContact;
+ 		pUser->bOnline = true;
+--- a/normal/0.96.8/KICQ/src/proto.h
++++ b/normal/0.96.8/KICQ/src/proto.h
+@@ -197,6 +197,11 @@
+ 
+ 	void HandleRoster(const bytes_t &data, int flags);
+ 	void FinishLogin();
++#if defined(_WIN32) && !defined(_WIN64)
++	// Network-thread only: one bounded resubscription after sign-on.
++	time_t m_x86PresenceRetryAt = 0;
++	void SendX86PresenceSubscriptions(bool missingOnly);
++#endif
+ 	void HandleBuddyPresence(const bytes_t &data, bool departed);
+ 	void HandleUserOnline(const bytes_t &data);
+ 	void HandleUserOffline(const bytes_t &data);
+--- a/normal/0.96.8/KICQ/src/server.cpp
++++ b/normal/0.96.8/KICQ/src/server.cpp
+@@ -93,6 +93,9 @@
+ void CKicqProto::ServerThread(void *)
+ {
+ 	m_iLoginError = 0;
++#if defined(_WIN32) && !defined(_WIN64)
++	m_x86PresenceRetryAt = 0;
++#endif
+ 	m_cookie.clear();
+ 	StopBart(); // previous BOS session may have left an exited BART worker
+ 	m_szUin = AccountId().c_str();
+@@ -285,6 +288,12 @@
+ void CKicqProto::CheckTimeouts()
+ {
+ 	time_t now = time(0);
++#if defined(_WIN32) && !defined(_WIN64)
++	if (m_bOnline && m_x86PresenceRetryAt && now >= m_x86PresenceRetryAt) {
++		m_x86PresenceRetryAt = 0; // no periodic polling or retry storm
++		SendX86PresenceSubscriptions(true);
++	}
++#endif
+ 	if (m_bOnline) PumpBartRefresh(now);
+ 
+ 	if (m_bOnline && now - m_lastProbe >= KEEPALIVE_INTERVAL) {
+@@ -486,6 +495,10 @@
+ 	case 0x03:
+ 		if (subtype == 0x0B || subtype == 0x0C)
+ 			HandleBuddyPresence(body, subtype == 0x0C);
++#if defined(_WIN32) && !defined(_WIN64)
++		else if (subtype == 0x0A)
++			debugLogA("PRESENCE x86: server rejected client-side buddy subscription (%u bytes)", (unsigned)body.size());
++#endif
+ 		break;
+ 
+ 	case 0x04:
+@@ -709,6 +722,46 @@
+ 	}
+ }
+ 
++#if defined(_WIN32) && !defined(_WIN64)
++void CKicqProto::SendX86PresenceSubscriptions(bool missingOnly)
++{
++	// Keep SSI as the authority for presence. Never bypass pending auth,
++	// and never use the client-side buddy path for AIM -> ICQ on OOS.
++	const bool aimAccount = oscarid::uin(AccountId()) == 0;
++	std::vector<std::string> names;
++	unsigned feedbagOnly = 0, pendingAuth = 0;
++	{
++		mir_cslock lock(m_csRoster);
++		for (auto &user : m_arUsers) {
++			if (!user->hContact || user->name.empty() || !user->ssiId)
++				continue;
++			if (!user->bAuthorized) { ++pendingAuth; continue; }
++			if (aimAccount && oscarid::uin(user->name)) { ++feedbagOnly; continue; }
++			if (missingOnly && user->bOnline)
++				continue;
++			names.push_back(user->name);
++		}
++	}
++	// Release roster lock before any potentially blocking network sends.
++	OscarWriter batch;
++	unsigned count = 0;
++	for (const auto &name : names) {
++		if (count && (count >= 50 || batch.size() + int(name.size()) + 1 > 3500)) {
++			Send(OscarSnac(3, 4, 0, batch.data()));
++			batch = OscarWriter();
++			count = 0;
++		}
++		batch.ascii8(name.c_str());
++		++count;
++	}
++	if (count)
++		Send(OscarSnac(3, 4, 0, batch.data()));
++	debugLogA("PRESENCE x86: %s account=%s subscribed=%u feedbag-only=%u pending-auth=%u",
++		missingOnly ? "post-ready retry" : "initial", aimAccount ? "AIM" : "ICQ",
++		(unsigned)names.size(), feedbagOnly, pendingAuth);
++}
++
++#endif
+ void CKicqProto::FinishLogin()
+ {
+ 	int iOldStatus = m_iStatus;
+@@ -719,6 +772,16 @@
+ 	auto *pVer = &pluginInfoEx.version;
+ 	Send(OscarPackets::setUserInfo(HIBYTE(HIWORD(*pVer)), LOBYTE(HIWORD(*pVer)), HIBYTE(LOWORD(*pVer)), nullptr, getByte("ClientIdPreset", 0) ? getByte("ClientIdPreset", 0) : (getDword("UIN") ? 0 : 10)));
+ 	Send(OscarPackets::setIcbmParams());
++#if defined(_WIN32) && !defined(_WIN64)
++	// Activate the feedbag BEFORE ClientOnline. OOS performs its initial
++	// visibility broadcast at ClientOnline for AIM and most ICQ clients.
++	// An AIM account cannot subscribe to ICQ UINs through 03/04; these
++	// contacts must receive presence via the activated, authorized SSI list.
++	Send(OscarPackets::rosterActivate());
++	SendX86PresenceSubscriptions(false);
++	Send(OscarPackets::clientReady());
++	debugLogA("PRESENCE x86: SSI activated before ClientOnline");
++#else
+ 	// Subscribe to presence for SSI contacts. The server sends 03/0B and
+ 	// 03/0C updates to clients registered via BuddyAddBuddies (03/04).
+ 	// Keep packets small to avoid exceeding server-side SNAC limits.
+@@ -744,12 +807,18 @@
+ 	Send(OscarPackets::clientReady());
+ 	// Activate SSI before publishing our initial presence.
+ 	Send(OscarPackets::rosterActivate());
++#endif
+ 	// Send only a 4-byte status TLV. The legacy DC-info/away-text
+ 	// extensions are not needed for Open OSCAR Server presence.
+ 	Send(OscarPackets::setStatus(MirandaToIcqStatus(m_iStatus), 256));
+ 	if(getDword("UIN")) Send(OscarPackets::offlineMsgsRequest(atoi(m_szUin), m_seq));
+ 
+ 	m_bOnline = true;
++#if defined(_WIN32) && !defined(_WIN64)
++	// Give initial BUDDY notifications time to arrive, then retry only
++	// authorized, still-offline contacts once on the BOS network thread.
++	m_x86PresenceRetryAt = time(0) + 4;
++#endif
+ 	// Include local contacts too, not just the online subset of the SSI roster.
+ 	// Discovery is deliberately queued, after the BOS client-ready sequence.
+ 	for (auto &contact : AccContacts()) ScheduleBartRefresh(ContactId(contact));
+@@ -1039,8 +1108,22 @@
+   if (avatarInfo.offline) { HandleUserOffline(data); return; }
+   for (const auto &raw : avatarInfo.metadata) ObserveBartPresence(name, raw);
+  }
++#if defined(_WIN32) && !defined(_WIN64)
++ if (!uin) {
++  MCONTACT c=0; bool changed=false;
++  { mir_cslock lock(m_csRoster); if (auto *u=FindUser(name)) { changed=!u->bOnline; u->bOnline=true; c=u->hContact; } }
++  if (c) {
++   const auto *flags=tlvs.find(1);
++   const WORD status=flags && (flags->u16()&0x20)?ID_STATUS_AWAY:ID_STATUS_ONLINE;
++   if (getWord(c,"Status",ID_STATUS_OFFLINE)!=status) setWord(c,"Status",status);
++   if (changed) debugLogA("PRESENCE x86: AIM arrived %s status=%u",name.c_str(),(unsigned)status);
++  } else debugLogA("PRESENCE x86: AIM arrival not in session roster: %s",name.c_str());
++  return;
++ }
++#else
+  if(!uin){MCONTACT c=0;{mir_cslock lock(m_csRoster);if(auto *u=FindUser(name)){u->bOnline=true;c=u->hContact;}}
+   if(c){const auto *flags=tlvs.find(1);setWord(c,"Status",flags && (flags->u16()&0x20)?ID_STATUS_AWAY:ID_STATUS_ONLINE);}return;}
++#endif
+ 
+ 
+     // Only trace changes for the target Jimm Multi UIN. A presence refresh can
+@@ -1087,8 +1170,16 @@
+ 	{
+ 		mir_cslock lck(m_csRoster);
+ 		auto *pUser = FindUser(name);
++#if defined(_WIN32) && !defined(_WIN64)
++		if (pUser == nullptr || !pUser->hContact) {
++			debugLogA("PRESENCE x86: ICQ arrival not in session roster: %s", name.c_str());
++			return;
++		}
++		if (!pUser->bOnline) debugLogA("PRESENCE x86: ICQ arrived %s", name.c_str());
++#else
+ 		if (pUser == nullptr)
+ 			return;
++#endif
+ 
+ 		hContact = pUser->hContact;
+ 		pUser->bOnline = true;
+--- a/windows-xp-x86/0.96.7/KICQ/src/proto.h
++++ b/windows-xp-x86/0.96.7/KICQ/src/proto.h
+@@ -197,6 +197,11 @@
+ 
+ 	void HandleRoster(const bytes_t &data, int flags);
+ 	void FinishLogin();
++#if defined(_WIN32) && !defined(_WIN64)
++	// Network-thread only: one bounded resubscription after sign-on.
++	time_t m_x86PresenceRetryAt = 0;
++	void SendX86PresenceSubscriptions(bool missingOnly);
++#endif
+ 	void HandleBuddyPresence(const bytes_t &data, bool departed);
+ 	void HandleUserOnline(const bytes_t &data);
+ 	void HandleUserOffline(const bytes_t &data);
+--- a/windows-xp-x86/0.96.7/KICQ/src/server.cpp
++++ b/windows-xp-x86/0.96.7/KICQ/src/server.cpp
+@@ -121,6 +121,9 @@
+ {
+ 	KicqXpTrace("ServerThread begin");
+ 	m_iLoginError = 0;
++#if defined(_WIN32) && !defined(_WIN64)
++	m_x86PresenceRetryAt = 0;
++#endif
+ 	m_cookie.clear();
+ 	StopBart(); // previous BOS session may have left an exited BART worker
+ 	m_szUin = AccountId().c_str();
+@@ -315,6 +318,12 @@
+ void CKicqProto::CheckTimeouts()
+ {
+ 	time_t now = time(0);
++#if defined(_WIN32) && !defined(_WIN64)
++	if (m_bOnline && m_x86PresenceRetryAt && now >= m_x86PresenceRetryAt) {
++		m_x86PresenceRetryAt = 0; // no periodic polling or retry storm
++		SendX86PresenceSubscriptions(true);
++	}
++#endif
+ 	if (m_bOnline) PumpBartRefresh(now);
+ 
+ 	if (m_bOnline && now - m_lastProbe >= KEEPALIVE_INTERVAL) {
+@@ -516,6 +525,10 @@
+ 	case 0x03:
+ 		if (subtype == 0x0B || subtype == 0x0C)
+ 			HandleBuddyPresence(body, subtype == 0x0C);
++#if defined(_WIN32) && !defined(_WIN64)
++		else if (subtype == 0x0A)
++			debugLogA("PRESENCE x86: server rejected client-side buddy subscription (%u bytes)", (unsigned)body.size());
++#endif
+ 		break;
+ 
+ 	case 0x04:
+@@ -802,6 +815,46 @@
+ 	}
+ }
+ 
++#if defined(_WIN32) && !defined(_WIN64)
++void CKicqProto::SendX86PresenceSubscriptions(bool missingOnly)
++{
++	// Keep SSI as the authority for presence. Never bypass pending auth,
++	// and never use the client-side buddy path for AIM -> ICQ on OOS.
++	const bool aimAccount = oscarid::uin(AccountId()) == 0;
++	std::vector<std::string> names;
++	unsigned feedbagOnly = 0, pendingAuth = 0;
++	{
++		mir_cslock lock(m_csRoster);
++		for (auto &user : m_arUsers) {
++			if (!user->hContact || user->name.empty() || !user->ssiId)
++				continue;
++			if (!user->bAuthorized) { ++pendingAuth; continue; }
++			if (aimAccount && oscarid::uin(user->name)) { ++feedbagOnly; continue; }
++			if (missingOnly && user->bOnline)
++				continue;
++			names.push_back(user->name);
++		}
++	}
++	// Release roster lock before any potentially blocking network sends.
++	OscarWriter batch;
++	unsigned count = 0;
++	for (const auto &name : names) {
++		if (count && (count >= 50 || batch.size() + int(name.size()) + 1 > 3500)) {
++			Send(OscarSnac(3, 4, 0, batch.data()));
++			batch = OscarWriter();
++			count = 0;
++		}
++		batch.ascii8(name.c_str());
++		++count;
++	}
++	if (count)
++		Send(OscarSnac(3, 4, 0, batch.data()));
++	debugLogA("PRESENCE x86: %s account=%s subscribed=%u feedbag-only=%u pending-auth=%u",
++		missingOnly ? "post-ready retry" : "initial", aimAccount ? "AIM" : "ICQ",
++		(unsigned)names.size(), feedbagOnly, pendingAuth);
++}
++
++#endif
+ void CKicqProto::FinishLogin()
+ {
+ 	KicqXpTrace("FinishLogin begin");
+@@ -813,6 +866,16 @@
+ 	auto *pVer = &pluginInfoEx.version;
+ 	Send(OscarPackets::setUserInfo(HIBYTE(HIWORD(*pVer)), LOBYTE(HIWORD(*pVer)), HIBYTE(LOWORD(*pVer)), nullptr, getByte("ClientIdPreset", 0) ? getByte("ClientIdPreset", 0) : (getDword("UIN") ? 0 : 10)));
+ 	Send(OscarPackets::setIcbmParams());
++#if defined(_WIN32) && !defined(_WIN64)
++	// Activate the feedbag BEFORE ClientOnline. OOS performs its initial
++	// visibility broadcast at ClientOnline for AIM and most ICQ clients.
++	// An AIM account cannot subscribe to ICQ UINs through 03/04; these
++	// contacts must receive presence via the activated, authorized SSI list.
++	Send(OscarPackets::rosterActivate());
++	SendX86PresenceSubscriptions(false);
++	Send(OscarPackets::clientReady());
++	debugLogA("PRESENCE x86: SSI activated before ClientOnline");
++#else
+ 	// Subscribe to presence for SSI contacts. The server sends 03/0B and
+ 	// 03/0C updates to clients registered via BuddyAddBuddies (03/04).
+ 	// Keep packets small to avoid exceeding server-side SNAC limits.
+@@ -847,12 +910,18 @@
+ 	Send(OscarPackets::clientReady());
+ 	// Activate SSI before publishing our initial presence.
+ 	Send(OscarPackets::rosterActivate());
++#endif
+ 	// Send only a 4-byte status TLV. The legacy DC-info/away-text
+ 	// extensions are not needed for Open OSCAR Server presence.
+ 	Send(OscarPackets::setStatus(MirandaToIcqStatus(m_iStatus), 256));
+ 	if(getDword("UIN")) Send(OscarPackets::offlineMsgsRequest(atoi(m_szUin), m_seq));
+ 
+ 	m_bOnline = true;
++#if defined(_WIN32) && !defined(_WIN64)
++	// Give initial BUDDY notifications time to arrive, then retry only
++	// authorized, still-offline contacts once on the BOS network thread.
++	m_x86PresenceRetryAt = time(0) + 4;
++#endif
+ 	// Include local contacts too, not just the online subset of the SSI roster.
+ 	// Discovery is deliberately queued, after the BOS client-ready sequence.
+ 	for (auto &contact : AccContacts()) ScheduleBartRefresh(ContactId(contact));
+@@ -1143,8 +1212,22 @@
+   if (avatarInfo.offline) { HandleUserOffline(data); return; }
+   for (const auto &raw : avatarInfo.metadata) ObserveBartPresence(name, raw);
+  }
++#if defined(_WIN32) && !defined(_WIN64)
++ if (!uin) {
++  MCONTACT c=0; bool changed=false;
++  { mir_cslock lock(m_csRoster); if (auto *u=FindUser(name)) { changed=!u->bOnline; u->bOnline=true; c=u->hContact; } }
++  if (c) {
++   const auto *flags=tlvs.find(1);
++   const WORD status=flags && (flags->u16()&0x20)?ID_STATUS_AWAY:ID_STATUS_ONLINE;
++   if (getWord(c,"Status",ID_STATUS_OFFLINE)!=status) setWord(c,"Status",status);
++   if (changed) debugLogA("PRESENCE x86: AIM arrived %s status=%u",name.c_str(),(unsigned)status);
++  } else debugLogA("PRESENCE x86: AIM arrival not in session roster: %s",name.c_str());
++  return;
++ }
++#else
+  if(!uin){MCONTACT c=0;{mir_cslock lock(m_csRoster);if(auto *u=FindUser(name)){u->bOnline=true;c=u->hContact;}}
+   if(c){const auto *flags=tlvs.find(1);setWord(c,"Status",flags && (flags->u16()&0x20)?ID_STATUS_AWAY:ID_STATUS_ONLINE);}return;}
++#endif
+ 
+ 
+     // Only trace changes for the target Jimm Multi UIN. A presence refresh can
+@@ -1191,8 +1274,16 @@
+ 	{
+ 		mir_cslock lck(m_csRoster);
+ 		auto *pUser = FindUser(name);
++#if defined(_WIN32) && !defined(_WIN64)
++		if (pUser == nullptr || !pUser->hContact) {
++			debugLogA("PRESENCE x86: ICQ arrival not in session roster: %s", name.c_str());
++			return;
++		}
++		if (!pUser->bOnline) debugLogA("PRESENCE x86: ICQ arrived %s", name.c_str());
++#else
+ 		if (pUser == nullptr)
+ 			return;
++#endif
+ 
+ 		hContact = pUser->hContact;
+ 		pUser->bOnline = true;
+--- a/windows-xp-x86/0.96.8/KICQ/src/proto.h
++++ b/windows-xp-x86/0.96.8/KICQ/src/proto.h
+@@ -197,6 +197,11 @@
+ 
+ 	void HandleRoster(const bytes_t &data, int flags);
+ 	void FinishLogin();
++#if defined(_WIN32) && !defined(_WIN64)
++	// Network-thread only: one bounded resubscription after sign-on.
++	time_t m_x86PresenceRetryAt = 0;
++	void SendX86PresenceSubscriptions(bool missingOnly);
++#endif
+ 	void HandleBuddyPresence(const bytes_t &data, bool departed);
+ 	void HandleUserOnline(const bytes_t &data);
+ 	void HandleUserOffline(const bytes_t &data);
+--- a/windows-xp-x86/0.96.8/KICQ/src/server.cpp
++++ b/windows-xp-x86/0.96.8/KICQ/src/server.cpp
+@@ -121,6 +121,9 @@
+ {
+ 	KicqXpTrace("ServerThread begin");
+ 	m_iLoginError = 0;
++#if defined(_WIN32) && !defined(_WIN64)
++	m_x86PresenceRetryAt = 0;
++#endif
+ 	m_cookie.clear();
+ 	StopBart(); // previous BOS session may have left an exited BART worker
+ 	m_szUin = AccountId().c_str();
+@@ -315,6 +318,12 @@
+ void CKicqProto::CheckTimeouts()
+ {
+ 	time_t now = time(0);
++#if defined(_WIN32) && !defined(_WIN64)
++	if (m_bOnline && m_x86PresenceRetryAt && now >= m_x86PresenceRetryAt) {
++		m_x86PresenceRetryAt = 0; // no periodic polling or retry storm
++		SendX86PresenceSubscriptions(true);
++	}
++#endif
+ 	if (m_bOnline) PumpBartRefresh(now);
+ 
+ 	if (m_bOnline && now - m_lastProbe >= KEEPALIVE_INTERVAL) {
+@@ -516,6 +525,10 @@
+ 	case 0x03:
+ 		if (subtype == 0x0B || subtype == 0x0C)
+ 			HandleBuddyPresence(body, subtype == 0x0C);
++#if defined(_WIN32) && !defined(_WIN64)
++		else if (subtype == 0x0A)
++			debugLogA("PRESENCE x86: server rejected client-side buddy subscription (%u bytes)", (unsigned)body.size());
++#endif
+ 		break;
+ 
+ 	case 0x04:
+@@ -802,6 +815,46 @@
+ 	}
+ }
+ 
++#if defined(_WIN32) && !defined(_WIN64)
++void CKicqProto::SendX86PresenceSubscriptions(bool missingOnly)
++{
++	// Keep SSI as the authority for presence. Never bypass pending auth,
++	// and never use the client-side buddy path for AIM -> ICQ on OOS.
++	const bool aimAccount = oscarid::uin(AccountId()) == 0;
++	std::vector<std::string> names;
++	unsigned feedbagOnly = 0, pendingAuth = 0;
++	{
++		mir_cslock lock(m_csRoster);
++		for (auto &user : m_arUsers) {
++			if (!user->hContact || user->name.empty() || !user->ssiId)
++				continue;
++			if (!user->bAuthorized) { ++pendingAuth; continue; }
++			if (aimAccount && oscarid::uin(user->name)) { ++feedbagOnly; continue; }
++			if (missingOnly && user->bOnline)
++				continue;
++			names.push_back(user->name);
++		}
++	}
++	// Release roster lock before any potentially blocking network sends.
++	OscarWriter batch;
++	unsigned count = 0;
++	for (const auto &name : names) {
++		if (count && (count >= 50 || batch.size() + int(name.size()) + 1 > 3500)) {
++			Send(OscarSnac(3, 4, 0, batch.data()));
++			batch = OscarWriter();
++			count = 0;
++		}
++		batch.ascii8(name.c_str());
++		++count;
++	}
++	if (count)
++		Send(OscarSnac(3, 4, 0, batch.data()));
++	debugLogA("PRESENCE x86: %s account=%s subscribed=%u feedbag-only=%u pending-auth=%u",
++		missingOnly ? "post-ready retry" : "initial", aimAccount ? "AIM" : "ICQ",
++		(unsigned)names.size(), feedbagOnly, pendingAuth);
++}
++
++#endif
+ void CKicqProto::FinishLogin()
+ {
+ 	KicqXpTrace("FinishLogin begin");
+@@ -813,6 +866,16 @@
+ 	auto *pVer = &pluginInfoEx.version;
+ 	Send(OscarPackets::setUserInfo(HIBYTE(HIWORD(*pVer)), LOBYTE(HIWORD(*pVer)), HIBYTE(LOWORD(*pVer)), nullptr, getByte("ClientIdPreset", 0) ? getByte("ClientIdPreset", 0) : (getDword("UIN") ? 0 : 10)));
+ 	Send(OscarPackets::setIcbmParams());
++#if defined(_WIN32) && !defined(_WIN64)
++	// Activate the feedbag BEFORE ClientOnline. OOS performs its initial
++	// visibility broadcast at ClientOnline for AIM and most ICQ clients.
++	// An AIM account cannot subscribe to ICQ UINs through 03/04; these
++	// contacts must receive presence via the activated, authorized SSI list.
++	Send(OscarPackets::rosterActivate());
++	SendX86PresenceSubscriptions(false);
++	Send(OscarPackets::clientReady());
++	debugLogA("PRESENCE x86: SSI activated before ClientOnline");
++#else
+ 	// Subscribe to presence for SSI contacts. The server sends 03/0B and
+ 	// 03/0C updates to clients registered via BuddyAddBuddies (03/04).
+ 	// Keep packets small to avoid exceeding server-side SNAC limits.
+@@ -847,12 +910,18 @@
+ 	Send(OscarPackets::clientReady());
+ 	// Activate SSI before publishing our initial presence.
+ 	Send(OscarPackets::rosterActivate());
++#endif
+ 	// Send only a 4-byte status TLV. The legacy DC-info/away-text
+ 	// extensions are not needed for Open OSCAR Server presence.
+ 	Send(OscarPackets::setStatus(MirandaToIcqStatus(m_iStatus), 256));
+ 	if(getDword("UIN")) Send(OscarPackets::offlineMsgsRequest(atoi(m_szUin), m_seq));
+ 
+ 	m_bOnline = true;
++#if defined(_WIN32) && !defined(_WIN64)
++	// Give initial BUDDY notifications time to arrive, then retry only
++	// authorized, still-offline contacts once on the BOS network thread.
++	m_x86PresenceRetryAt = time(0) + 4;
++#endif
+ 	// Include local contacts too, not just the online subset of the SSI roster.
+ 	// Discovery is deliberately queued, after the BOS client-ready sequence.
+ 	for (auto &contact : AccContacts()) ScheduleBartRefresh(ContactId(contact));
+@@ -1143,8 +1212,22 @@
+   if (avatarInfo.offline) { HandleUserOffline(data); return; }
+   for (const auto &raw : avatarInfo.metadata) ObserveBartPresence(name, raw);
+  }
++#if defined(_WIN32) && !defined(_WIN64)
++ if (!uin) {
++  MCONTACT c=0; bool changed=false;
++  { mir_cslock lock(m_csRoster); if (auto *u=FindUser(name)) { changed=!u->bOnline; u->bOnline=true; c=u->hContact; } }
++  if (c) {
++   const auto *flags=tlvs.find(1);
++   const WORD status=flags && (flags->u16()&0x20)?ID_STATUS_AWAY:ID_STATUS_ONLINE;
++   if (getWord(c,"Status",ID_STATUS_OFFLINE)!=status) setWord(c,"Status",status);
++   if (changed) debugLogA("PRESENCE x86: AIM arrived %s status=%u",name.c_str(),(unsigned)status);
++  } else debugLogA("PRESENCE x86: AIM arrival not in session roster: %s",name.c_str());
++  return;
++ }
++#else
+  if(!uin){MCONTACT c=0;{mir_cslock lock(m_csRoster);if(auto *u=FindUser(name)){u->bOnline=true;c=u->hContact;}}
+   if(c){const auto *flags=tlvs.find(1);setWord(c,"Status",flags && (flags->u16()&0x20)?ID_STATUS_AWAY:ID_STATUS_ONLINE);}return;}
++#endif
+ 
+ 
+     // Only trace changes for the target Jimm Multi UIN. A presence refresh can
+@@ -1191,8 +1274,16 @@
+ 	{
+ 		mir_cslock lck(m_csRoster);
+ 		auto *pUser = FindUser(name);
++#if defined(_WIN32) && !defined(_WIN64)
++		if (pUser == nullptr || !pUser->hContact) {
++			debugLogA("PRESENCE x86: ICQ arrival not in session roster: %s", name.c_str());
++			return;
++		}
++		if (!pUser->bOnline) debugLogA("PRESENCE x86: ICQ arrived %s", name.c_str());
++#else
+ 		if (pUser == nullptr)
+ 			return;
++#endif
+ 
+ 		hContact = pUser->hContact;
+ 		pUser->bOnline = true;

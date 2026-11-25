@@ -1,0 +1,536 @@
+--- a/normal/0.96.7/KICQ/src/server.cpp
++++ b/normal/0.96.7/KICQ/src/server.cpp
+@@ -1,4 +1,4 @@
+-﻿/*
++/*
+ Copyright (C) 2026 Miranda NG team
+ 
+ This program is free software; you can redistribute it and/or
+@@ -907,6 +907,73 @@
+ 	return 0;
+ }
+ 
++// Live ICQ mood (TLV 0x001D / item 0x000E) -> the same icon IDs as
++// legacy QIP capability GUIDs. Mapping verified against OSCAR mood catalog.
++// Returns -2 when absent/invalid, -1 for an unsupported mood, 0 when
++// explicitly cleared, or 1..35 for a known X-status.
++static int KicqMoodToXStatus(const bytes_t &presenceNote)
++{
++ OscarReader r(presenceNote);
++ while (r.remaining() >= 4) {
++  const unsigned kind = r.u16();
++  r.u8(); // flags
++  const unsigned length = r.u8();
++  if (length > r.remaining()) return -2; // malformed; do not touch the icon
++  const bytes_t value = r.bytes(length);
++  if (kind != 0x000E) continue;
++  if (value.empty()) return 0; // explicit mood removal
++  static const char prefix[] = "0icqmood";
++  if (value.size() <= sizeof(prefix)-1 ||
++      value.compare(0, sizeof(prefix)-1, prefix) != 0)
++   return -1; // unknown mood; don't destroy a valid capability status
++  unsigned number = 0;
++  for (size_t i = sizeof(prefix)-1; i < value.size(); ++i) {
++   const unsigned char ch = (unsigned char)value[i];
++   if (ch < '0' || ch > '9') return -1;
++   number = number * 10 + (ch - '0');
++   if (number > 999) return -1;
++  }
++  struct Mood { unsigned number; int id; };
++  static const Mood mapped[] = {
++		{ 0, 18 },
++		{ 1, 2 },
++		{ 2, 3 },
++		{ 3, 4 },
++		{ 4, 5 },
++		{ 5, 6 },
++		{ 6, 7 },
++		{ 7, 8 },
++		{ 8, 9 },
++		{ 9, 10 },
++		{ 10, 11 },
++		{ 11, 31 },
++		{ 12, 13 },
++		{ 14, 15 },
++		{ 15, 16 },
++		{ 16, 17 },
++		{ 17, 19 },
++		{ 18, 20 },
++		{ 19, 21 },
++		{ 20, 22 },
++		{ 21, 23 },
++		{ 22, 25 },
++		{ 23, 1 },
++		{ 68, 29 },
++		{ 70, 20 },
++		{ 71, 27 },
++		{ 76, 32 },
++		{ 77, 30 },
++		{ 81, 16 },
++		{ 84, 35 },
++		{ 85, 33 }
++  };
++  for (const Mood &entry : mapped)
++   if (entry.number == number) return entry.id;
++  return -1;
++ }
++ return -2;
++}
++
+ void CKicqProto::HandleUserOnline(const bytes_t &data)
+ {
+ 	OscarReader r(data);
+@@ -973,10 +1040,9 @@
+ 		if (bFull) {
+ 			// A full capability update replaces the previously advertised X-status.
+ 			// Do not clear it on abbreviated online updates.
+-			int xstatus = caps ? FindQipXStatus(caps->data) : 0;
+-			// A presence with 0x19 short caps only is still a full update:
+-			// there is no 16-byte X-status GUID to keep. Empty/removed
+-			// capabilities must clear the previously displayed icon.
++			int xstatus = caps ? FindQipXStatus(caps->data) : getByte(hContact, "XStatusId", 0);
++			// Compact capabilities do not encode the legacy X-status GUID.
++			// Do not clear a valid icon on a short-caps-only update.
+ 			xstatusChanged = (getByte(hContact, "XStatusId", 0) != xstatus ||
+ 				(xstatus && !getByte(hContact, "XStatusLive", 0)));
+ 			if (xstatus)
+@@ -1133,6 +1199,37 @@
+ 		}
+ 	}
+ 
++
++ // Live X-status update: ICQ/Jimm may send only TLV 0x1D item 0x000E
++ // without repeating TLV 0x000D capabilities. Apply after releasing the
++ // roster lock and override a stale capability GUID in the same packet.
++ if (const OscarTlv *moodTlv = tlvs.find(0x1D)) {
++  const int moodId = KicqMoodToXStatus(moodTlv->data);
++  if (moodId >= 0) {
++   const int previousId = getByte(hContact, "XStatusId", 0);
++   const bool wasLive = getByte(hContact, "XStatusLive", 0) != 0;
++   if (previousId != moodId || (moodId > 0 && !wasLive)) {
++    xstatusChanged = true;
++    if (moodId > 0) {
++     setByte(hContact, "XStatusId", (uint8_t)moodId);
++     setByte(hContact, "XStatusLive", 1);
++     setWString(hContact, "XStatusName", kKicqXStatuses[moodId - 1].nameRu);
++     db_unset(hContact, m_szModuleName, "XStatusMsg");
++     db_unset(hContact, m_szModuleName, "XStatusTextReceived");
++     db_unset(hContact, m_szModuleName, "XStatusQueryTS");
++    }
++    else {
++     db_unset(hContact, m_szModuleName, "XStatusId");
++     db_unset(hContact, m_szModuleName, "XStatusName");
++     db_unset(hContact, m_szModuleName, "XStatusLive");
++     db_unset(hContact, m_szModuleName, "XStatusMsg");
++     db_unset(hContact, m_szModuleName, "XStatusTextReceived");
++     db_unset(hContact, m_szModuleName, "XStatusQueryTS");
++    }
++   }
++  }
++ }
++
+ 	auto *st = tlvs.find(6);
+ 	int iStatus = st ? OscarReader(st->data, 2).u16() : ICQ_STATUS_ONLINE;
+ 	const WORD newStatus = IcqToMirandaStatus(iStatus);
+--- a/normal/0.96.8/KICQ/src/server.cpp
++++ b/normal/0.96.8/KICQ/src/server.cpp
+@@ -1,4 +1,4 @@
+-﻿/*
++/*
+ Copyright (C) 2026 Miranda NG team
+ 
+ This program is free software; you can redistribute it and/or
+@@ -907,6 +907,73 @@
+ 	return 0;
+ }
+ 
++// Live ICQ mood (TLV 0x001D / item 0x000E) -> the same icon IDs as
++// legacy QIP capability GUIDs. Mapping verified against OSCAR mood catalog.
++// Returns -2 when absent/invalid, -1 for an unsupported mood, 0 when
++// explicitly cleared, or 1..35 for a known X-status.
++static int KicqMoodToXStatus(const bytes_t &presenceNote)
++{
++ OscarReader r(presenceNote);
++ while (r.remaining() >= 4) {
++  const unsigned kind = r.u16();
++  r.u8(); // flags
++  const unsigned length = r.u8();
++  if (length > r.remaining()) return -2; // malformed; do not touch the icon
++  const bytes_t value = r.bytes(length);
++  if (kind != 0x000E) continue;
++  if (value.empty()) return 0; // explicit mood removal
++  static const char prefix[] = "0icqmood";
++  if (value.size() <= sizeof(prefix)-1 ||
++      value.compare(0, sizeof(prefix)-1, prefix) != 0)
++   return -1; // unknown mood; don't destroy a valid capability status
++  unsigned number = 0;
++  for (size_t i = sizeof(prefix)-1; i < value.size(); ++i) {
++   const unsigned char ch = (unsigned char)value[i];
++   if (ch < '0' || ch > '9') return -1;
++   number = number * 10 + (ch - '0');
++   if (number > 999) return -1;
++  }
++  struct Mood { unsigned number; int id; };
++  static const Mood mapped[] = {
++		{ 0, 18 },
++		{ 1, 2 },
++		{ 2, 3 },
++		{ 3, 4 },
++		{ 4, 5 },
++		{ 5, 6 },
++		{ 6, 7 },
++		{ 7, 8 },
++		{ 8, 9 },
++		{ 9, 10 },
++		{ 10, 11 },
++		{ 11, 31 },
++		{ 12, 13 },
++		{ 14, 15 },
++		{ 15, 16 },
++		{ 16, 17 },
++		{ 17, 19 },
++		{ 18, 20 },
++		{ 19, 21 },
++		{ 20, 22 },
++		{ 21, 23 },
++		{ 22, 25 },
++		{ 23, 1 },
++		{ 68, 29 },
++		{ 70, 20 },
++		{ 71, 27 },
++		{ 76, 32 },
++		{ 77, 30 },
++		{ 81, 16 },
++		{ 84, 35 },
++		{ 85, 33 }
++  };
++  for (const Mood &entry : mapped)
++   if (entry.number == number) return entry.id;
++  return -1;
++ }
++ return -2;
++}
++
+ void CKicqProto::HandleUserOnline(const bytes_t &data)
+ {
+ 	OscarReader r(data);
+@@ -973,10 +1040,9 @@
+ 		if (bFull) {
+ 			// A full capability update replaces the previously advertised X-status.
+ 			// Do not clear it on abbreviated online updates.
+-			int xstatus = caps ? FindQipXStatus(caps->data) : 0;
+-			// A presence with 0x19 short caps only is still a full update:
+-			// there is no 16-byte X-status GUID to keep. Empty/removed
+-			// capabilities must clear the previously displayed icon.
++			int xstatus = caps ? FindQipXStatus(caps->data) : getByte(hContact, "XStatusId", 0);
++			// Compact capabilities do not encode the legacy X-status GUID.
++			// Do not clear a valid icon on a short-caps-only update.
+ 			xstatusChanged = (getByte(hContact, "XStatusId", 0) != xstatus ||
+ 				(xstatus && !getByte(hContact, "XStatusLive", 0)));
+ 			if (xstatus)
+@@ -1133,6 +1199,37 @@
+ 		}
+ 	}
+ 
++
++ // Live X-status update: ICQ/Jimm may send only TLV 0x1D item 0x000E
++ // without repeating TLV 0x000D capabilities. Apply after releasing the
++ // roster lock and override a stale capability GUID in the same packet.
++ if (const OscarTlv *moodTlv = tlvs.find(0x1D)) {
++  const int moodId = KicqMoodToXStatus(moodTlv->data);
++  if (moodId >= 0) {
++   const int previousId = getByte(hContact, "XStatusId", 0);
++   const bool wasLive = getByte(hContact, "XStatusLive", 0) != 0;
++   if (previousId != moodId || (moodId > 0 && !wasLive)) {
++    xstatusChanged = true;
++    if (moodId > 0) {
++     setByte(hContact, "XStatusId", (uint8_t)moodId);
++     setByte(hContact, "XStatusLive", 1);
++     setWString(hContact, "XStatusName", kKicqXStatuses[moodId - 1].nameRu);
++     db_unset(hContact, m_szModuleName, "XStatusMsg");
++     db_unset(hContact, m_szModuleName, "XStatusTextReceived");
++     db_unset(hContact, m_szModuleName, "XStatusQueryTS");
++    }
++    else {
++     db_unset(hContact, m_szModuleName, "XStatusId");
++     db_unset(hContact, m_szModuleName, "XStatusName");
++     db_unset(hContact, m_szModuleName, "XStatusLive");
++     db_unset(hContact, m_szModuleName, "XStatusMsg");
++     db_unset(hContact, m_szModuleName, "XStatusTextReceived");
++     db_unset(hContact, m_szModuleName, "XStatusQueryTS");
++    }
++   }
++  }
++ }
++
+ 	auto *st = tlvs.find(6);
+ 	int iStatus = st ? OscarReader(st->data, 2).u16() : ICQ_STATUS_ONLINE;
+ 	const WORD newStatus = IcqToMirandaStatus(iStatus);
+--- a/windows-xp-x86/0.96.7/KICQ/src/server.cpp
++++ b/windows-xp-x86/0.96.7/KICQ/src/server.cpp
+@@ -1,4 +1,4 @@
+-﻿/*
++/*
+ #include <string>
+ Copyright (C) 2026 Miranda NG team
+ 
+@@ -1016,6 +1016,73 @@
+ 	return 0;
+ }
+ 
++// Live ICQ mood (TLV 0x001D / item 0x000E) -> the same icon IDs as
++// legacy QIP capability GUIDs. Mapping verified against OSCAR mood catalog.
++// Returns -2 when absent/invalid, -1 for an unsupported mood, 0 when
++// explicitly cleared, or 1..35 for a known X-status.
++static int KicqMoodToXStatus(const bytes_t &presenceNote)
++{
++ OscarReader r(presenceNote);
++ while (r.remaining() >= 4) {
++  const unsigned kind = r.u16();
++  r.u8(); // flags
++  const unsigned length = r.u8();
++  if (length > r.remaining()) return -2; // malformed; do not touch the icon
++  const bytes_t value = r.bytes(length);
++  if (kind != 0x000E) continue;
++  if (value.empty()) return 0; // explicit mood removal
++  static const char prefix[] = "0icqmood";
++  if (value.size() <= sizeof(prefix)-1 ||
++      value.compare(0, sizeof(prefix)-1, prefix) != 0)
++   return -1; // unknown mood; don't destroy a valid capability status
++  unsigned number = 0;
++  for (size_t i = sizeof(prefix)-1; i < value.size(); ++i) {
++   const unsigned char ch = (unsigned char)value[i];
++   if (ch < '0' || ch > '9') return -1;
++   number = number * 10 + (ch - '0');
++   if (number > 999) return -1;
++  }
++  struct Mood { unsigned number; int id; };
++  static const Mood mapped[] = {
++		{ 0, 18 },
++		{ 1, 2 },
++		{ 2, 3 },
++		{ 3, 4 },
++		{ 4, 5 },
++		{ 5, 6 },
++		{ 6, 7 },
++		{ 7, 8 },
++		{ 8, 9 },
++		{ 9, 10 },
++		{ 10, 11 },
++		{ 11, 31 },
++		{ 12, 13 },
++		{ 14, 15 },
++		{ 15, 16 },
++		{ 16, 17 },
++		{ 17, 19 },
++		{ 18, 20 },
++		{ 19, 21 },
++		{ 20, 22 },
++		{ 21, 23 },
++		{ 22, 25 },
++		{ 23, 1 },
++		{ 68, 29 },
++		{ 70, 20 },
++		{ 71, 27 },
++		{ 76, 32 },
++		{ 77, 30 },
++		{ 81, 16 },
++		{ 84, 35 },
++		{ 85, 33 }
++  };
++  for (const Mood &entry : mapped)
++   if (entry.number == number) return entry.id;
++  return -1;
++ }
++ return -2;
++}
++
+ void CKicqProto::HandleUserOnline(const bytes_t &data)
+ {
+ 	OscarReader r(data);
+@@ -1082,10 +1149,9 @@
+ 		if (bFull) {
+ 			// A full capability update replaces the previously advertised X-status.
+ 			// Do not clear it on abbreviated online updates.
+-			int xstatus = caps ? FindQipXStatus(caps->data) : 0;
+-			// A presence with 0x19 short caps only is still a full update:
+-			// there is no 16-byte X-status GUID to keep. Empty/removed
+-			// capabilities must clear the previously displayed icon.
++			int xstatus = caps ? FindQipXStatus(caps->data) : getByte(hContact, "XStatusId", 0);
++			// Compact capabilities do not encode the legacy X-status GUID.
++			// Do not clear a valid icon on a short-caps-only update.
+ 			xstatusChanged = (getByte(hContact, "XStatusId", 0) != xstatus ||
+ 				(xstatus && !getByte(hContact, "XStatusLive", 0)));
+ 			if (xstatus)
+@@ -1235,6 +1301,37 @@
+ 		}
+ 	}
+ 
++
++ // Live X-status update: ICQ/Jimm may send only TLV 0x1D item 0x000E
++ // without repeating TLV 0x000D capabilities. Apply after releasing the
++ // roster lock and override a stale capability GUID in the same packet.
++ if (const OscarTlv *moodTlv = tlvs.find(0x1D)) {
++  const int moodId = KicqMoodToXStatus(moodTlv->data);
++  if (moodId >= 0) {
++   const int previousId = getByte(hContact, "XStatusId", 0);
++   const bool wasLive = getByte(hContact, "XStatusLive", 0) != 0;
++   if (previousId != moodId || (moodId > 0 && !wasLive)) {
++    xstatusChanged = true;
++    if (moodId > 0) {
++     setByte(hContact, "XStatusId", (uint8_t)moodId);
++     setByte(hContact, "XStatusLive", 1);
++     setWString(hContact, "XStatusName", kKicqXStatuses[moodId - 1].nameRu);
++     db_unset(hContact, m_szModuleName, "XStatusMsg");
++     db_unset(hContact, m_szModuleName, "XStatusTextReceived");
++     db_unset(hContact, m_szModuleName, "XStatusQueryTS");
++    }
++    else {
++     db_unset(hContact, m_szModuleName, "XStatusId");
++     db_unset(hContact, m_szModuleName, "XStatusName");
++     db_unset(hContact, m_szModuleName, "XStatusLive");
++     db_unset(hContact, m_szModuleName, "XStatusMsg");
++     db_unset(hContact, m_szModuleName, "XStatusTextReceived");
++     db_unset(hContact, m_szModuleName, "XStatusQueryTS");
++    }
++   }
++  }
++ }
++
+ 	auto *st = tlvs.find(6);
+ 	int iStatus = st ? OscarReader(st->data, 2).u16() : ICQ_STATUS_ONLINE;
+ 	// Diagnostic counters: log every 100th presence notification, without UINs.
+--- a/windows-xp-x86/0.96.8/KICQ/src/server.cpp
++++ b/windows-xp-x86/0.96.8/KICQ/src/server.cpp
+@@ -1,4 +1,4 @@
+-﻿/*
++/*
+ #include <string>
+ Copyright (C) 2026 Miranda NG team
+ 
+@@ -1016,6 +1016,73 @@
+ 	return 0;
+ }
+ 
++// Live ICQ mood (TLV 0x001D / item 0x000E) -> the same icon IDs as
++// legacy QIP capability GUIDs. Mapping verified against OSCAR mood catalog.
++// Returns -2 when absent/invalid, -1 for an unsupported mood, 0 when
++// explicitly cleared, or 1..35 for a known X-status.
++static int KicqMoodToXStatus(const bytes_t &presenceNote)
++{
++ OscarReader r(presenceNote);
++ while (r.remaining() >= 4) {
++  const unsigned kind = r.u16();
++  r.u8(); // flags
++  const unsigned length = r.u8();
++  if (length > r.remaining()) return -2; // malformed; do not touch the icon
++  const bytes_t value = r.bytes(length);
++  if (kind != 0x000E) continue;
++  if (value.empty()) return 0; // explicit mood removal
++  static const char prefix[] = "0icqmood";
++  if (value.size() <= sizeof(prefix)-1 ||
++      value.compare(0, sizeof(prefix)-1, prefix) != 0)
++   return -1; // unknown mood; don't destroy a valid capability status
++  unsigned number = 0;
++  for (size_t i = sizeof(prefix)-1; i < value.size(); ++i) {
++   const unsigned char ch = (unsigned char)value[i];
++   if (ch < '0' || ch > '9') return -1;
++   number = number * 10 + (ch - '0');
++   if (number > 999) return -1;
++  }
++  struct Mood { unsigned number; int id; };
++  static const Mood mapped[] = {
++		{ 0, 18 },
++		{ 1, 2 },
++		{ 2, 3 },
++		{ 3, 4 },
++		{ 4, 5 },
++		{ 5, 6 },
++		{ 6, 7 },
++		{ 7, 8 },
++		{ 8, 9 },
++		{ 9, 10 },
++		{ 10, 11 },
++		{ 11, 31 },
++		{ 12, 13 },
++		{ 14, 15 },
++		{ 15, 16 },
++		{ 16, 17 },
++		{ 17, 19 },
++		{ 18, 20 },
++		{ 19, 21 },
++		{ 20, 22 },
++		{ 21, 23 },
++		{ 22, 25 },
++		{ 23, 1 },
++		{ 68, 29 },
++		{ 70, 20 },
++		{ 71, 27 },
++		{ 76, 32 },
++		{ 77, 30 },
++		{ 81, 16 },
++		{ 84, 35 },
++		{ 85, 33 }
++  };
++  for (const Mood &entry : mapped)
++   if (entry.number == number) return entry.id;
++  return -1;
++ }
++ return -2;
++}
++
+ void CKicqProto::HandleUserOnline(const bytes_t &data)
+ {
+ 	OscarReader r(data);
+@@ -1082,10 +1149,9 @@
+ 		if (bFull) {
+ 			// A full capability update replaces the previously advertised X-status.
+ 			// Do not clear it on abbreviated online updates.
+-			int xstatus = caps ? FindQipXStatus(caps->data) : 0;
+-			// A presence with 0x19 short caps only is still a full update:
+-			// there is no 16-byte X-status GUID to keep. Empty/removed
+-			// capabilities must clear the previously displayed icon.
++			int xstatus = caps ? FindQipXStatus(caps->data) : getByte(hContact, "XStatusId", 0);
++			// Compact capabilities do not encode the legacy X-status GUID.
++			// Do not clear a valid icon on a short-caps-only update.
+ 			xstatusChanged = (getByte(hContact, "XStatusId", 0) != xstatus ||
+ 				(xstatus && !getByte(hContact, "XStatusLive", 0)));
+ 			if (xstatus)
+@@ -1235,6 +1301,37 @@
+ 		}
+ 	}
+ 
++
++ // Live X-status update: ICQ/Jimm may send only TLV 0x1D item 0x000E
++ // without repeating TLV 0x000D capabilities. Apply after releasing the
++ // roster lock and override a stale capability GUID in the same packet.
++ if (const OscarTlv *moodTlv = tlvs.find(0x1D)) {
++  const int moodId = KicqMoodToXStatus(moodTlv->data);
++  if (moodId >= 0) {
++   const int previousId = getByte(hContact, "XStatusId", 0);
++   const bool wasLive = getByte(hContact, "XStatusLive", 0) != 0;
++   if (previousId != moodId || (moodId > 0 && !wasLive)) {
++    xstatusChanged = true;
++    if (moodId > 0) {
++     setByte(hContact, "XStatusId", (uint8_t)moodId);
++     setByte(hContact, "XStatusLive", 1);
++     setWString(hContact, "XStatusName", kKicqXStatuses[moodId - 1].nameRu);
++     db_unset(hContact, m_szModuleName, "XStatusMsg");
++     db_unset(hContact, m_szModuleName, "XStatusTextReceived");
++     db_unset(hContact, m_szModuleName, "XStatusQueryTS");
++    }
++    else {
++     db_unset(hContact, m_szModuleName, "XStatusId");
++     db_unset(hContact, m_szModuleName, "XStatusName");
++     db_unset(hContact, m_szModuleName, "XStatusLive");
++     db_unset(hContact, m_szModuleName, "XStatusMsg");
++     db_unset(hContact, m_szModuleName, "XStatusTextReceived");
++     db_unset(hContact, m_szModuleName, "XStatusQueryTS");
++    }
++   }
++  }
++ }
++
+ 	auto *st = tlvs.find(6);
+ 	int iStatus = st ? OscarReader(st->data, 2).u16() : ICQ_STATUS_ONLINE;
+ 	// Diagnostic counters: log every 100th presence notification, without UINs.

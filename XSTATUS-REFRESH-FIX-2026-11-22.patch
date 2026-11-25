@@ -1,0 +1,410 @@
+--- a/normal/0.96.7/KICQ/src/proto.cpp
++++ b/normal/0.96.7/KICQ/src/proto.cpp
+@@ -72,17 +72,24 @@
+  if (!contact) return 0;
+  const char *module = Proto_GetBaseAccountName(contact);
+  if (!KicqIsOurAccount(module)) return 0;
+- // Do not show a cached X-status for an offline contact.
+- const WORD presence = db_get_w(contact, module, "Status", ID_STATUS_OFFLINE);
+- if (presence == ID_STATUS_OFFLINE) {
+-  ExtraIcon_SetIcon(g_kicqExtraIcon, contact, INVALID_HANDLE_VALUE);
+-  return 0;
+- }
+-
+- // Only display an X-status explicitly confirmed by the current OSCAR session.
+- // A stale XStatusId alone must never allocate an extra-icon slot.
+- const int confirmed = db_get_b(contact, module, "XStatusLive", 0);
+- int id = confirmed ? db_get_b(contact, module, "XStatusId", 0) : 0;
++ // A locally added copy of our own UIN mirrors the account X-status.
++ // The server does not have to send our own 03/0B presence back to us,
++ // so XStatusLive on that contact is NOT a reliable indicator.
++ const uint32_t ownUin = db_get_dw(0, module, "UIN", 0);
++ const uint32_t contactUin = db_get_dw(contact, module, "UIN", 0);
++ const bool isSelf = ownUin != 0 && ownUin == contactUin;
++ int id = 0;
++ if (isSelf) {
++  id = db_get_b(0, module, "XStatusId", 0);
++ }
++ else {
++  // Remote contact: never use a stale XStatusId from an earlier session.
++  // Status transitions and full-capability updates reapply this slot.
++  const WORD presence = db_get_w(contact, module, "Status", ID_STATUS_OFFLINE);
++  const bool confirmed = db_get_b(contact, module, "XStatusLive", 0) != 0;
++  if (presence != ID_STATUS_OFFLINE && confirmed)
++   id = db_get_b(contact, module, "XStatusId", 0);
++ }
+  if (id >= 1 && id <= 35) {
+   if (g_kicqExtraImages[id - 1] && g_kicqExtraImages[id - 1] != INVALID_HANDLE_VALUE) ExtraIcon_SetIcon(g_kicqExtraIcon, contact, g_kicqExtraImages[id - 1]);
+   else ExtraIcon_SetIcon(g_kicqExtraIcon, contact, INVALID_HANDLE_VALUE);
+@@ -96,6 +103,20 @@
+ {
+  if (hContact && g_kicqExtraIcon)
+   KicqExtraApply((WPARAM)hContact, 0);
++}
++
++// Update only the locally added self-contact(s) for this account.
++// Called after an account-level XStatusId change: no global ExtraIcon_SetAll.
++static void KicqRefreshOwnXStatus(const char *module)
++{
++ if (!g_kicqExtraIcon || !module) return;
++ const uint32_t ownUin = db_get_dw(0, module, "UIN", 0);
++ if (!ownUin) return;
++ for (MCONTACT h = db_find_first(); h; h = db_find_next(h)) {
++  const char *base = Proto_GetBaseAccountName(h);
++  if (base && !mir_strcmp(base, module) && db_get_dw(h, module, "UIN", 0) == ownUin)
++   KicqRefreshSingleXStatus(h);
++ }
+ }
+ 
+ static int CompareUsers(const KicqUser *p1, const KicqUser *p2)
+@@ -637,6 +658,12 @@
+ int CKicqProto::OnSettingChanged(WPARAM hContact, LPARAM lParam)
+ {
+ 	auto *cws = (DBCONTACTWRITESETTING *)lParam;
++	// Own X-status is stored at account scope (hContact=0), whereas
++	// ExtraIcons are drawn for real contacts, including our own UIN.
++	if (!hContact && cws && cws->szModule && cws->szSetting &&
++		!mir_strcmp(cws->szModule, m_szModuleName) &&
++		!mir_strcmp(cws->szSetting, "XStatusId"))
++		KicqRefreshOwnXStatus(m_szModuleName);
+ 	// Presence transitions also invalidate the extra-icon slot. In particular,
+ 	// a contact can go offline without receiving a USER_OFFLINE SNAC.
+ 	// Do not rebuild all icons: refresh only this contact on a status change.
+@@ -1034,6 +1061,7 @@
+    proto->setWString("XStatusName", title);
+    proto->setWString("XStatusMsg", desc);
+    proto->SendXStatus();
++   KicqRefreshOwnXStatus(proto->m_szModuleName);
+    // Update the protocol menu to show the selected X-status.
+    if (proto->m_hXStatusMenu) {
+     const wchar_t *label = id > 0 && id <= 34 ? (language == 0 ? kKicqXStatuses[id-1].nameRu : kKicqXStatuses[id-1].name) : L"X-status...";
+--- a/normal/0.96.7/KICQ/src/server.cpp
++++ b/normal/0.96.7/KICQ/src/server.cpp
+@@ -974,8 +974,12 @@
+ 			// A full capability update replaces the previously advertised X-status.
+ 			// Do not clear it on abbreviated online updates.
+ 			int xstatus = caps ? FindQipXStatus(caps->data) : 0;
+-			if (caps) xstatusChanged = (getByte(hContact, "XStatusId", 0) != xstatus || (xstatus && !getByte(hContact, "XStatusLive", 0)));
+-			if (caps && xstatus)
++			// A presence with 0x19 short caps only is still a full update:
++			// there is no 16-byte X-status GUID to keep. Empty/removed
++			// capabilities must clear the previously displayed icon.
++			xstatusChanged = (getByte(hContact, "XStatusId", 0) != xstatus ||
++				(xstatus && !getByte(hContact, "XStatusLive", 0)));
++			if (xstatus)
+ 				{
+     setByte(hContact, "XStatusId", (uint8_t)xstatus);
+     setByte(hContact, "XStatusLive", 1);
+@@ -991,7 +995,7 @@
+      // Keep the last genuine status text until a replacement arrives.
+     }
+    }
+-			else if (caps)
++			else
+ 				{ db_unset(hContact, m_szModuleName, "XStatusId"); db_unset(hContact, m_szModuleName, "XStatusName"); db_unset(hContact, m_szModuleName, "XStatusLive"); db_unset(hContact, m_szModuleName, "XStatusMsg"); db_unset(hContact, m_szModuleName, "XStatusTextReceived"); db_unset(hContact, "CList", "StatusMsg"); db_unset(hContact, m_szModuleName, "XStatusQueryTS"); }
+ 			/* Refresh after roster lock is released below. */
+ 			pUser->bUtf8 = pUser->bServerRelay = false;
+--- a/normal/0.96.8/KICQ/src/proto.cpp
++++ b/normal/0.96.8/KICQ/src/proto.cpp
+@@ -72,17 +72,24 @@
+  if (!contact) return 0;
+  const char *module = Proto_GetBaseAccountName(contact);
+  if (!KicqIsOurAccount(module)) return 0;
+- // Do not show a cached X-status for an offline contact.
+- const WORD presence = db_get_w(contact, module, "Status", ID_STATUS_OFFLINE);
+- if (presence == ID_STATUS_OFFLINE) {
+-  ExtraIcon_SetIcon(g_kicqExtraIcon, contact, INVALID_HANDLE_VALUE);
+-  return 0;
+- }
+-
+- // Only display an X-status explicitly confirmed by the current OSCAR session.
+- // A stale XStatusId alone must never allocate an extra-icon slot.
+- const int confirmed = db_get_b(contact, module, "XStatusLive", 0);
+- int id = confirmed ? db_get_b(contact, module, "XStatusId", 0) : 0;
++ // A locally added copy of our own UIN mirrors the account X-status.
++ // The server does not have to send our own 03/0B presence back to us,
++ // so XStatusLive on that contact is NOT a reliable indicator.
++ const uint32_t ownUin = db_get_dw(0, module, "UIN", 0);
++ const uint32_t contactUin = db_get_dw(contact, module, "UIN", 0);
++ const bool isSelf = ownUin != 0 && ownUin == contactUin;
++ int id = 0;
++ if (isSelf) {
++  id = db_get_b(0, module, "XStatusId", 0);
++ }
++ else {
++  // Remote contact: never use a stale XStatusId from an earlier session.
++  // Status transitions and full-capability updates reapply this slot.
++  const WORD presence = db_get_w(contact, module, "Status", ID_STATUS_OFFLINE);
++  const bool confirmed = db_get_b(contact, module, "XStatusLive", 0) != 0;
++  if (presence != ID_STATUS_OFFLINE && confirmed)
++   id = db_get_b(contact, module, "XStatusId", 0);
++ }
+  if (id >= 1 && id <= 35) {
+   if (g_kicqExtraImages[id - 1] && g_kicqExtraImages[id - 1] != INVALID_HANDLE_VALUE) ExtraIcon_SetIcon(g_kicqExtraIcon, contact, g_kicqExtraImages[id - 1]);
+   else ExtraIcon_SetIcon(g_kicqExtraIcon, contact, INVALID_HANDLE_VALUE);
+@@ -96,6 +103,20 @@
+ {
+  if (hContact && g_kicqExtraIcon)
+   KicqExtraApply((WPARAM)hContact, 0);
++}
++
++// Update only the locally added self-contact(s) for this account.
++// Called after an account-level XStatusId change: no global ExtraIcon_SetAll.
++static void KicqRefreshOwnXStatus(const char *module)
++{
++ if (!g_kicqExtraIcon || !module) return;
++ const uint32_t ownUin = db_get_dw(0, module, "UIN", 0);
++ if (!ownUin) return;
++ for (MCONTACT h = db_find_first(); h; h = db_find_next(h)) {
++  const char *base = Proto_GetBaseAccountName(h);
++  if (base && !mir_strcmp(base, module) && db_get_dw(h, module, "UIN", 0) == ownUin)
++   KicqRefreshSingleXStatus(h);
++ }
+ }
+ 
+ static int CompareUsers(const KicqUser *p1, const KicqUser *p2)
+@@ -635,6 +656,12 @@
+ int CKicqProto::OnSettingChanged(WPARAM hContact, LPARAM lParam)
+ {
+ 	auto *cws = (DBCONTACTWRITESETTING *)lParam;
++	// Own X-status is stored at account scope (hContact=0), whereas
++	// ExtraIcons are drawn for real contacts, including our own UIN.
++	if (!hContact && cws && cws->szModule && cws->szSetting &&
++		!mir_strcmp(cws->szModule, m_szModuleName) &&
++		!mir_strcmp(cws->szSetting, "XStatusId"))
++		KicqRefreshOwnXStatus(m_szModuleName);
+ 	// Presence transitions also invalidate the extra-icon slot. In particular,
+ 	// a contact can go offline without receiving a USER_OFFLINE SNAC.
+ 	// Do not rebuild all icons: refresh only this contact on a status change.
+@@ -1032,6 +1059,7 @@
+    proto->setWString("XStatusName", title);
+    proto->setWString("XStatusMsg", desc);
+    proto->SendXStatus();
++   KicqRefreshOwnXStatus(proto->m_szModuleName);
+    // Update the protocol menu to show the selected X-status.
+    if (proto->m_hXStatusMenu) {
+     const wchar_t *label = id > 0 && id <= 34 ? (language == 0 ? kKicqXStatuses[id-1].nameRu : kKicqXStatuses[id-1].name) : L"X-status...";
+--- a/normal/0.96.8/KICQ/src/server.cpp
++++ b/normal/0.96.8/KICQ/src/server.cpp
+@@ -974,8 +974,12 @@
+ 			// A full capability update replaces the previously advertised X-status.
+ 			// Do not clear it on abbreviated online updates.
+ 			int xstatus = caps ? FindQipXStatus(caps->data) : 0;
+-			if (caps) xstatusChanged = (getByte(hContact, "XStatusId", 0) != xstatus || (xstatus && !getByte(hContact, "XStatusLive", 0)));
+-			if (caps && xstatus)
++			// A presence with 0x19 short caps only is still a full update:
++			// there is no 16-byte X-status GUID to keep. Empty/removed
++			// capabilities must clear the previously displayed icon.
++			xstatusChanged = (getByte(hContact, "XStatusId", 0) != xstatus ||
++				(xstatus && !getByte(hContact, "XStatusLive", 0)));
++			if (xstatus)
+ 				{
+     setByte(hContact, "XStatusId", (uint8_t)xstatus);
+     setByte(hContact, "XStatusLive", 1);
+@@ -991,7 +995,7 @@
+      // Keep the last genuine status text until a replacement arrives.
+     }
+    }
+-			else if (caps)
++			else
+ 				{ db_unset(hContact, m_szModuleName, "XStatusId"); db_unset(hContact, m_szModuleName, "XStatusName"); db_unset(hContact, m_szModuleName, "XStatusLive"); db_unset(hContact, m_szModuleName, "XStatusMsg"); db_unset(hContact, m_szModuleName, "XStatusTextReceived"); db_unset(hContact, "CList", "StatusMsg"); db_unset(hContact, m_szModuleName, "XStatusQueryTS"); }
+ 			/* Refresh after roster lock is released below. */
+ 			pUser->bUtf8 = pUser->bServerRelay = false;
+--- a/windows-xp-x86/0.96.7/KICQ/src/proto.cpp
++++ b/windows-xp-x86/0.96.7/KICQ/src/proto.cpp
+@@ -73,17 +73,19 @@
+  if (!contact) return 0;
+  const char *module = Proto_GetBaseAccountName(contact);
+  if (!KicqIsOurAccount(module)) return 0;
+- // Do not show a cached X-status for an offline contact.
+- const WORD presence = db_get_w(contact, module, "Status", ID_STATUS_OFFLINE);
+- if (presence == ID_STATUS_OFFLINE) {
+-  ExtraIcon_SetIcon(g_kicqExtraIcon, contact, INVALID_HANDLE_VALUE);
+-  return 0;
+- }
+-
+- // Only display an X-status explicitly confirmed by the current OSCAR session.
+- // A stale XStatusId alone must never allocate an extra-icon slot.
+- const int confirmed = db_get_b(contact, module, "XStatusLive", 0);
+- int id = confirmed ? db_get_b(contact, module, "XStatusId", 0) : 0;
++ // Local self-contact must read the account X-status, not remote XStatusLive.
++ const uint32_t ownUin = db_get_dw(0, module, "UIN", 0);
++ const uint32_t contactUin = db_get_dw(contact, module, "UIN", 0);
++ const bool isSelf = ownUin != 0 && ownUin == contactUin;
++ int id = 0;
++ if (isSelf)
++  id = db_get_b(0, module, "XStatusId", 0);
++ else {
++  const WORD presence = db_get_w(contact, module, "Status", ID_STATUS_OFFLINE);
++  const bool confirmed = db_get_b(contact, module, "XStatusLive", 0) != 0;
++  if (presence != ID_STATUS_OFFLINE && confirmed)
++   id = db_get_b(contact, module, "XStatusId", 0);
++ }
+  if (id >= 1 && id <= 35) {
+   if (g_kicqExtraImages[id - 1] && g_kicqExtraImages[id - 1] != INVALID_HANDLE_VALUE) ExtraIcon_SetIcon(g_kicqExtraIcon, contact, g_kicqExtraImages[id - 1]);
+   else ExtraIcon_SetIcon(g_kicqExtraIcon, contact, INVALID_HANDLE_VALUE);
+@@ -98,6 +100,19 @@
+ {
+  if (hContact && g_kicqExtraIcon)
+   KicqExtraApply((WPARAM)hContact, 0);
++}
++
++// Only update copies of this account's own UIN; never rebuild all icons.
++static void KicqRefreshOwnXStatus(const char *module)
++{
++ if (!g_kicqExtraIcon || !module) return;
++ const uint32_t ownUin = db_get_dw(0, module, "UIN", 0);
++ if (!ownUin) return;
++ for (MCONTACT h = db_find_first(); h; h = db_find_next(h)) {
++  const char *base = Proto_GetBaseAccountName(h);
++  if (base && !mir_strcmp(base, module) && db_get_dw(h, module, "UIN", 0) == ownUin)
++   KicqRefreshSingleXStatus(h);
++ }
+ }
+ 
+ static int CompareUsers(const KicqUser *p1, const KicqUser *p2)
+@@ -654,6 +669,11 @@
+ int CKicqProto::OnSettingChanged(WPARAM hContact, LPARAM lParam)
+ {
+ 	auto *cws = (DBCONTACTWRITESETTING *)lParam;
++	// The account-level X-status changes even when no buddy presence arrives.
++	if (!hContact && cws && cws->szModule && cws->szSetting &&
++		!mir_strcmp(cws->szModule, m_szModuleName) &&
++		!mir_strcmp(cws->szSetting, "XStatusId"))
++		KicqRefreshOwnXStatus(m_szModuleName);
+ 	// Presence transitions also invalidate the extra-icon slot. In particular,
+ 	// a contact can go offline without receiving a USER_OFFLINE SNAC.
+ 	// Do not rebuild all icons: refresh only this contact on a status change.
+@@ -1048,6 +1068,7 @@
+    proto->setWString("XStatusName", title);
+    proto->setWString("XStatusMsg", desc);
+    proto->SendXStatus();
++   KicqRefreshOwnXStatus(proto->m_szModuleName);
+    // Update the protocol menu to show the selected X-status.
+    if (proto->m_hXStatusMenu) {
+     const wchar_t *label = id > 0 && id <= 34 ? (language == 0 ? kKicqXStatuses[id-1].nameRu : kKicqXStatuses[id-1].name) : L"X-status...";
+--- a/windows-xp-x86/0.96.7/KICQ/src/server.cpp
++++ b/windows-xp-x86/0.96.7/KICQ/src/server.cpp
+@@ -1083,8 +1083,12 @@
+ 			// A full capability update replaces the previously advertised X-status.
+ 			// Do not clear it on abbreviated online updates.
+ 			int xstatus = caps ? FindQipXStatus(caps->data) : 0;
+-			if (caps) xstatusChanged = (getByte(hContact, "XStatusId", 0) != xstatus || (xstatus && !getByte(hContact, "XStatusLive", 0)));
+-			if (caps && xstatus)
++			// A presence with 0x19 short caps only is still a full update:
++			// there is no 16-byte X-status GUID to keep. Empty/removed
++			// capabilities must clear the previously displayed icon.
++			xstatusChanged = (getByte(hContact, "XStatusId", 0) != xstatus ||
++				(xstatus && !getByte(hContact, "XStatusLive", 0)));
++			if (xstatus)
+ 				{
+     setByte(hContact, "XStatusId", (uint8_t)xstatus);
+     setByte(hContact, "XStatusLive", 1);
+@@ -1100,7 +1104,7 @@
+      // Keep the last genuine status text until a replacement arrives.
+     }
+    }
+-			else if (caps)
++			else
+ 				{ db_unset(hContact, m_szModuleName, "XStatusId"); db_unset(hContact, m_szModuleName, "XStatusName"); db_unset(hContact, m_szModuleName, "XStatusLive"); db_unset(hContact, m_szModuleName, "XStatusMsg"); db_unset(hContact, m_szModuleName, "XStatusTextReceived"); db_unset(hContact, "CList", "StatusMsg"); db_unset(hContact, m_szModuleName, "XStatusQueryTS"); }
+ 			/* Refresh after roster lock is released below. */
+ 			pUser->bUtf8 = pUser->bServerRelay = false;
+--- a/windows-xp-x86/0.96.8/KICQ/src/proto.cpp
++++ b/windows-xp-x86/0.96.8/KICQ/src/proto.cpp
+@@ -73,17 +73,19 @@
+  if (!contact) return 0;
+  const char *module = Proto_GetBaseAccountName(contact);
+  if (!KicqIsOurAccount(module)) return 0;
+- // Do not show a cached X-status for an offline contact.
+- const WORD presence = db_get_w(contact, module, "Status", ID_STATUS_OFFLINE);
+- if (presence == ID_STATUS_OFFLINE) {
+-  ExtraIcon_SetIcon(g_kicqExtraIcon, contact, INVALID_HANDLE_VALUE);
+-  return 0;
+- }
+-
+- // Only display an X-status explicitly confirmed by the current OSCAR session.
+- // A stale XStatusId alone must never allocate an extra-icon slot.
+- const int confirmed = db_get_b(contact, module, "XStatusLive", 0);
+- int id = confirmed ? db_get_b(contact, module, "XStatusId", 0) : 0;
++ // Local self-contact must read the account X-status, not remote XStatusLive.
++ const uint32_t ownUin = db_get_dw(0, module, "UIN", 0);
++ const uint32_t contactUin = db_get_dw(contact, module, "UIN", 0);
++ const bool isSelf = ownUin != 0 && ownUin == contactUin;
++ int id = 0;
++ if (isSelf)
++  id = db_get_b(0, module, "XStatusId", 0);
++ else {
++  const WORD presence = db_get_w(contact, module, "Status", ID_STATUS_OFFLINE);
++  const bool confirmed = db_get_b(contact, module, "XStatusLive", 0) != 0;
++  if (presence != ID_STATUS_OFFLINE && confirmed)
++   id = db_get_b(contact, module, "XStatusId", 0);
++ }
+  if (id >= 1 && id <= 35) {
+   if (g_kicqExtraImages[id - 1] && g_kicqExtraImages[id - 1] != INVALID_HANDLE_VALUE) ExtraIcon_SetIcon(g_kicqExtraIcon, contact, g_kicqExtraImages[id - 1]);
+   else ExtraIcon_SetIcon(g_kicqExtraIcon, contact, INVALID_HANDLE_VALUE);
+@@ -98,6 +100,19 @@
+ {
+  if (hContact && g_kicqExtraIcon)
+   KicqExtraApply((WPARAM)hContact, 0);
++}
++
++// Only update copies of this account's own UIN; never rebuild all icons.
++static void KicqRefreshOwnXStatus(const char *module)
++{
++ if (!g_kicqExtraIcon || !module) return;
++ const uint32_t ownUin = db_get_dw(0, module, "UIN", 0);
++ if (!ownUin) return;
++ for (MCONTACT h = db_find_first(); h; h = db_find_next(h)) {
++  const char *base = Proto_GetBaseAccountName(h);
++  if (base && !mir_strcmp(base, module) && db_get_dw(h, module, "UIN", 0) == ownUin)
++   KicqRefreshSingleXStatus(h);
++ }
+ }
+ 
+ static int CompareUsers(const KicqUser *p1, const KicqUser *p2)
+@@ -649,6 +664,11 @@
+ int CKicqProto::OnSettingChanged(WPARAM hContact, LPARAM lParam)
+ {
+ 	auto *cws = (DBCONTACTWRITESETTING *)lParam;
++	// The account-level X-status changes even when no buddy presence arrives.
++	if (!hContact && cws && cws->szModule && cws->szSetting &&
++		!mir_strcmp(cws->szModule, m_szModuleName) &&
++		!mir_strcmp(cws->szSetting, "XStatusId"))
++		KicqRefreshOwnXStatus(m_szModuleName);
+ 	// Presence transitions also invalidate the extra-icon slot. In particular,
+ 	// a contact can go offline without receiving a USER_OFFLINE SNAC.
+ 	// Do not rebuild all icons: refresh only this contact on a status change.
+@@ -1043,6 +1063,7 @@
+    proto->setWString("XStatusName", title);
+    proto->setWString("XStatusMsg", desc);
+    proto->SendXStatus();
++   KicqRefreshOwnXStatus(proto->m_szModuleName);
+    // Update the protocol menu to show the selected X-status.
+    if (proto->m_hXStatusMenu) {
+     const wchar_t *label = id > 0 && id <= 34 ? (language == 0 ? kKicqXStatuses[id-1].nameRu : kKicqXStatuses[id-1].name) : L"X-status...";
+--- a/windows-xp-x86/0.96.8/KICQ/src/server.cpp
++++ b/windows-xp-x86/0.96.8/KICQ/src/server.cpp
+@@ -1083,8 +1083,12 @@
+ 			// A full capability update replaces the previously advertised X-status.
+ 			// Do not clear it on abbreviated online updates.
+ 			int xstatus = caps ? FindQipXStatus(caps->data) : 0;
+-			if (caps) xstatusChanged = (getByte(hContact, "XStatusId", 0) != xstatus || (xstatus && !getByte(hContact, "XStatusLive", 0)));
+-			if (caps && xstatus)
++			// A presence with 0x19 short caps only is still a full update:
++			// there is no 16-byte X-status GUID to keep. Empty/removed
++			// capabilities must clear the previously displayed icon.
++			xstatusChanged = (getByte(hContact, "XStatusId", 0) != xstatus ||
++				(xstatus && !getByte(hContact, "XStatusLive", 0)));
++			if (xstatus)
+ 				{
+     setByte(hContact, "XStatusId", (uint8_t)xstatus);
+     setByte(hContact, "XStatusLive", 1);
+@@ -1100,7 +1104,7 @@
+      // Keep the last genuine status text until a replacement arrives.
+     }
+    }
+-			else if (caps)
++			else
+ 				{ db_unset(hContact, m_szModuleName, "XStatusId"); db_unset(hContact, m_szModuleName, "XStatusName"); db_unset(hContact, m_szModuleName, "XStatusLive"); db_unset(hContact, m_szModuleName, "XStatusMsg"); db_unset(hContact, m_szModuleName, "XStatusTextReceived"); db_unset(hContact, "CList", "StatusMsg"); db_unset(hContact, m_szModuleName, "XStatusQueryTS"); }
+ 			/* Refresh after roster lock is released below. */
+ 			pUser->bUtf8 = pUser->bServerRelay = false;
